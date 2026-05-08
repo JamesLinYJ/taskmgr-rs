@@ -31,9 +31,6 @@
     <None Include="sysmon.manifest">
       <Filter>Project Files</Filter>
     </None>
-    <None Include="RUST_MIGRATION.md">
-      <Filter>Project Files</Filter>
-    </None>
     <None Include="scripts\release-clean.ps1">
       <Filter>Scripts</Filter>
     </None>

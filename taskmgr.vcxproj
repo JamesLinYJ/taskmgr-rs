@@ -81,7 +81,6 @@
     <None Include="Cargo.lock" />
     <None Include="build.rs" />
     <None Include="sysmon.manifest" />
-    <None Include="RUST_MIGRATION.md" />
     <None Include="scripts\release-clean.ps1" />
     <None Include="src\app.rs" />
     <None Include="src\assets.rs" />
