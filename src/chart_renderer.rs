@@ -93,6 +93,8 @@ impl Default for ChartRenderer {
 
 impl Direct2DRenderer {
     fn new() -> Option<Self> {
+        // SAFETY: Direct2D COM wrapper methods validate HRESULTs; the factory and render target
+        // are retained by `Direct2DRenderer` and used on the UI drawing thread.
         unsafe {
             // 图表绘制是 2D 单线程工作负载，因此单线程 D2D factory 足够。
             let factory: ID2D1Factory =
@@ -114,6 +116,8 @@ impl Direct2DRenderer {
     }
 
     fn begin_frame(&self, hdc: SysHdc, rect: SysRect) -> Option<ChartFrame<'_>> {
+        // SAFETY: `hdc` and `rect` come from the current paint operation; D2D calls are
+        // synchronous and brushes are owned by the returned frame until `end`.
         unsafe {
             // D2D 绑定到 HDC 后，后续绘制统一使用局部坐标系。
             let rect = to_win_rect(rect);
@@ -199,6 +203,8 @@ impl ChartFrame<'_> {
         width: f32,
     ) {
         // 网格线和数据折线共用这一条底层线段绘制路径。
+        // SAFETY: the render target is inside an active BeginDraw/EndDraw frame and the brush
+        // belongs to this frame.
         unsafe {
             self.renderer.target.DrawLine(
                 Vector2 { X: x0, Y: y0 },
@@ -213,6 +219,8 @@ impl ChartFrame<'_> {
     pub fn fill_rect(&self, rect: WinRect, brush: &ID2D1SolidColorBrush) {
         // 填充矩形是最常见的图表背景/块状绘制原语。
         let rect = to_d2d_rect(rect);
+        // SAFETY: the render target is inside an active frame and `rect`/`brush` are valid for
+        // the duration of the synchronous call.
         unsafe {
             self.renderer.target.FillRectangle(&rect, brush);
         }
@@ -220,6 +228,7 @@ impl ChartFrame<'_> {
 
     pub fn end(self) -> bool {
         // `EndDraw` 失败时由调用方决定是否退回 GDI。
+        // SAFETY: this consumes the active frame and closes the matching BeginDraw call.
         unsafe { self.renderer.target.EndDraw(None, None).is_ok() }
     }
 

@@ -4,14 +4,17 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod app_controllers;
 mod assets;
 mod chart_renderer;
+mod drawing;
 mod dialog_templates;
 mod language;
 mod menus;
 mod netpage;
 mod options;
 mod pages;
+mod perf_drawing;
 mod perf_layout;
 mod perfpage;
 mod procpage;

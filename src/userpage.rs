@@ -9,12 +9,12 @@ use std::ptr::null_mut;
 use std::slice;
 
 use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::MapWindowPoints;
+
 use windows_sys::Win32::System::RemoteDesktop::{
     WTSActive, WTSClientName, WTSConnectQuery, WTSConnected, WTSDisconnectSession, WTSDisconnected,
-    WTSDomainName, WTSDown, WTSEnumerateSessionsW, WTSFreeMemory, WTSIdle, WTSInit, WTSListen,
-    WTSLogoffSession, WTSQuerySessionInformationW, WTSReset, WTSSendMessageW, WTSShadow,
-    WTSUserName, WTS_CONNECTSTATE_CLASS, WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW,
+    WTSDomainName, WTSDown, WTSEnumerateSessionsW, WTSIdle, WTSInit, WTSListen, WTSLogoffSession,
+    WTSQuerySessionInformationW, WTSReset, WTSSendMessageW, WTSShadow, WTSUserName,
+    WTS_CONNECTSTATE_CLASS, WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW,
 };
 use windows_sys::Win32::UI::Controls::{
     LVCFMT_LEFT, LVCFMT_RIGHT, LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
@@ -41,13 +41,13 @@ use crate::menus::build_popup_menu;
 use crate::options::Options;
 use crate::resource::{
     IDC_MESSAGE_MESSAGE, IDC_MESSAGE_TITLE, IDC_USERLIST, IDD_MESSAGE, IDM_DISCONNECT, IDM_LOGOFF,
-    IDM_SENDMESSAGE, IDM_SHOWDOMAINNAMES, IDR_USER_CONTEXT, IDS_TASKMGR,
+    IDM_SENDMESSAGE, IDM_SHOWDOMAINNAMES, IDR_USER_CONTEXT,
 };
 use crate::winutil::{
-    finish_list_view_update, get_window_userdata, load_string, loword, set_window_userdata,
-    subclass_list_view, to_wide_null,
+    destroy_menu_handle, finish_list_view_update, get_window_userdata, loword, set_window_userdata,
+    subclass_list_view, to_wide_null, widestr_ptr_to_string, window_rect_relative_to_page,
+    OwnedWtsMemory,
 };
-
 const DEFSPACING_BASE: i32 = 3;
 const DLG_SCALE_X: i32 = 4;
 
@@ -86,19 +86,23 @@ impl UserPageState {
         Self::default()
     }
 
-    pub unsafe fn initialize(&mut self, hwnd: HWND) {
+    pub fn initialize(&mut self, hwnd: HWND) {
         // 用户页初始化时把 ListView 立刻配置好并做首轮会话枚举，
         // 这样页面第一次切入就已经带着当前在线用户状态。
-        self.hinstance =
-            windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(null_mut()) as isize;
-        self.hwnd = hwnd;
-        let list = self.list_hwnd();
-        if !list.is_null() {
-            subclass_list_view(list);
+        // SAFETY: all Win32 calls target the user page HWND and its child controls during UI-thread
+        // initialization.
+        unsafe {
+            self.hinstance =
+                windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(null_mut()) as isize;
+            self.hwnd = hwnd;
+            let list = self.list_hwnd();
+            if !list.is_null() {
+                subclass_list_view(list);
+            }
+            self.configure_columns();
+            self.refresh();
+            self.size_page();
         }
-        self.configure_columns();
-        self.refresh();
-        self.size_page();
     }
 
     pub fn apply_options(&mut self, options: &Options) {
@@ -114,94 +118,100 @@ impl UserPageState {
         self.show_domain_names
     }
 
-    pub unsafe fn timer_event(&mut self) {
+    pub fn timer_event(&mut self) {
         // 用户/会话状态变化相对较慢，所以每轮刷新只做一次重新枚举。
         self.refresh();
     }
 
     pub fn destroy(&mut self) {}
 
-    pub unsafe fn size_page(&self) {
+    pub fn size_page(&self) {
         // 用户页采用“列表占满上方，按钮固定在下方右侧”的经典布局。
-        if self.hwnd.is_null() {
-            return;
-        }
-        let mut parent_rect = zeroed::<RECT>();
-        GetClientRect(self.hwnd, &mut parent_rect);
-        let units = GetDialogBaseUnits() as usize;
-        let def_spacing = (DEFSPACING_BASE * i32::from(loword(units))) / DLG_SCALE_X;
-        let mut hdwp = BeginDeferWindowPos(10);
-        if hdwp.is_null() {
-            return;
-        }
-        let master_hwnd = GetDlgItem(self.hwnd, i32::from(IDM_SENDMESSAGE));
-        let list_hwnd = self.list_hwnd();
-        if master_hwnd.is_null() || list_hwnd.is_null() {
-            EndDeferWindowPos(hdwp);
-            return;
-        }
-        let master_rect = window_rect_relative_to_page(master_hwnd, self.hwnd);
-        let dx = (parent_rect.right - def_spacing * 2) - master_rect.right;
-        let dy = (parent_rect.bottom - def_spacing * 2) - master_rect.bottom;
-        let list_rect = window_rect_relative_to_page(list_hwnd, self.hwnd);
-        hdwp = DeferWindowPos(
-            hdwp,
-            list_hwnd,
-            null_mut(),
-            0,
-            0,
-            (master_rect.right - list_rect.left + dx).max(0),
-            (master_rect.top - list_rect.top + dy - def_spacing).max(0),
-            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-        );
-        for control_id in [
-            i32::from(IDM_DISCONNECT),
-            i32::from(IDM_LOGOFF),
-            i32::from(IDM_SENDMESSAGE),
-        ] {
-            let control_hwnd = GetDlgItem(self.hwnd, control_id);
-            if control_hwnd.is_null() {
-                continue;
+        // SAFETY: layout only queries and moves child controls belonging to this page HWND.
+        unsafe {
+            if self.hwnd.is_null() {
+                return;
             }
-            let control_rect = window_rect_relative_to_page(control_hwnd, self.hwnd);
+            let mut parent_rect = zeroed::<RECT>();
+            GetClientRect(self.hwnd, &mut parent_rect);
+            let units = GetDialogBaseUnits() as usize;
+            let def_spacing = (DEFSPACING_BASE * i32::from(loword(units))) / DLG_SCALE_X;
+            let mut hdwp = BeginDeferWindowPos(10);
+            if hdwp.is_null() {
+                return;
+            }
+            let master_hwnd = GetDlgItem(self.hwnd, i32::from(IDM_SENDMESSAGE));
+            let list_hwnd = self.list_hwnd();
+            if master_hwnd.is_null() || list_hwnd.is_null() {
+                EndDeferWindowPos(hdwp);
+                return;
+            }
+            let master_rect = window_rect_relative_to_page(master_hwnd, self.hwnd);
+            let dx = (parent_rect.right - def_spacing * 2) - master_rect.right;
+            let dy = (parent_rect.bottom - def_spacing * 2) - master_rect.bottom;
+            let list_rect = window_rect_relative_to_page(list_hwnd, self.hwnd);
             hdwp = DeferWindowPos(
                 hdwp,
-                control_hwnd,
+                list_hwnd,
                 null_mut(),
-                control_rect.left + dx,
-                control_rect.top + dy,
                 0,
                 0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                (master_rect.right - list_rect.left + dx).max(0),
+                (master_rect.top - list_rect.top + dy - def_spacing).max(0),
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
-        }
-        EndDeferWindowPos(hdwp);
-    }
-    pub unsafe fn handle_notify(&mut self, lparam: isize) -> isize {
-        // 选择变化用于驱动按钮可用性，列点击则触发当前会话列表重新排序。
-        let notify = &*(lparam as *const NMLISTVIEW);
-        if notify.hdr.idFrom as i32 == IDC_USERLIST {
-            if notify.hdr.code == LVN_ITEMCHANGED {
-                self.selected_session_id = self.current_selected_session_id();
-                self.update_ui_state();
-                return 1;
-            }
-            if notify.hdr.code == LVN_COLUMNCLICK {
-                let column = notify.iSubItem.max(0) as usize;
-                if self.sort_column == column {
-                    self.sort_ascending = !self.sort_ascending;
-                } else {
-                    self.sort_column = column;
-                    self.sort_ascending = true;
+            for control_id in [
+                i32::from(IDM_DISCONNECT),
+                i32::from(IDM_LOGOFF),
+                i32::from(IDM_SENDMESSAGE),
+            ] {
+                let control_hwnd = GetDlgItem(self.hwnd, control_id);
+                if control_hwnd.is_null() {
+                    continue;
                 }
-                self.refresh();
-                return 1;
+                let control_rect = window_rect_relative_to_page(control_hwnd, self.hwnd);
+                hdwp = DeferWindowPos(
+                    hdwp,
+                    control_hwnd,
+                    null_mut(),
+                    control_rect.left + dx,
+                    control_rect.top + dy,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
             }
+            EndDeferWindowPos(hdwp);
         }
-        0
+    }
+    pub fn handle_notify(&mut self, lparam: isize) -> isize {
+        // 选择变化用于驱动按钮可用性，列点击则触发当前会话列表重新排序。
+        // SAFETY: `lparam` is provided by WM_NOTIFY and points to an NMLISTVIEW for this handler.
+        unsafe {
+            let notify = &*(lparam as *const NMLISTVIEW);
+            if notify.hdr.idFrom as i32 == IDC_USERLIST {
+                if notify.hdr.code == LVN_ITEMCHANGED {
+                    self.selected_session_id = self.current_selected_session_id();
+                    self.update_ui_state();
+                    return 1;
+                }
+                if notify.hdr.code == LVN_COLUMNCLICK {
+                    let column = notify.iSubItem.max(0) as usize;
+                    if self.sort_column == column {
+                        self.sort_ascending = !self.sort_ascending;
+                    } else {
+                        self.sort_column = column;
+                        self.sort_ascending = true;
+                    }
+                    self.refresh();
+                    return 1;
+                }
+            }
+            0
+        }
     }
 
-    pub unsafe fn handle_command(&mut self, command_id: u16) -> bool {
+    pub fn handle_command(&mut self, command_id: u16) -> bool {
         // 用户页命令都围绕会话管理：发消息、断开、注销、切换显示域名。
         match command_id {
             IDM_SENDMESSAGE => {
@@ -225,575 +235,627 @@ impl UserPageState {
         }
     }
 
-    pub unsafe fn show_context_menu(&mut self, x: i32, y: i32) {
+    pub fn show_context_menu(&mut self, x: i32, y: i32) {
         // 右键菜单只在有选择时弹出，并按当前会话状态动态禁用不合法操作。
-        let selected = self.selected_session_ids();
-        if selected.is_empty() {
-            return;
-        }
+        // SAFETY: context menu and selection queries are UI-thread operations for this page.
+        unsafe {
+            let selected = self.selected_session_ids();
+            if selected.is_empty() {
+                return;
+            }
 
-        let Some(popup) = build_popup_menu(IDR_USER_CONTEXT, usize::MAX) else {
-            return;
-        };
+            let Some(popup) = build_popup_menu(IDR_USER_CONTEXT, usize::MAX) else {
+                return;
+            };
 
-        self.update_menu_state(popup, &selected);
-        let command = TrackPopupMenuEx(popup, TPM_RETURNCMD, x, y, self.hwnd, null_mut());
-        windows_sys::Win32::UI::WindowsAndMessaging::DestroyMenu(popup);
-        if command != 0 {
-            self.handle_command(command as u16);
+            self.update_menu_state(popup, &selected);
+            let command = TrackPopupMenuEx(popup, TPM_RETURNCMD, x, y, self.hwnd, null_mut());
+            destroy_menu_handle(popup);
+            if command != 0 {
+                self.handle_command(command as u16);
+            }
         }
     }
 
-    unsafe fn configure_columns(&self) {
-        // 用户页列固定，直接按当前语言文本重建整套列表头即可。
-        let list = self.list_hwnd();
-        if list.is_null() {
-            return;
-        }
-
-        while SendMessageW(list, LVM_DELETECOLUMN, 0, 0) != 0 {}
-
-        let titles = user_column_titles();
-        let columns = [
-            (titles[0], 160, LVCFMT_LEFT),
-            (titles[1], 80, LVCFMT_RIGHT),
-            (titles[2], 90, LVCFMT_LEFT),
-            (titles[3], 120, LVCFMT_LEFT),
-            (user_session_column_title(), 90, LVCFMT_LEFT),
-        ];
-
-        for (index, (title, width, fmt)) in columns.iter().enumerate() {
-            let mut title_wide = to_wide_null(title);
-            let mut column = LVCOLUMNW {
-                mask: LVCF_FMT | LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM,
-                fmt: *fmt,
-                cx: *width,
-                pszText: title_wide.as_mut_ptr(),
-                cchTextMax: title_wide.len() as i32,
-                iSubItem: index as i32,
-                ..zeroed()
-            };
-            SendMessageW(
-                list,
-                LVM_INSERTCOLUMNW,
-                index,
-                &mut column as *mut _ as isize,
-            );
-        }
-    }
-
-    unsafe fn refresh(&mut self) {
-        // 刷新时先保存上一轮会话映射，再和新枚举结果做比对，
-        // 这样可以知道哪些行真正发生了变化。
-        let previous_selection = self.selected_session_id;
-        let mut previous_sessions = HashMap::with_capacity(self.sessions.len());
-        for session in self.sessions.drain(..) {
-            previous_sessions.insert(session.session_id, session);
-        }
-        let mut sessions_ptr = null_mut::<WTS_SESSION_INFOW>();
-        let mut session_count = 0u32;
-        if WTSEnumerateSessionsW(
-            WTS_CURRENT_SERVER_HANDLE,
-            0,
-            1,
-            &mut sessions_ptr,
-            &mut session_count,
-        ) == 0
-            || sessions_ptr.is_null()
-        {
-            self.sessions.clear();
-            self.update_listview();
-            self.update_ui_state();
-            return;
-        }
-
-        let mut sessions = Vec::with_capacity(session_count as usize);
-        for session in slice::from_raw_parts(sessions_ptr, session_count as usize) {
-            let user_name = query_session_string(session.SessionId, WTSUserName);
-            if user_name.is_empty() {
-                continue;
+    fn configure_columns(&self) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 用户页列固定，直接按当前语言文本重建整套列表头即可。
+            let list = self.list_hwnd();
+            if list.is_null() {
+                return;
             }
 
-            let domain_name = query_session_string(session.SessionId, WTSDomainName);
-            let client_name = query_session_string(session.SessionId, WTSClientName);
-            let display_name = if domain_name.is_empty() || !self.show_domain_names {
-                user_name.clone()
-            } else {
-                format!("{domain_name}\\{user_name}")
-            };
+            while SendMessageW(list, LVM_DELETECOLUMN, 0, 0) != 0 {}
 
-            let mut entry = UserSessionEntry {
-                session_id: session.SessionId,
-                display_name,
-                status: session_state_text(session.State),
-                client_name: if client_name.is_empty() {
-                    "-".to_string()
-                } else {
-                    client_name
-                },
-                session_name: widestr_ptr_to_string(session.pWinStationName),
-                dirty: true,
-            };
-            if let Some(previous) = previous_sessions.remove(&entry.session_id) {
-                entry.dirty = previous.display_name != entry.display_name
-                    || previous.status != entry.status
-                    || previous.client_name != entry.client_name
-                    || previous.session_name != entry.session_name;
-            }
-            sessions.push(entry);
-        }
+            let titles = user_column_titles();
+            let columns = [
+                (titles[0], 160, LVCFMT_LEFT),
+                (titles[1], 80, LVCFMT_RIGHT),
+                (titles[2], 90, LVCFMT_LEFT),
+                (titles[3], 120, LVCFMT_LEFT),
+                (user_session_column_title(), 90, LVCFMT_LEFT),
+            ];
 
-        WTSFreeMemory(sessions_ptr as _);
-
-        match self.sort_column {
-            1 => sessions.sort_by(|left, right| {
-                compare_user_sessions(left, right, self.sort_column, self.sort_ascending)
-            }),
-            2 => {
-                if self.sort_ascending {
-                    sessions.sort_by_cached_key(|entry| entry.status.to_lowercase());
-                } else {
-                    sessions.sort_by_cached_key(|entry| Reverse(entry.status.to_lowercase()));
-                }
-            }
-            3 => {
-                if self.sort_ascending {
-                    sessions.sort_by_cached_key(|entry| entry.client_name.to_lowercase());
-                } else {
-                    sessions.sort_by_cached_key(|entry| Reverse(entry.client_name.to_lowercase()));
-                }
-            }
-            4 => {
-                if self.sort_ascending {
-                    sessions.sort_by_cached_key(|entry| entry.session_name.to_lowercase());
-                } else {
-                    sessions.sort_by_cached_key(|entry| Reverse(entry.session_name.to_lowercase()));
-                }
-            }
-            _ => {
-                if self.sort_ascending {
-                    sessions.sort_by_cached_key(|entry| entry.display_name.to_lowercase());
-                } else {
-                    sessions.sort_by_cached_key(|entry| Reverse(entry.display_name.to_lowercase()));
-                }
-            }
-        }
-        self.sessions = sessions;
-        self.update_listview();
-
-        self.selected_session_id = previous_selection;
-        if let Some(session_id) = previous_selection {
-            self.restore_selection(session_id);
-        } else {
-            self.update_ui_state();
-        }
-    }
-
-    unsafe fn update_listview(&self) {
-        // 用户列表也采用增量同步策略，减少重排带来的闪烁和选择状态丢失。
-        let list = self.list_hwnd();
-        if list.is_null() {
-            return;
-        }
-
-        SendMessageW(list, WM_SETREDRAW, 0, 0);
-
-        let mut existing_count = SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) as usize;
-        let common_count = existing_count.min(self.sessions.len());
-
-        for index in 0..common_count {
-            let session = &self.sessions[index];
-            let mut current_item = LVITEMW {
-                mask: LVIF_PARAM,
-                iItem: index as i32,
-                ..zeroed()
-            };
-            let current_session_id =
-                if SendMessageW(list, LVM_GETITEMW, 0, &mut current_item as *mut _ as isize) != 0 {
-                    Some(current_item.lParam as u32)
-                } else {
-                    None
+            for (index, (title, width, fmt)) in columns.iter().enumerate() {
+                let mut title_wide = to_wide_null(title);
+                let mut column = LVCOLUMNW {
+                    mask: LVCF_FMT | LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM,
+                    fmt: *fmt,
+                    cx: *width,
+                    pszText: title_wide.as_mut_ptr(),
+                    cchTextMax: title_wide.len() as i32,
+                    iSubItem: index as i32,
+                    ..zeroed()
                 };
-
-            if current_session_id != Some(session.session_id) {
-                self.replace_row(list, index, session);
-            } else if session.dirty {
-                self.update_row(list, index, session);
+                SendMessageW(
+                    list,
+                    LVM_INSERTCOLUMNW,
+                    index,
+                    &mut column as *mut _ as isize,
+                );
             }
         }
-
-        while existing_count > self.sessions.len() {
-            existing_count -= 1;
-            SendMessageW(list, LVM_DELETEITEM, existing_count, 0);
-        }
-
-        for index in common_count..self.sessions.len() {
-            self.insert_row(list, index, &self.sessions[index]);
-        }
-
-        finish_list_view_update(list);
     }
 
-    unsafe fn insert_row(&self, list: HWND, index: usize, session: &UserSessionEntry) {
-        let mut user_name = to_wide_null(&session.display_name);
-        let mut item = LVITEMW {
-            mask: LVIF_TEXT | LVIF_PARAM,
-            iItem: index as i32,
-            iSubItem: 0,
-            pszText: user_name.as_mut_ptr(),
-            cchTextMax: user_name.len() as i32,
-            lParam: session.session_id as isize,
-            ..zeroed()
-        };
-        SendMessageW(list, LVM_INSERTITEMW, 0, &mut item as *mut _ as isize);
-        self.update_row(list, index, session);
-    }
-
-    unsafe fn replace_row(&self, list: HWND, index: usize, session: &UserSessionEntry) {
-        let mut user_name = to_wide_null(&session.display_name);
-        let mut item = LVITEMW {
-            mask: LVIF_TEXT | LVIF_PARAM,
-            iItem: index as i32,
-            iSubItem: 0,
-            pszText: user_name.as_mut_ptr(),
-            cchTextMax: user_name.len() as i32,
-            lParam: session.session_id as isize,
-            ..zeroed()
-        };
-        SendMessageW(list, LVM_SETITEMW, 0, &mut item as *mut _ as isize);
-        self.update_row(list, index, session);
-    }
-
-    unsafe fn update_row(&self, list: HWND, index: usize, session: &UserSessionEntry) {
-        // 第 1 列是字符串，第 2 列显示 session id，其余列回填状态和客户端信息。
-        let row = [
-            session.display_name.as_str(),
-            "",
-            session.status.as_str(),
-            session.client_name.as_str(),
-            session.session_name.as_str(),
-        ];
-        for (subitem, text) in row.iter().enumerate() {
-            let content = if subitem == 1 {
-                session.session_id.to_string()
-            } else {
-                (*text).to_string()
-            };
-            let mut value = to_wide_null(&content);
-            let mut subitem_item = LVITEMW {
-                mask: LVIF_TEXT,
-                iItem: index as i32,
-                iSubItem: subitem as i32,
-                pszText: value.as_mut_ptr(),
-                cchTextMax: value.len() as i32,
-                ..zeroed()
-            };
-            SendMessageW(list, LVM_SETITEMW, 0, &mut subitem_item as *mut _ as isize);
-        }
-    }
-
-    unsafe fn restore_selection(&self, session_id: u32) {
-        let list = self.list_hwnd();
-        if list.is_null() {
-            return;
-        }
-
-        for (index, session) in self.sessions.iter().enumerate() {
-            if session.session_id != session_id {
-                continue;
+    fn refresh(&mut self) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 刷新时先保存上一轮会话映射，再和新枚举结果做比对，
+            // 这样可以知道哪些行真正发生了变化。
+            let previous_selection = self.selected_session_id;
+            let mut previous_sessions = HashMap::with_capacity(self.sessions.len());
+            for session in self.sessions.drain(..) {
+                previous_sessions.insert(session.session_id, session);
             }
-
-            let mut item = LVITEMW {
-                stateMask: LVIS_SELECTED | LVIS_FOCUSED,
-                state: LVIS_SELECTED | LVIS_FOCUSED,
-                ..zeroed()
-            };
-            SendMessageW(list, LVM_SETITEMSTATE, index, &mut item as *mut _ as isize);
-            SendMessageW(list, LVM_ENSUREVISIBLE, index, 0);
-            break;
-        }
-
-        self.update_ui_state();
-    }
-
-    unsafe fn current_selected_session_id(&self) -> Option<u32> {
-        let list = self.list_hwnd();
-        if list.is_null() {
-            return None;
-        }
-
-        let index = SendMessageW(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize) as i32;
-        if index < 0 {
-            return None;
-        }
-
-        let mut item = LVITEMW {
-            mask: LVIF_PARAM | LVIF_STATE,
-            iItem: index,
-            ..zeroed()
-        };
-        if SendMessageW(list, LVM_GETITEMW, 0, &mut item as *mut _ as isize) != 0 {
-            Some(item.lParam as u32)
-        } else {
-            None
-        }
-    }
-
-    unsafe fn update_ui_state(&self) {
-        // “发送消息”只要有选择就可用；
-        // “断开”则不能对已经断开的会话再次执行。
-        let selected = self.selected_session_ids();
-        let send_enabled = !selected.is_empty();
-        let mut disconnect_enabled = !selected.is_empty();
-        let logoff_enabled = !selected.is_empty();
-
-        for session_id in &selected {
-            if let Some(session) = self
-                .sessions
-                .iter()
-                .find(|entry| entry.session_id == *session_id)
+            let mut sessions_ptr = null_mut::<WTS_SESSION_INFOW>();
+            let mut session_count = 0u32;
+            if WTSEnumerateSessionsW(
+                WTS_CURRENT_SERVER_HANDLE,
+                0,
+                1,
+                &mut sessions_ptr,
+                &mut session_count,
+            ) == 0
+                || sessions_ptr.is_null()
             {
-                if session.status == session_state("Disconnected") {
-                    disconnect_enabled = false;
+                self.sessions.clear();
+                self.update_listview();
+                self.update_ui_state();
+                return;
+            }
+
+            let Some(sessions_memory) = OwnedWtsMemory::new(sessions_ptr) else {
+                return;
+            };
+
+            let mut sessions = Vec::with_capacity(session_count as usize);
+            for session in slice::from_raw_parts(sessions_memory.as_ptr(), session_count as usize) {
+                let user_name = query_session_string(session.SessionId, WTSUserName);
+                if user_name.is_empty() {
+                    continue;
+                }
+
+                let domain_name = query_session_string(session.SessionId, WTSDomainName);
+                let client_name = query_session_string(session.SessionId, WTSClientName);
+                let display_name = if domain_name.is_empty() || !self.show_domain_names {
+                    user_name.clone()
+                } else {
+                    format!("{domain_name}\\{user_name}")
+                };
+
+                let mut entry = UserSessionEntry {
+                    session_id: session.SessionId,
+                    display_name,
+                    status: session_state_text(session.State),
+                    client_name: if client_name.is_empty() {
+                        "-".to_string()
+                    } else {
+                        client_name
+                    },
+                    session_name: widestr_ptr_to_string(session.pWinStationName),
+                    dirty: true,
+                };
+                if let Some(previous) = previous_sessions.remove(&entry.session_id) {
+                    entry.dirty = previous.display_name != entry.display_name
+                        || previous.status != entry.status
+                        || previous.client_name != entry.client_name
+                        || previous.session_name != entry.session_name;
+                }
+                sessions.push(entry);
+            }
+
+            match self.sort_column {
+                1 => sessions.sort_by(|left, right| {
+                    compare_user_sessions(left, right, self.sort_column, self.sort_ascending)
+                }),
+                2 => {
+                    if self.sort_ascending {
+                        sessions.sort_by_cached_key(|entry| entry.status.to_lowercase());
+                    } else {
+                        sessions.sort_by_cached_key(|entry| Reverse(entry.status.to_lowercase()));
+                    }
+                }
+                3 => {
+                    if self.sort_ascending {
+                        sessions.sort_by_cached_key(|entry| entry.client_name.to_lowercase());
+                    } else {
+                        sessions
+                            .sort_by_cached_key(|entry| Reverse(entry.client_name.to_lowercase()));
+                    }
+                }
+                4 => {
+                    if self.sort_ascending {
+                        sessions.sort_by_cached_key(|entry| entry.session_name.to_lowercase());
+                    } else {
+                        sessions
+                            .sort_by_cached_key(|entry| Reverse(entry.session_name.to_lowercase()));
+                    }
+                }
+                _ => {
+                    if self.sort_ascending {
+                        sessions.sort_by_cached_key(|entry| entry.display_name.to_lowercase());
+                    } else {
+                        sessions
+                            .sort_by_cached_key(|entry| Reverse(entry.display_name.to_lowercase()));
+                    }
                 }
             }
-        }
+            self.sessions = sessions;
+            self.update_listview();
 
-        for control_id in [IDM_DISCONNECT, IDM_LOGOFF, IDM_SENDMESSAGE] {
-            let control = GetDlgItem(self.hwnd, i32::from(control_id));
-            if !control.is_null() {
-                let enabled = match control_id {
-                    IDM_DISCONNECT => disconnect_enabled,
-                    IDM_LOGOFF => logoff_enabled,
-                    IDM_SENDMESSAGE => send_enabled,
-                    _ => false,
-                };
-                EnableWindow(control, i32::from(enabled));
+            self.selected_session_id = previous_selection;
+            if let Some(session_id) = previous_selection {
+                self.restore_selection(session_id);
+            } else {
+                self.update_ui_state();
             }
         }
     }
 
-    unsafe fn selected_session_ids(&self) -> Vec<u32> {
-        // 批量操作都基于当前多选会话列表，因此这里统一把所有选中项提取出来。
-        let list = self.list_hwnd();
-        if list.is_null() {
-            return Vec::new();
-        }
+    fn update_listview(&self) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 用户列表也采用增量同步策略，减少重排带来的闪烁和选择状态丢失。
+            let list = self.list_hwnd();
+            if list.is_null() {
+                return;
+            }
 
-        let mut selected = Vec::with_capacity(8);
-        let mut index = -1;
-        loop {
-            index = SendMessageW(
-                list,
-                LVM_GETNEXTITEM,
-                index.max(-1) as usize,
-                LVNI_SELECTED as isize,
-            ) as i32;
-            if index < 0 {
+            SendMessageW(list, WM_SETREDRAW, 0, 0);
+
+            let mut existing_count = SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) as usize;
+            let common_count = existing_count.min(self.sessions.len());
+
+            for index in 0..common_count {
+                let session = &self.sessions[index];
+                let mut current_item = LVITEMW {
+                    mask: LVIF_PARAM,
+                    iItem: index as i32,
+                    ..zeroed()
+                };
+                let current_session_id =
+                    if SendMessageW(list, LVM_GETITEMW, 0, &mut current_item as *mut _ as isize)
+                        != 0
+                    {
+                        Some(current_item.lParam as u32)
+                    } else {
+                        None
+                    };
+
+                if current_session_id != Some(session.session_id) {
+                    self.replace_row(list, index, session);
+                } else if session.dirty {
+                    self.update_row(list, index, session);
+                }
+            }
+
+            while existing_count > self.sessions.len() {
+                existing_count -= 1;
+                SendMessageW(list, LVM_DELETEITEM, existing_count, 0);
+            }
+
+            for index in common_count..self.sessions.len() {
+                self.insert_row(list, index, &self.sessions[index]);
+            }
+
+            finish_list_view_update(list);
+        }
+    }
+
+    fn insert_row(&self, list: HWND, index: usize, session: &UserSessionEntry) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            let mut user_name = to_wide_null(&session.display_name);
+            let mut item = LVITEMW {
+                mask: LVIF_TEXT | LVIF_PARAM,
+                iItem: index as i32,
+                iSubItem: 0,
+                pszText: user_name.as_mut_ptr(),
+                cchTextMax: user_name.len() as i32,
+                lParam: session.session_id as isize,
+                ..zeroed()
+            };
+            SendMessageW(list, LVM_INSERTITEMW, 0, &mut item as *mut _ as isize);
+            self.update_row(list, index, session);
+        }
+    }
+
+    fn replace_row(&self, list: HWND, index: usize, session: &UserSessionEntry) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            let mut user_name = to_wide_null(&session.display_name);
+            let mut item = LVITEMW {
+                mask: LVIF_TEXT | LVIF_PARAM,
+                iItem: index as i32,
+                iSubItem: 0,
+                pszText: user_name.as_mut_ptr(),
+                cchTextMax: user_name.len() as i32,
+                lParam: session.session_id as isize,
+                ..zeroed()
+            };
+            SendMessageW(list, LVM_SETITEMW, 0, &mut item as *mut _ as isize);
+            self.update_row(list, index, session);
+        }
+    }
+
+    fn update_row(&self, list: HWND, index: usize, session: &UserSessionEntry) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 第 1 列是字符串，第 2 列显示 session id，其余列回填状态和客户端信息。
+            let row = [
+                session.display_name.as_str(),
+                "",
+                session.status.as_str(),
+                session.client_name.as_str(),
+                session.session_name.as_str(),
+            ];
+            for (subitem, text) in row.iter().enumerate() {
+                let content = if subitem == 1 {
+                    session.session_id.to_string()
+                } else {
+                    (*text).to_string()
+                };
+                let mut value = to_wide_null(&content);
+                let mut subitem_item = LVITEMW {
+                    mask: LVIF_TEXT,
+                    iItem: index as i32,
+                    iSubItem: subitem as i32,
+                    pszText: value.as_mut_ptr(),
+                    cchTextMax: value.len() as i32,
+                    ..zeroed()
+                };
+                SendMessageW(list, LVM_SETITEMW, 0, &mut subitem_item as *mut _ as isize);
+            }
+        }
+    }
+
+    fn restore_selection(&self, session_id: u32) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            let list = self.list_hwnd();
+            if list.is_null() {
+                return;
+            }
+
+            for (index, session) in self.sessions.iter().enumerate() {
+                if session.session_id != session_id {
+                    continue;
+                }
+
+                let mut item = LVITEMW {
+                    stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+                    state: LVIS_SELECTED | LVIS_FOCUSED,
+                    ..zeroed()
+                };
+                SendMessageW(list, LVM_SETITEMSTATE, index, &mut item as *mut _ as isize);
+                SendMessageW(list, LVM_ENSUREVISIBLE, index, 0);
                 break;
             }
 
+            self.update_ui_state();
+        }
+    }
+
+    fn current_selected_session_id(&self) -> Option<u32> {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            let list = self.list_hwnd();
+            if list.is_null() {
+                return None;
+            }
+
+            let index =
+                SendMessageW(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize) as i32;
+            if index < 0 {
+                return None;
+            }
+
             let mut item = LVITEMW {
-                mask: LVIF_PARAM,
+                mask: LVIF_PARAM | LVIF_STATE,
                 iItem: index,
                 ..zeroed()
             };
             if SendMessageW(list, LVM_GETITEMW, 0, &mut item as *mut _ as isize) != 0 {
-                selected.push(item.lParam as u32);
+                Some(item.lParam as u32)
+            } else {
+                None
             }
         }
-        selected
     }
 
-    unsafe fn update_menu_state(&self, popup: HMENU, selected: &[u32]) {
-        let send_enabled = !selected.is_empty();
-        let mut disconnect_enabled = !selected.is_empty();
-        let logoff_enabled = !selected.is_empty();
+    fn update_ui_state(&self) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // “发送消息”只要有选择就可用；
+            // “断开”则不能对已经断开的会话再次执行。
+            let selected = self.selected_session_ids();
+            let send_enabled = !selected.is_empty();
+            let mut disconnect_enabled = !selected.is_empty();
+            let logoff_enabled = !selected.is_empty();
 
-        for session_id in selected {
-            if let Some(session) = self
-                .sessions
-                .iter()
-                .find(|entry| entry.session_id == *session_id)
-            {
-                if session.status == session_state("Disconnected") {
-                    disconnect_enabled = false;
+            for session_id in &selected {
+                if let Some(session) = self
+                    .sessions
+                    .iter()
+                    .find(|entry| entry.session_id == *session_id)
+                {
+                    if session.status == session_state("Disconnected") {
+                        disconnect_enabled = false;
+                    }
+                }
+            }
+
+            for control_id in [IDM_DISCONNECT, IDM_LOGOFF, IDM_SENDMESSAGE] {
+                let control = GetDlgItem(self.hwnd, i32::from(control_id));
+                if !control.is_null() {
+                    let enabled = match control_id {
+                        IDM_DISCONNECT => disconnect_enabled,
+                        IDM_LOGOFF => logoff_enabled,
+                        IDM_SENDMESSAGE => send_enabled,
+                        _ => false,
+                    };
+                    EnableWindow(control, i32::from(enabled));
                 }
             }
         }
-
-        if !send_enabled {
-            windows_sys::Win32::UI::WindowsAndMessaging::EnableMenuItem(
-                popup,
-                u32::from(IDM_SENDMESSAGE),
-                MF_BYCOMMAND | MF_GRAYED | MF_DISABLED,
-            );
-        }
-        if !disconnect_enabled {
-            windows_sys::Win32::UI::WindowsAndMessaging::EnableMenuItem(
-                popup,
-                u32::from(IDM_DISCONNECT),
-                MF_BYCOMMAND | MF_GRAYED | MF_DISABLED,
-            );
-        }
-        if !logoff_enabled {
-            windows_sys::Win32::UI::WindowsAndMessaging::EnableMenuItem(
-                popup,
-                u32::from(IDM_LOGOFF),
-                MF_BYCOMMAND | MF_GRAYED | MF_DISABLED,
-            );
-        }
-        windows_sys::Win32::UI::WindowsAndMessaging::CheckMenuItem(
-            popup,
-            u32::from(IDM_SHOWDOMAINNAMES),
-            MF_BYCOMMAND
-                | if self.show_domain_names {
-                    MF_CHECKED
-                } else {
-                    MF_UNCHECKED
-                },
-        );
     }
 
-    unsafe fn send_message(&mut self) {
-        // 发送消息会先弹出输入对话框，再逐个会话调用 WTSSendMessageW。
-        let selected = self.selected_session_ids();
-        if selected.is_empty() {
-            return;
-        }
+    fn selected_session_ids(&self) -> Vec<u32> {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 批量操作都基于当前多选会话列表，因此这里统一把所有选中项提取出来。
+            let list = self.list_hwnd();
+            if list.is_null() {
+                return Vec::new();
+            }
 
-        let mut result = MessageDialogResult::default();
-        if dialog_box(
-            self.hinstance as _,
-            IDD_MESSAGE,
-            self.hwnd,
-            Some(message_dialog_proc),
-            &mut result as *mut _ as LPARAM,
-        ) != IDOK as isize
-        {
-            return;
-        }
+            let mut selected = Vec::with_capacity(8);
+            let mut index = -1;
+            loop {
+                index = SendMessageW(
+                    list,
+                    LVM_GETNEXTITEM,
+                    index.max(-1) as usize,
+                    LVNI_SELECTED as isize,
+                ) as i32;
+                if index < 0 {
+                    break;
+                }
 
-        let title = to_wide_null(&result.title);
-        let body = to_wide_null(&result.body);
-        for session_id in selected {
-            let mut response = 0i32;
-            if WTSSendMessageW(
-                WTS_CURRENT_SERVER_HANDLE,
-                session_id,
-                title.as_ptr(),
-                (result.title.encode_utf16().count() * 2) as u32,
-                body.as_ptr(),
-                (result.body.encode_utf16().count() * 2) as u32,
-                MB_OK | MB_TOPMOST | MB_ICONINFORMATION,
-                0,
-                &mut response,
-                0,
-            ) == 0
+                let mut item = LVITEMW {
+                    mask: LVIF_PARAM,
+                    iItem: index,
+                    ..zeroed()
+                };
+                if SendMessageW(list, LVM_GETITEMW, 0, &mut item as *mut _ as isize) != 0 {
+                    selected.push(item.lParam as u32);
+                }
+            }
+            selected
+        }
+    }
+
+    fn update_menu_state(&self, popup: HMENU, selected: &[u32]) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            let send_enabled = !selected.is_empty();
+            let mut disconnect_enabled = !selected.is_empty();
+            let logoff_enabled = !selected.is_empty();
+
+            for session_id in selected {
+                if let Some(session) = self
+                    .sessions
+                    .iter()
+                    .find(|entry| entry.session_id == *session_id)
+                {
+                    if session.status == session_state("Disconnected") {
+                        disconnect_enabled = false;
+                    }
+                }
+            }
+
+            if !send_enabled {
+                windows_sys::Win32::UI::WindowsAndMessaging::EnableMenuItem(
+                    popup,
+                    u32::from(IDM_SENDMESSAGE),
+                    MF_BYCOMMAND | MF_GRAYED | MF_DISABLED,
+                );
+            }
+            if !disconnect_enabled {
+                windows_sys::Win32::UI::WindowsAndMessaging::EnableMenuItem(
+                    popup,
+                    u32::from(IDM_DISCONNECT),
+                    MF_BYCOMMAND | MF_GRAYED | MF_DISABLED,
+                );
+            }
+            if !logoff_enabled {
+                windows_sys::Win32::UI::WindowsAndMessaging::EnableMenuItem(
+                    popup,
+                    u32::from(IDM_LOGOFF),
+                    MF_BYCOMMAND | MF_GRAYED | MF_DISABLED,
+                );
+            }
+            windows_sys::Win32::UI::WindowsAndMessaging::CheckMenuItem(
+                popup,
+                u32::from(IDM_SHOWDOMAINNAMES),
+                MF_BYCOMMAND
+                    | if self.show_domain_names {
+                        MF_CHECKED
+                    } else {
+                        MF_UNCHECKED
+                    },
+            );
+        }
+    }
+
+    fn send_message(&mut self) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 发送消息会先弹出输入对话框，再逐个会话调用 WTSSendMessageW。
+            let selected = self.selected_session_ids();
+            if selected.is_empty() {
+                return;
+            }
+
+            let mut result = MessageDialogResult::default();
+            if dialog_box(
+                self.hinstance as _,
+                IDD_MESSAGE,
+                self.hwnd,
+                Some(message_dialog_proc),
+                &mut result as *mut _ as LPARAM,
+            ) != IDOK as isize
             {
-                self.show_command_failure(text(TextKey::MessageCouldNotBeSent));
-                break;
+                return;
+            }
+
+            let title = to_wide_null(&result.title);
+            let body = to_wide_null(&result.body);
+            for session_id in selected {
+                let mut response = 0i32;
+                if WTSSendMessageW(
+                    WTS_CURRENT_SERVER_HANDLE,
+                    session_id,
+                    title.as_ptr(),
+                    (result.title.encode_utf16().count() * 2) as u32,
+                    body.as_ptr(),
+                    (result.body.encode_utf16().count() * 2) as u32,
+                    MB_OK | MB_TOPMOST | MB_ICONINFORMATION,
+                    0,
+                    &mut response,
+                    0,
+                ) == 0
+                {
+                    self.show_command_failure(text(TextKey::MessageCouldNotBeSent));
+                    break;
+                }
             }
         }
     }
 
-    unsafe fn change_session_state(&mut self, command_id: u16) {
-        // 断开/注销属于高影响操作，先确认，再逐个会话执行，失败时立即报错并停止。
-        let selected = self.selected_session_ids();
-        if selected.is_empty() {
-            return;
-        }
+    fn change_session_state(&mut self, command_id: u16) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 断开/注销属于高影响操作，先确认，再逐个会话执行，失败时立即报错并停止。
+            let selected = self.selected_session_ids();
+            if selected.is_empty() {
+                return;
+            }
 
-        let prompt = if command_id == IDM_LOGOFF {
-            text(TextKey::ConfirmLogoffSelectedUsers)
-        } else {
-            text(TextKey::ConfirmDisconnectSelectedUsers)
-        };
-        let prompt_wide = to_wide_null(prompt);
-        let caption_wide = to_wide_null(&load_string(self.hinstance as _, IDS_TASKMGR));
-        if MessageBoxW(
-            self.hwnd,
-            prompt_wide.as_ptr(),
-            caption_wide.as_ptr(),
-            MB_YESNO | MB_DEFBUTTON2 | MB_ICONEXCLAMATION,
-        ) == IDNO
-        {
-            return;
-        }
-
-        for session_id in selected {
-            let succeeded = if command_id == IDM_LOGOFF {
-                WTSLogoffSession(WTS_CURRENT_SERVER_HANDLE, session_id, 0) != 0
+            let prompt = if command_id == IDM_LOGOFF {
+                text(TextKey::ConfirmLogoffSelectedUsers)
             } else {
-                WTSDisconnectSession(WTS_CURRENT_SERVER_HANDLE, session_id, 0) != 0
+                text(TextKey::ConfirmDisconnectSelectedUsers)
             };
-            if !succeeded {
-                self.show_command_failure(if command_id == IDM_LOGOFF {
-                    text(TextKey::SelectedUserCouldNotBeLoggedOff)
-                } else {
-                    text(TextKey::SelectedUserCouldNotBeDisconnected)
-                });
-                break;
+            let prompt_wide = to_wide_null(prompt);
+            let caption_wide = to_wide_null(text(TextKey::AppTitle));
+            if MessageBoxW(
+                self.hwnd,
+                prompt_wide.as_ptr(),
+                caption_wide.as_ptr(),
+                MB_YESNO | MB_DEFBUTTON2 | MB_ICONEXCLAMATION,
+            ) == IDNO
+            {
+                return;
             }
-        }
 
-        self.refresh();
+            for session_id in selected {
+                let succeeded = if command_id == IDM_LOGOFF {
+                    WTSLogoffSession(WTS_CURRENT_SERVER_HANDLE, session_id, 0) != 0
+                } else {
+                    WTSDisconnectSession(WTS_CURRENT_SERVER_HANDLE, session_id, 0) != 0
+                };
+                if !succeeded {
+                    self.show_command_failure(if command_id == IDM_LOGOFF {
+                        text(TextKey::SelectedUserCouldNotBeLoggedOff)
+                    } else {
+                        text(TextKey::SelectedUserCouldNotBeDisconnected)
+                    });
+                    break;
+                }
+            }
+
+            self.refresh();
+        }
     }
 
-    unsafe fn show_command_failure(&self, message: &str) {
-        // 统一附带最后一个 Win32 错误码，方便排查权限或会话状态问题。
-        let last_error = GetLastError();
-        let body = if last_error == 0 {
-            message.to_string()
-        } else {
-            format!(
-                "{}\n\n{} {last_error}",
-                message,
-                text(TextKey::Win32ErrorPrefix)
-            )
-        };
-        let body_wide = to_wide_null(&body);
-        let caption_wide = to_wide_null(&load_string(self.hinstance as _, IDS_TASKMGR));
-        MessageBoxW(
-            self.hwnd,
-            body_wide.as_ptr(),
-            caption_wide.as_ptr(),
-            MB_OK | MB_ICONERROR,
-        );
+    fn show_command_failure(&self, message: &str) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 统一附带最后一个 Win32 错误码，方便排查权限或会话状态问题。
+            let last_error = GetLastError();
+            let body = if last_error == 0 {
+                message.to_string()
+            } else {
+                format!(
+                    "{}\n\n{} {last_error}",
+                    message,
+                    text(TextKey::Win32ErrorPrefix)
+                )
+            };
+            let body_wide = to_wide_null(&body);
+            let caption_wide = to_wide_null(text(TextKey::AppTitle));
+            MessageBoxW(
+                self.hwnd,
+                body_wide.as_ptr(),
+                caption_wide.as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+        }
     }
 
     fn list_hwnd(&self) -> HWND {
+        // SAFETY: this only queries a child HWND from this page dialog; null is allowed.
         unsafe { GetDlgItem(self.hwnd, IDC_USERLIST) }
     }
 }
 
-unsafe fn window_rect_relative_to_page(hwnd: HWND, page_hwnd: HWND) -> RECT {
-    let mut rect = zeroed::<RECT>();
-    windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect);
-    MapWindowPoints(null_mut(), page_hwnd, &mut rect as *mut _ as _, 2);
-    rect
-}
-unsafe fn query_session_string(session_id: u32, info_class: i32) -> String {
-    // 终端服务 API 返回的是系统分配的 UTF-16 缓冲区，需要在复制完字符串后手动释放。
-    let mut buffer = null_mut();
-    let mut bytes = 0u32;
-    if WTSQuerySessionInformationW(
-        WTS_CURRENT_SERVER_HANDLE,
-        session_id,
-        info_class,
-        &mut buffer,
-        &mut bytes,
-    ) == 0
-        || buffer.is_null()
-        || bytes == 0
-    {
-        return String::new();
-    }
+fn query_session_string(session_id: u32, info_class: i32) -> String {
+    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    unsafe {
+        // 终端服务 API 返回的是系统分配的 UTF-16 缓冲区，需要在复制完字符串后手动释放。
+        let mut buffer = null_mut();
+        let mut bytes = 0u32;
+        if WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            session_id,
+            info_class,
+            &mut buffer,
+            &mut bytes,
+        ) == 0
+            || buffer.is_null()
+            || bytes == 0
+        {
+            return String::new();
+        }
 
-    let len = (bytes as usize / 2).saturating_sub(1);
-    let value = String::from_utf16_lossy(slice::from_raw_parts(buffer, len));
-    WTSFreeMemory(buffer as _);
-    value
+        let Some(buffer) = OwnedWtsMemory::new(buffer) else {
+            return String::new();
+        };
+        let len = (bytes as usize / 2).saturating_sub(1);
+        String::from_utf16_lossy(slice::from_raw_parts(buffer.as_ptr(), len))
+    }
 }
 
 fn compare_user_sessions(
@@ -825,21 +887,6 @@ fn compare_user_sessions(
     } else {
         ordering.reverse()
     }
-}
-
-unsafe fn widestr_ptr_to_string(text: *const u16) -> String {
-    if text.is_null() {
-        return String::new();
-    }
-
-    // 防止缺失终止符的异常缓冲区触发无界内存读取。
-    const MAX_WIDE_CHARS: usize = 32 * 1024;
-    let mut len = 0usize;
-    while len < MAX_WIDE_CHARS && *text.add(len) != 0 {
-        len += 1;
-    }
-
-    String::from_utf16_lossy(slice::from_raw_parts(text, len))
 }
 
 fn session_state_text(state: WTS_CONNECTSTATE_CLASS) -> String {
@@ -903,31 +950,34 @@ unsafe extern "system" fn message_dialog_proc(
     }
 }
 
-unsafe fn get_dialog_item_text(hwnd: HWND, control_id: i32) -> String {
-    // 小型输入对话框直接把控件文本读回为 Rust String，便于后续传给 WTS API。
-    let control = GetDlgItem(hwnd, control_id);
-    if control.is_null() {
-        return String::new();
+fn get_dialog_item_text(hwnd: HWND, control_id: i32) -> String {
+    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    unsafe {
+        // 小型输入对话框直接把控件文本读回为 Rust String，便于后续传给 WTS API。
+        let control = GetDlgItem(hwnd, control_id);
+        if control.is_null() {
+            return String::new();
+        }
+
+        let length = GetWindowTextLengthW(control);
+        if length <= 0 {
+            return String::new();
+        }
+
+        let Ok(length) = usize::try_from(length) else {
+            return String::new();
+        };
+
+        let mut buffer = vec![0u16; length + 1];
+        let actual = GetWindowTextW(
+            control,
+            buffer.as_mut_ptr(),
+            i32::try_from(buffer.len()).expect("GetWindowTextW buffer length fits in i32"),
+        );
+        let Ok(actual) = usize::try_from(actual) else {
+            return String::new();
+        };
+
+        String::from_utf16_lossy(&buffer[..actual])
     }
-
-    let length = GetWindowTextLengthW(control);
-    if length <= 0 {
-        return String::new();
-    }
-
-    let Ok(length) = usize::try_from(length) else {
-        return String::new();
-    };
-
-    let mut buffer = vec![0u16; length + 1];
-    let actual = GetWindowTextW(
-        control,
-        buffer.as_mut_ptr(),
-        i32::try_from(buffer.len()).expect("GetWindowTextW buffer length fits in i32"),
-    );
-    let Ok(actual) = usize::try_from(actual) else {
-        return String::new();
-    };
-
-    String::from_utf16_lossy(&buffer[..actual])
 }

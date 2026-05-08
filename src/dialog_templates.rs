@@ -27,6 +27,14 @@ const BS_DEFPUSHBUTTON_STYLE: u32 = BS_DEFPUSHBUTTON as u32;
 const ES_MULTILINE_STYLE: u32 = ES_MULTILINE as u32;
 const ES_AUTOVSCROLL_STYLE: u32 = ES_AUTOVSCROLL as u32;
 const SBS_VERT_STYLE: u32 = SBS_VERT as u32;
+const DIALOG_FONT_NAME: &str = "MS Shell Dlg";
+const DIALOG_FONT_SIZE: u16 = 8;
+const CPU_LABELS: [&str; 32] = [
+    "CPU 0", "CPU 1", "CPU 2", "CPU 3", "CPU 4", "CPU 5", "CPU 6", "CPU 7", "CPU 8", "CPU 9",
+    "CPU 10", "CPU 11", "CPU 12", "CPU 13", "CPU 14", "CPU 15", "CPU 16", "CPU 17", "CPU 18",
+    "CPU 19", "CPU 20", "CPU 21", "CPU 22", "CPU 23", "CPU 24", "CPU 25", "CPU 26", "CPU 27",
+    "CPU 28", "CPU 29", "CPU 30", "CPU 31",
+];
 
 struct ControlSpec<'a> {
     // 单个控件的声明式描述，会被编译进 Win32 `DLGTEMPLATE` 缓冲区。
@@ -238,8 +246,8 @@ fn build_main_dialog() -> DialogSpec<'static> {
         cx: 264,
         cy: 247,
         title: "",
-        font_name: "Segoe UI",
-        font_size: 9,
+        font_name: DIALOG_FONT_NAME,
+        font_size: DIALOG_FONT_SIZE,
         controls: vec![ControlSpec {
             class_name: "SysTabControl32",
             text: "Tab1",
@@ -313,8 +321,8 @@ fn build_perf_dialog() -> DialogSpec<'static> {
         cx: 438,
         cy: 303,
         title: "",
-        font_name: "Segoe UI",
-        font_size: 9,
+        font_name: DIALOG_FONT_NAME,
+        font_size: DIALOG_FONT_SIZE,
         controls,
     }
 }
@@ -328,8 +336,8 @@ fn build_network_dialog() -> DialogSpec<'static> {
         cx: 438,
         cy: 303,
         title: "",
-        font_name: "Segoe UI",
-        font_size: 9,
+        font_name: DIALOG_FONT_NAME,
+        font_size: DIALOG_FONT_SIZE,
         controls: vec![
             ControlSpec {
                 class_name: "SysListView32",
@@ -375,8 +383,8 @@ fn build_process_dialog() -> DialogSpec<'static> {
         cx: 393,
         cy: 197,
         title: "",
-        font_name: "Segoe UI",
-        font_size: 9,
+        font_name: DIALOG_FONT_NAME,
+        font_size: DIALOG_FONT_SIZE,
         controls: vec![
             ControlSpec {
                 class_name: "SysListView32",
@@ -403,8 +411,8 @@ fn build_task_dialog() -> DialogSpec<'static> {
         cx: 393,
         cy: 177,
         title: "",
-        font_name: "Segoe UI",
-        font_size: 9,
+        font_name: DIALOG_FONT_NAME,
+        font_size: DIALOG_FONT_SIZE,
         controls: vec![
             ControlSpec {
                 class_name: "SysListView32",
@@ -638,8 +646,8 @@ fn build_select_columns_dialog() -> DialogSpec<'static> {
         cx: 191,
         cy: 141,
         title: "Select Columns",
-        font_name: "Segoe UI",
-        font_size: 9,
+        font_name: DIALOG_FONT_NAME,
+        font_size: DIALOG_FONT_SIZE,
         controls,
     }
 }
@@ -657,7 +665,7 @@ fn build_affinity_dialog() -> DialogSpec<'static> {
         let cx = if cpu_index >= 10 { 41 } else { 37 };
         controls.push(ControlSpec {
             class_name: "Button",
-            text: Box::leak(format!("CPU {}", cpu_index).into_boxed_str()),
+            text: CPU_LABELS[cpu_index as usize],
             id: (IDC_CPU0 + cpu_index) as u16,
             style: WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX_STYLE,
             ex_style: 0,
@@ -697,8 +705,8 @@ fn build_affinity_dialog() -> DialogSpec<'static> {
         cx: 232,
         cy: 157,
         title: "Processor Affinity",
-        font_name: "Segoe UI",
-        font_size: 9,
+        font_name: DIALOG_FONT_NAME,
+        font_size: DIALOG_FONT_SIZE,
         controls,
     }
 }
@@ -712,8 +720,8 @@ fn build_users_dialog() -> DialogSpec<'static> {
         cx: 393,
         cy: 197,
         title: "",
-        font_name: "Segoe UI",
-        font_size: 9,
+        font_name: DIALOG_FONT_NAME,
+        font_size: DIALOG_FONT_SIZE,
         controls: vec![
             ControlSpec {
                 class_name: "SysListView32",
@@ -750,8 +758,8 @@ fn build_message_dialog() -> DialogSpec<'static> {
         cx: 214,
         cy: 114,
         title: "Send Message",
-        font_name: "Segoe UI",
-        font_size: 9,
+        font_name: DIALOG_FONT_NAME,
+        font_size: DIALOG_FONT_SIZE,
         controls: vec![
             static_text("&Message title:", IDC_MESSAGE_TITLE_LABEL, 0, 7, 7, 200, 8),
             edit_text(
@@ -792,7 +800,7 @@ fn dialog_spec(dialog_id: u16) -> Option<DialogSpec<'static>> {
     })
 }
 
-pub unsafe fn create_dialog(
+pub fn create_dialog(
     hinstance: HINSTANCE,
     dialog_id: u16,
     parent: HWND,
@@ -803,16 +811,20 @@ pub unsafe fn create_dialog(
         return std::ptr::null_mut();
     };
     let template = DialogTemplateBuilder::new().build(spec);
-    CreateDialogIndirectParamW(
-        hinstance,
-        template.as_ptr() as *const _,
-        parent,
-        dialog_proc,
-        init_param,
-    )
+    // SAFETY: the generated template buffer is valid for the duration of the call; Win32 copies
+    // or consumes it before returning the dialog handle.
+    unsafe {
+        CreateDialogIndirectParamW(
+            hinstance,
+            template.as_ptr() as *const _,
+            parent,
+            dialog_proc,
+            init_param,
+        )
+    }
 }
 
-pub unsafe fn dialog_box(
+pub fn dialog_box(
     hinstance: HINSTANCE,
     dialog_id: u16,
     parent: HWND,
@@ -823,11 +835,15 @@ pub unsafe fn dialog_box(
         return -1;
     };
     let template = DialogTemplateBuilder::new().build(spec);
-    DialogBoxIndirectParamW(
-        hinstance,
-        template.as_ptr() as *const _,
-        parent,
-        dialog_proc,
-        init_param,
-    )
+    // SAFETY: the generated template buffer remains alive while the modal dialog is created and
+    // run by `DialogBoxIndirectParamW`.
+    unsafe {
+        DialogBoxIndirectParamW(
+            hinstance,
+            template.as_ptr() as *const _,
+            parent,
+            dialog_proc,
+            init_param,
+        )
+    }
 }

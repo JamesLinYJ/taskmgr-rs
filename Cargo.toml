@@ -5,6 +5,7 @@ name = "taskmgr"
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"
+exclude = [".claude/**", ".tmp-pip/**", ".tmp-tests/**", ".vs/**"]
 
 # 发布配置偏向生成体积更小、更接近系统工具风格的可执行文件。
 [profile.release]
@@ -53,4 +54,9 @@ windows = { version = "0.62", features = [
 windows-numerics = "0.3.1"
 
 [build-dependencies]
+syn = { version = "2", features = ["full"] }
+toml = "0.8"
 winres = "0.1"
+
+[dev-dependencies]
+syn = { version = "2", features = ["full"] }

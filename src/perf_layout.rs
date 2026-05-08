@@ -64,13 +64,13 @@ pub fn compute_perf_layout(
     let graph_height =
         (cpu_history_height - spacing.inner_spacing * 2 - spacing.top_spacing).max(0);
 
+    let meter_left = anchors.cpu_usage_frame.left + spacing.inner_spacing * 2;
+    let meter_top = anchors.cpu_usage_frame.top + spacing.top_spacing;
     let meter_rect = RECT {
-        left: anchors.cpu_usage_frame.left + spacing.inner_spacing * 2,
-        top: anchors.cpu_usage_frame.top + spacing.top_spacing,
-        right: anchors.cpu_usage_frame.left
-            + spacing.inner_spacing * 2
-            + rect_width(anchors.cpu_usage_frame),
-        bottom: anchors.cpu_usage_frame.top + spacing.top_spacing + graph_height,
+        left: meter_left,
+        top: meter_top,
+        right: (anchors.cpu_usage_frame.right - spacing.inner_spacing * 2).max(meter_left),
+        bottom: meter_top + graph_height,
     };
 
     let mem_top = cpu_history_height + spacing.def_spacing * 2;
@@ -88,11 +88,11 @@ pub fn compute_perf_layout(
         bottom: mem_top + cpu_history_height,
     };
 
-    let mem_graph_width = (cpu_history_width - spacing.inner_spacing * 2).max(0);
+    let mem_graph_left = mem_frame_rect.left + spacing.inner_spacing * 2;
     let mem_graph_rect = RECT {
-        left: anchors.cpu_history_frame.left + spacing.inner_spacing * 2,
+        left: mem_graph_left,
         top: mem_top + spacing.top_spacing,
-        right: anchors.cpu_history_frame.left + spacing.inner_spacing * 2 + mem_graph_width,
+        right: (mem_frame_rect.right - spacing.inner_spacing * 2).max(mem_graph_left),
         bottom: mem_top + spacing.top_spacing + graph_height,
     };
 
@@ -160,4 +160,66 @@ pub fn next_graph_surface_extent(current: i32, required: i32, quantum: i32) -> i
 
 fn rect_width(rect: RECT) -> i32 {
     rect.right - rect.left
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    fn sample_anchors() -> PerfLayoutAnchors {
+        PerfLayoutAnchors {
+            master_rect: rect(10, 180, 160, 220),
+            top_frame: rect(10, 160, 160, 200),
+            cpu_history_frame: rect(130, 10, 200, 100),
+            cpu_usage_frame: rect(10, 10, 110, 100),
+            mem_bar_frame: rect(10, 110, 110, 200),
+            mem_frame: rect(130, 110, 200, 200),
+        }
+    }
+
+    fn sample_spacing() -> PerfDialogSpacing {
+        PerfDialogSpacing {
+            def_spacing: 6,
+            inner_spacing: 3,
+            top_spacing: 15,
+        }
+    }
+
+    #[test]
+    fn meter_rect_respects_frame_inner_padding() {
+        let layout = compute_perf_layout(
+            rect(0, 0, 640, 260),
+            sample_anchors(),
+            sample_spacing(),
+            1,
+            false,
+        );
+
+        assert_eq!(layout.meter_rect.left, 16);
+        assert_eq!(layout.meter_rect.right, 104);
+        assert!(layout.meter_rect.right <= sample_anchors().cpu_usage_frame.right);
+    }
+
+    #[test]
+    fn memory_graph_uses_memory_frame_bounds() {
+        let layout = compute_perf_layout(
+            rect(0, 0, 640, 260),
+            sample_anchors(),
+            sample_spacing(),
+            1,
+            false,
+        );
+
+        assert_eq!(layout.mem_graph_rect.left, layout.mem_frame_rect.left + 6);
+        assert_eq!(layout.mem_graph_rect.right, layout.mem_frame_rect.right - 6);
+    }
 }

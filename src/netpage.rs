@@ -135,7 +135,7 @@ impl NetworkPageState {
         self.refresh();
     }
 
-    pub fn apply_options(&mut self, options: &Options) {
+    pub unsafe fn apply_options(&mut self, options: &Options) {
         // 网络页当前只有无标题布局依赖全局选项，因此这里比较轻量。
         let previous = self.no_title;
         self.no_title = options.no_title();
@@ -148,7 +148,7 @@ impl NetworkPageState {
         }
     }
 
-    pub fn no_title(&self) -> bool {
+    pub unsafe fn no_title(&self) -> bool {
         self.no_title
     }
 

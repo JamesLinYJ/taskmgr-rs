@@ -8,16 +8,16 @@ use crate::runtime_menu::{MenuBar, MenuItemState, PopupMenu};
 use crate::winutil::sanitize_task_manager_menu;
 use windows_sys::Win32::UI::WindowsAndMessaging::HMENU;
 
-unsafe fn append_item(menu: &mut PopupMenu, command_id: u16, key: TextKey) -> bool {
+fn append_item(menu: &mut PopupMenu, command_id: u16, key: TextKey) -> bool {
     // 菜单项统一走语言键，避免调用方自己取文本。
     menu.append_item(command_id, text(key), MenuItemState::ENABLED)
 }
 
-unsafe fn append_separator(menu: &mut PopupMenu) -> bool {
+fn append_separator(menu: &mut PopupMenu) -> bool {
     menu.append_separator()
 }
 
-unsafe fn build_update_speed_menu() -> Option<PopupMenu> {
+fn build_update_speed_menu() -> Option<PopupMenu> {
     // 刷新速度子菜单会被多个主菜单复用。
     let mut menu = PopupMenu::new()?;
     for (command_id, key) in [
@@ -33,7 +33,7 @@ unsafe fn build_update_speed_menu() -> Option<PopupMenu> {
     Some(menu)
 }
 
-unsafe fn build_file_menu() -> Option<PopupMenu> {
+fn build_file_menu() -> Option<PopupMenu> {
     // 文件菜单保持经典任务管理器的精简结构：新任务 + 退出。
     let mut menu = PopupMenu::new()?;
     if !append_item(&mut menu, IDM_RUN, TextKey::NewTaskMenu) {
@@ -48,7 +48,7 @@ unsafe fn build_file_menu() -> Option<PopupMenu> {
     Some(menu)
 }
 
-unsafe fn build_options_menu(base_items: &[(u16, TextKey)]) -> Option<PopupMenu> {
+fn build_options_menu(base_items: &[(u16, TextKey)]) -> Option<PopupMenu> {
     // `command_id == 0` 代表分隔线，其余项则按顺序展开成普通菜单项。
     let mut menu = PopupMenu::new()?;
     for (index, (command_id, key)) in base_items.iter().copied().enumerate() {
@@ -68,7 +68,7 @@ unsafe fn build_options_menu(base_items: &[(u16, TextKey)]) -> Option<PopupMenu>
     Some(menu)
 }
 
-unsafe fn build_task_view_popup() -> Option<PopupMenu> {
+fn build_task_view_popup() -> Option<PopupMenu> {
     // 任务页视图菜单只负责应用程序页自己的显示模式。
     let mut menu = PopupMenu::new()?;
     if !append_item(&mut menu, IDM_RUN, TextKey::NewTaskMenu) {
@@ -89,7 +89,7 @@ unsafe fn build_task_view_popup() -> Option<PopupMenu> {
     Some(menu)
 }
 
-unsafe fn build_task_context_popup() -> Option<PopupMenu> {
+fn build_task_context_popup() -> Option<PopupMenu> {
     // 任务页右键菜单仍然保持老 Task Manager 的命令顺序。
     let mut menu = PopupMenu::new()?;
     for (index, (command_id, key)) in [
@@ -123,7 +123,7 @@ unsafe fn build_task_context_popup() -> Option<PopupMenu> {
     Some(menu)
 }
 
-unsafe fn build_perf_view_menu() -> Option<PopupMenu> {
+fn build_perf_view_menu() -> Option<PopupMenu> {
     // 性能页视图菜单额外承载 CPU 历史模式等性能页专属选项。
     let mut menu = PopupMenu::new()?;
     if !append_item(&mut menu, IDM_REFRESH, TextKey::RefreshNow) {
@@ -154,7 +154,7 @@ unsafe fn build_perf_view_menu() -> Option<PopupMenu> {
     Some(menu)
 }
 
-unsafe fn build_common_help_menu() -> Option<PopupMenu> {
+fn build_common_help_menu() -> Option<PopupMenu> {
     let mut menu = PopupMenu::new()?;
     if !append_item(&mut menu, IDM_HELP, TextKey::HelpTopics) {
         return None;
@@ -168,7 +168,7 @@ unsafe fn build_common_help_menu() -> Option<PopupMenu> {
     Some(menu)
 }
 
-unsafe fn build_task_main_menu() -> Option<MenuBar> {
+fn build_task_main_menu() -> Option<MenuBar> {
     let mut bar = MenuBar::new()?;
     let file = build_file_menu()?;
     let options = build_options_menu(&[
@@ -211,7 +211,7 @@ unsafe fn build_task_main_menu() -> Option<MenuBar> {
     Some(bar)
 }
 
-unsafe fn build_process_main_menu() -> Option<MenuBar> {
+fn build_process_main_menu() -> Option<MenuBar> {
     let mut bar = MenuBar::new()?;
     let file = build_file_menu()?;
     let options = build_options_menu(&[
@@ -238,7 +238,7 @@ unsafe fn build_process_main_menu() -> Option<MenuBar> {
     Some(bar)
 }
 
-unsafe fn build_perf_main_menu() -> Option<MenuBar> {
+fn build_perf_main_menu() -> Option<MenuBar> {
     let mut bar = MenuBar::new()?;
     let file = build_file_menu()?;
     let options = build_options_menu(&[
@@ -258,7 +258,7 @@ unsafe fn build_perf_main_menu() -> Option<MenuBar> {
     Some(bar)
 }
 
-unsafe fn build_network_main_menu() -> Option<MenuBar> {
+fn build_network_main_menu() -> Option<MenuBar> {
     let mut bar = MenuBar::new()?;
     let file = build_file_menu()?;
     let options = build_options_menu(&[
@@ -284,7 +284,7 @@ unsafe fn build_network_main_menu() -> Option<MenuBar> {
     Some(bar)
 }
 
-unsafe fn build_users_main_menu() -> Option<MenuBar> {
+fn build_users_main_menu() -> Option<MenuBar> {
     let mut bar = MenuBar::new()?;
     let file = build_file_menu()?;
     let options = build_options_menu(&[
@@ -309,7 +309,7 @@ unsafe fn build_users_main_menu() -> Option<MenuBar> {
     Some(bar)
 }
 
-unsafe fn build_tray_popup() -> Option<PopupMenu> {
+fn build_tray_popup() -> Option<PopupMenu> {
     let mut menu = PopupMenu::new()?;
     if !append_item(&mut menu, IDM_RESTORETASKMAN, TextKey::RestoreTaskManager)
         || !append_item(&mut menu, IDM_EXIT, TextKey::ExitTaskManager)
@@ -321,7 +321,7 @@ unsafe fn build_tray_popup() -> Option<PopupMenu> {
     Some(menu)
 }
 
-unsafe fn build_user_context_popup() -> Option<PopupMenu> {
+fn build_user_context_popup() -> Option<PopupMenu> {
     let mut menu = PopupMenu::new()?;
     if !append_item(&mut menu, IDM_SENDMESSAGE, TextKey::SendMessage)
         || !append_separator(&mut menu)
@@ -333,7 +333,7 @@ unsafe fn build_user_context_popup() -> Option<PopupMenu> {
     Some(menu)
 }
 
-pub unsafe fn build_main_menu(resource_id: u16, processor_count: usize) -> Option<HMENU> {
+pub fn build_main_menu(resource_id: u16, processor_count: usize) -> Option<HMENU> {
     let menu = match resource_id {
         IDR_MAINMENU_TASK => build_task_main_menu()?.into_raw(),
         IDR_MAINMENU_PROC => build_process_main_menu()?.into_raw(),
@@ -346,7 +346,7 @@ pub unsafe fn build_main_menu(resource_id: u16, processor_count: usize) -> Optio
     Some(menu)
 }
 
-pub unsafe fn build_popup_menu(resource_id: u16, processor_count: usize) -> Option<HMENU> {
+pub fn build_popup_menu(resource_id: u16, processor_count: usize) -> Option<HMENU> {
     let menu = match resource_id {
         IDR_TASK_CONTEXT => build_task_context_popup()?.into_raw(),
         IDR_TASKVIEW => build_task_view_popup()?.into_raw(),

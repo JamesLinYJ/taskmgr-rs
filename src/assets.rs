@@ -71,39 +71,47 @@ pub fn locate_asset(file_name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.exists())
 }
 
-pub unsafe fn load_icon_from_file(file_name: &str, width: i32, height: i32, flags: u32) -> HICON {
+pub fn load_icon_from_file(file_name: &str, width: i32, height: i32, flags: u32) -> HICON {
     // 图标直接按文件加载，避免重新引入 `.rc` 资源依赖。
     let Some(path) = locate_asset(file_name) else {
         return null_mut();
     };
     let wide = to_wide_null(&path);
-    LoadImageW(
-        0 as HINSTANCE,
-        wide.as_ptr(),
-        IMAGE_ICON,
-        width,
-        height,
-        flags | LR_LOADFROMFILE,
-    ) as HICON
+    // SAFETY: `wide` is a live, NUL-terminated UTF-16 path and `LoadImageW` only borrows it
+    // for the duration of the call.
+    unsafe {
+        LoadImageW(
+            0 as HINSTANCE,
+            wide.as_ptr(),
+            IMAGE_ICON,
+            width,
+            height,
+            flags | LR_LOADFROMFILE,
+        ) as HICON
+    }
 }
 
-pub unsafe fn load_bitmap_from_file(file_name: &str) -> HBITMAP {
+pub fn load_bitmap_from_file(file_name: &str) -> HBITMAP {
     // 位图和图标共享同一套定位逻辑，只是加载的 Win32 类型不同。
     let Some(path) = locate_asset(file_name) else {
         return null_mut();
     };
     let wide = to_wide_null(&path);
-    LoadImageW(
-        0 as HINSTANCE,
-        wide.as_ptr(),
-        IMAGE_BITMAP,
-        0,
-        0,
-        LR_LOADFROMFILE,
-    ) as HBITMAP
+    // SAFETY: `wide` is a live, NUL-terminated UTF-16 path and `LoadImageW` only borrows it
+    // for the duration of the call.
+    unsafe {
+        LoadImageW(
+            0 as HINSTANCE,
+            wide.as_ptr(),
+            IMAGE_BITMAP,
+            0,
+            0,
+            LR_LOADFROMFILE,
+        ) as HBITMAP
+    }
 }
 
-pub unsafe fn create_accelerator_table() -> HACCEL {
+pub fn create_accelerator_table() -> HACCEL {
     // 加速键表在 Rust 侧声明，运行时一次性创建成 Win32 `HACCEL`。
     let accelerators = [
         ACCEL {
@@ -137,5 +145,6 @@ pub unsafe fn create_accelerator_table() -> HACCEL {
             cmd: IDC_PREVTAB,
         },
     ];
-    CreateAcceleratorTableW(accelerators.as_ptr(), accelerators.len() as i32)
+    // SAFETY: `accelerators` is a valid slice of ACCEL entries and the API copies the table.
+    unsafe { CreateAcceleratorTableW(accelerators.as_ptr(), accelerators.len() as i32) }
 }

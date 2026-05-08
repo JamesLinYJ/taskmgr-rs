@@ -10,7 +10,7 @@ use crate::language::{text, TextKey};
 use crate::resource::*;
 use crate::winutil::to_wide_null;
 
-pub unsafe fn localize_dialog(hwnd: HWND, dialog_id: u16) {
+pub fn localize_dialog(hwnd: HWND, dialog_id: u16) {
     // 对话框本地化按资源 ID 分发，确保同一个模板在不同语言下仍复用相同控件编号。
     if hwnd.is_null() {
         return;
@@ -46,14 +46,14 @@ pub unsafe fn localize_dialog(hwnd: HWND, dialog_id: u16) {
             set_dialog_item_text(hwnd, IDC_STATIC11, TextKey::Total);
             set_dialog_item_text(hwnd, IDC_STATIC12, TextKey::Paged);
             set_dialog_item_text(hwnd, IDC_STATIC17, TextKey::Nonpaged);
-            set_control_text(GetDlgItem(hwnd, IDC_CPUFRAME), TextKey::CpuUsageHistory);
-            set_control_text(GetDlgItem(hwnd, IDC_CPUUSAGEFRAME), TextKey::CpuUsage);
-            set_control_text(GetDlgItem(hwnd, IDC_MEMBARFRAME), TextKey::MemUsage);
-            set_control_text(GetDlgItem(hwnd, IDC_MEMFRAME), TextKey::MemoryUsageHistory);
-            set_control_text(GetDlgItem(hwnd, IDC_STATIC1), TextKey::PhysicalMemoryK);
-            set_control_text(GetDlgItem(hwnd, IDC_STATIC5), TextKey::CommitChargeK);
-            set_control_text(GetDlgItem(hwnd, IDC_STATIC10), TextKey::KernelMemoryK);
-            set_control_text(GetDlgItem(hwnd, IDC_STATIC13), TextKey::Totals);
+            set_control_text(dlg_item(hwnd, IDC_CPUFRAME), TextKey::CpuUsageHistory);
+            set_control_text(dlg_item(hwnd, IDC_CPUUSAGEFRAME), TextKey::CpuUsage);
+            set_control_text(dlg_item(hwnd, IDC_MEMBARFRAME), TextKey::MemUsage);
+            set_control_text(dlg_item(hwnd, IDC_MEMFRAME), TextKey::MemoryUsageHistory);
+            set_control_text(dlg_item(hwnd, IDC_STATIC1), TextKey::PhysicalMemoryK);
+            set_control_text(dlg_item(hwnd, IDC_STATIC5), TextKey::CommitChargeK);
+            set_control_text(dlg_item(hwnd, IDC_STATIC10), TextKey::KernelMemoryK);
+            set_control_text(dlg_item(hwnd, IDC_STATIC13), TextKey::Totals);
         }
         IDD_SELECTPROCCOLS => {
             set_window_text(hwnd, TextKey::SelectColumnsTitle);
@@ -103,23 +103,31 @@ pub unsafe fn localize_dialog(hwnd: HWND, dialog_id: u16) {
     }
 }
 
-unsafe fn set_window_text(hwnd: HWND, text_key: TextKey) {
+fn dlg_item(hwnd: HWND, control_id: i32) -> HWND {
+    // SAFETY: lookup only borrows the dialog handle; failure is represented as a null HWND.
+    unsafe { GetDlgItem(hwnd, control_id) }
+}
+
+fn set_window_text(hwnd: HWND, text_key: TextKey) {
     // 窗口标题和普通控件文本共用同一套 `TextKey -> UTF-16` 转换。
     let wide = to_wide_null(text(text_key));
-    SetWindowTextW(hwnd, wide.as_ptr());
+    // SAFETY: `hwnd` is supplied by Win32 dialog creation and `wide` lives for the call.
+    unsafe { SetWindowTextW(hwnd, wide.as_ptr()) };
 }
 
-unsafe fn set_dialog_item_text(hwnd: HWND, control_id: i32, text_key: TextKey) {
+fn set_dialog_item_text(hwnd: HWND, control_id: i32, text_key: TextKey) {
     // 按控件 ID 设置文本，适合按钮、标签和输入框标题等标准对话框子控件。
     let wide = to_wide_null(text(text_key));
-    SetDlgItemTextW(hwnd, control_id, wide.as_ptr());
+    // SAFETY: `hwnd` is a dialog window and `wide` lives for the call.
+    unsafe { SetDlgItemTextW(hwnd, control_id, wide.as_ptr()) };
 }
 
-unsafe fn set_control_text(hwnd: HWND, text_key: TextKey) {
+fn set_control_text(hwnd: HWND, text_key: TextKey) {
     // 有些自定义控件只能先拿到 `HWND` 再设文本，所以单独保留这个辅助函数。
     if hwnd.is_null() {
         return;
     }
     let wide = to_wide_null(text(text_key));
-    SetWindowTextW(hwnd, wide.as_ptr());
+    // SAFETY: `hwnd` is checked non-null and `wide` lives for the call.
+    unsafe { SetWindowTextW(hwnd, wide.as_ptr()) };
 }

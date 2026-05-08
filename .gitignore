@@ -1,5 +1,10 @@
 target/
 .vs/
+.claude/
+.tmp-pip/
+.tmp-tests/
+.tmp-process-list.txt
+artifacts/
 *.user
 *.aps
 *.ncb

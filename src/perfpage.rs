@@ -1,5 +1,4 @@
 use std::ffi::c_void;
-
 // 性能页实现。
 // 该模块负责采样系统级 CPU/内存指标，并绘制经典任务管理器里的折线图、
 // 数值面板和状态快照。
@@ -8,22 +7,27 @@ use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen, CreateSolidBrush, DeleteDC,
-    DeleteObject, DrawTextW, FillRect, GetCurrentObject, GetDC, GetObjectW, GetStockObject,
-    InvalidateRect, LineTo, MapWindowPoints, MoveToEx, Rectangle, ReleaseDC, SelectObject,
-    SetBkMode, SetTextColor, BLACK_BRUSH, DT_BOTTOM, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, HBITMAP, HBRUSH, HDC, HGDIOBJ, LOGFONTW, OBJ_FONT, PS_SOLID, SRCCOPY, TRANSPARENT,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC,
+    DeleteObject, DrawTextW, GetDC, GetStockObject,
+    InvalidateRect, Rectangle, RedrawWindow, ReleaseDC,
+    SelectObject, SetBkMode, SetTextColor, UpdateWindow, BLACK_BRUSH, DT_BOTTOM, DT_CENTER, DT_SINGLELINE, HBITMAP, HBRUSH, HDC, HGDIOBJ, RDW_ERASE, RDW_INVALIDATE, RDW_NOCHILDREN, RDW_UPDATENOW, SRCCOPY, TRANSPARENT,
 };
 use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetClientRect, GetDialogBaseUnits,
-    GetDlgItem, GetWindowRect, IsIconic, SetDlgItemTextW, ShowWindow, HDWP, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
+    GetDlgCtrlID, GetDlgItem, IsIconic, IsWindowVisible, SendMessageW, ShowWindow, HDWP, SWP_NOACTIVATE, SWP_NOREDRAW, SWP_NOSIZE,
+    SWP_NOZORDER, SW_HIDE, SW_SHOW, WM_SETREDRAW,
 };
 
 use crate::assets::load_bitmap_from_file;
-use crate::chart_renderer::{ChartColor, ChartFrame, ChartRenderer};
+use crate::drawing::{fill_black, push_history, rgb};
+use crate::chart_renderer::{ChartColor, ChartRenderer};
 use crate::options::{CpuHistoryMode, Options};
+use crate::perf_drawing::{
+    average_history, current_font_height, defer_resize, draw_grid_width, draw_grid_width_gpu,
+    draw_history_series, draw_history_series_gpu, draw_meter, format_mem_meter_text,
+    set_numeric_text, HistoryPlotLayout, HistorySeries, GRAPH_GRID, HIST_SIZE,
+};
 use crate::perf_layout::{
     compute_perf_layout, next_graph_surface_extent, PerfDialogSpacing, PerfLayoutAnchors,
 };
@@ -36,15 +40,8 @@ use crate::resource::{
     IDC_STATIC6, IDC_STATIC8, IDC_STATIC9, IDC_TOTAL_HANDLES, IDC_TOTAL_PHYSICAL,
     IDC_TOTAL_PROCESSES, IDC_TOTAL_THREADS, STATIC_CPU_GRAPH_COUNT,
 };
-use crate::winutil::{hiword, loword, to_wide_null};
+use crate::winutil::{hiword, loword, to_wide_null, window_rect_relative_to_page};
 
-#[link(name = "shlwapi")]
-unsafe extern "system" {
-    fn StrFormatByteSizeW(qw: i64, pszbuf: *mut u16, cchbuf: u32) -> *mut u16;
-}
-
-const HIST_SIZE: usize = 2000;
-const GRAPH_GRID: i32 = 12;
 const STRIP_HEIGHT: i32 = 75;
 const STRIP_WIDTH: i32 = 33;
 const DEFSPACING_BASE: i32 = 3;
@@ -89,6 +86,16 @@ const PERF_TEXT_CONTROLS: [i32; 28] = [
 ];
 
 const PERF_LAYOUT_CONTROLS: [i32; 28] = PERF_TEXT_CONTROLS;
+const PERF_FRAME_CONTROLS: [i32; 8] = [
+    crate::resource::IDC_CPUFRAME,
+    CPU_USAGE_FRAME_ID,
+    IDC_MEMBARFRAME,
+    IDC_MEMFRAME,
+    IDC_STATIC1,
+    IDC_STATIC5,
+    IDC_STATIC10,
+    IDC_STATIC13,
+];
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -173,7 +180,7 @@ impl PerformancePageState {
         Self::default()
     }
 
-    pub unsafe fn initialize(&mut self, hinstance: HINSTANCE, processor_count: usize) {
+    pub fn initialize(&mut self, hinstance: HINSTANCE, processor_count: usize) {
         // 性能页启动时先准备采样缓冲和仪表位图；
         // 真正依赖窗口尺寸的离屏表面会在布局完成后再创建。
         self.hinstance = hinstance;
@@ -182,52 +189,57 @@ impl PerformancePageState {
         self.chart_renderer = ChartRenderer::new();
     }
 
-    pub unsafe fn apply_options(
-        &mut self,
-        hwnd_page: HWND,
-        options: &Options,
-        processor_count: usize,
-    ) {
-        // 配置变化会同时影响图表数量、是否叠加内核时间，以及文字区是否折叠。
-        self.ensure_history_capacity(processor_count.max(1));
-        self.cpu_history_mode = options.cpu_history_mode;
-        self.show_kernel_times = options.kernel_times();
-        self.no_title = options.no_title();
+    pub fn apply_options(&mut self, hwnd_page: HWND, options: &Options, processor_count: usize) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 配置变化会同时影响图表数量、是否叠加内核时间，以及文字区是否折叠。
+            self.ensure_history_capacity(processor_count.max(1));
+            self.cpu_history_mode = options.cpu_history_mode;
+            self.show_kernel_times = options.kernel_times();
+            self.no_title = options.no_title();
 
-        let pane_count = self.visible_cpu_graph_count();
+            let pane_count = self.visible_cpu_graph_count();
 
-        for index in 0..self.cpu_graph_slot_count() {
-            let control = self.cpu_graph_hwnd(hwnd_page, index);
-            if !control.is_null() {
-                ShowWindow(control, if index < pane_count { SW_SHOW } else { SW_HIDE });
+            for index in 0..self.cpu_graph_slot_count() {
+                let control = self.cpu_graph_hwnd(hwnd_page, index);
+                if !control.is_null() {
+                    ShowWindow(control, if index < pane_count { SW_SHOW } else { SW_HIDE });
+                }
             }
-        }
 
-        let detail_state = if self.no_title { SW_HIDE } else { SW_SHOW };
-        for control_id in PERF_TEXT_CONTROLS {
-            let control = GetDlgItem(hwnd_page, control_id);
-            if !control.is_null() {
-                ShowWindow(control, detail_state);
+            let detail_state = if self.no_title { SW_HIDE } else { SW_SHOW };
+            for control_id in PERF_TEXT_CONTROLS {
+                let control = GetDlgItem(hwnd_page, control_id);
+                if !control.is_null() {
+                    ShowWindow(control, detail_state);
+                }
             }
-        }
 
-        for control_id in [IDC_MEMGRAPH, IDC_MEMFRAME, IDC_MEMBARFRAME, IDC_MEMMETER] {
-            let control = GetDlgItem(hwnd_page, control_id);
-            if !control.is_null() {
-                ShowWindow(control, detail_state);
+            for control_id in [IDC_MEMGRAPH, IDC_MEMFRAME, IDC_MEMBARFRAME, IDC_MEMMETER] {
+                let control = GetDlgItem(hwnd_page, control_id);
+                if !control.is_null() {
+                    ShowWindow(control, detail_state);
+                }
             }
-        }
 
-        InvalidateRect(hwnd_page, null(), 0);
+            if !self.no_title {
+                self.update_detail_texts(hwnd_page);
+            }
+
+            InvalidateRect(hwnd_page, null(), 0);
+        }
     }
 
-    pub unsafe fn timer_event(&mut self, hwnd_page: HWND, main_hwnd: HWND) {
-        // 定时器事件先刷新底层采样，再推动图表滚动与数值文本更新。
-        self.refresh_measurements(hwnd_page);
-        self.scroll_offset = (self.scroll_offset + 2) % GRAPH_GRID;
+    pub fn timer_event(&mut self, hwnd_page: HWND, main_hwnd: HWND) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 定时器事件先刷新底层采样，再推动图表滚动与数值文本更新。
+            self.refresh_measurements(hwnd_page);
+            self.scroll_offset = (self.scroll_offset + 2) % GRAPH_GRID;
 
-        if IsIconic(main_hwnd) == 0 {
-            self.invalidate_graph_controls(hwnd_page);
+            if IsIconic(main_hwnd) == 0 {
+                self.invalidate_graph_controls(hwnd_page);
+            }
         }
     }
 
@@ -264,188 +276,197 @@ impl PerformancePageState {
         }
     }
 
-    unsafe fn invalidate_graph_controls(&self, hwnd_page: HWND) {
-        // 图表刷新只失效图表控件本身，不整页重绘。
-        for control_id in [IDC_CPUMETER, IDC_MEMMETER, IDC_MEMGRAPH] {
-            let control = GetDlgItem(hwnd_page, control_id);
-            if !control.is_null() {
-                InvalidateRect(control, null(), 0);
+    fn invalidate_graph_controls(&self, hwnd_page: HWND) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 图表刷新只失效图表控件本身，不整页重绘。
+            for control_id in [IDC_CPUMETER, IDC_MEMMETER, IDC_MEMGRAPH] {
+                let control = GetDlgItem(hwnd_page, control_id);
+                if !control.is_null() {
+                    InvalidateRect(control, null(), 0);
+                }
             }
-        }
 
-        let pane_count = self.visible_cpu_graph_count();
-        for pane_index in 0..pane_count {
-            let control = self.cpu_graph_hwnd(hwnd_page, pane_index);
-            if !control.is_null() {
-                InvalidateRect(control, null(), 0);
+            let pane_count = self.visible_cpu_graph_count();
+            for pane_index in 0..pane_count {
+                let control = self.cpu_graph_hwnd(hwnd_page, pane_index);
+                if !control.is_null() {
+                    InvalidateRect(control, null(), 0);
+                }
             }
         }
     }
 
-    pub unsafe fn draw_cpu_graph(&self, hdc: HDC, rect: RECT, pane_index: usize) {
-        // CPU 图优先绘制到离屏 DC，再一次性拷回目标 DC，
-        // 这样网格线和曲线更新时不会在前台逐步闪出来。
-        if pane_index >= self.cpu_history.len() {
-            return;
-        }
-
-        let width = (rect.right - rect.left).max(1);
-        let height = (rect.bottom - rect.top).max(1);
-        let use_backbuffer = !self.graph_dc.is_null()
-            && self.graph_bitmap_width >= width
-            && self.graph_bitmap_height >= height;
-        let target_hdc = if use_backbuffer { self.graph_dc } else { hdc };
-        let target_rect = if use_backbuffer {
-            RECT {
-                left: 0,
-                top: 0,
-                right: self.graph_bitmap_width,
-                bottom: height,
+    pub fn draw_cpu_graph(&self, hdc: HDC, rect: RECT, pane_index: usize) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // CPU 图优先绘制到离屏 DC，再一次性拷回目标 DC，
+            // 这样网格线和曲线更新时不会在前台逐步闪出来。
+            if pane_index >= self.cpu_history.len() {
+                return;
             }
-        } else {
-            rect
-        };
 
-        fill_black(target_hdc, &target_rect);
-        draw_grid_width(target_hdc, &target_rect, width, self.scroll_offset);
+            let width = (rect.right - rect.left).max(1);
+            let height = (rect.bottom - rect.top).max(1);
+            let use_backbuffer = !self.graph_dc.is_null()
+                && self.graph_bitmap_width >= width
+                && self.graph_bitmap_height >= height;
+            let target_hdc = if use_backbuffer { self.graph_dc } else { hdc };
+            let target_rect = if use_backbuffer {
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: self.graph_bitmap_width,
+                    bottom: height,
+                }
+            } else {
+                rect
+            };
 
-        let graph_height = (target_rect.bottom - target_rect.top - 1).max(1);
-        let scale = ((width - 1) / HIST_SIZE as i32).max(0);
-        let scale = if scale == 0 { 2 } else { scale } as usize;
+            fill_black(target_hdc, &target_rect);
+            draw_grid_width(target_hdc, &target_rect, width, self.scroll_offset);
 
-        let plot_layout = HistoryPlotLayout {
-            graph_height,
-            width,
-            scale,
-        };
+            let graph_height = (target_rect.bottom - target_rect.top - 1).max(1);
+            let scale = ((width - 1) / HIST_SIZE as i32).max(0);
+            let scale = if scale == 0 { 2 } else { scale } as usize;
 
-        if self.show_kernel_times {
+            let plot_layout = HistoryPlotLayout {
+                graph_height,
+                width,
+                scale,
+            };
+
+            if self.show_kernel_times {
+                if self.cpu_history_mode == CpuHistoryMode::Panes as i32 {
+                    draw_history_series(
+                        target_hdc,
+                        &target_rect,
+                        plot_layout,
+                        HistorySeries {
+                            history: &self.kernel_history[pane_index],
+                            color: ChartColor::Red,
+                            stop_on_zero: false,
+                        },
+                    );
+                } else {
+                    let averaged_kernel = average_history(&self.kernel_history);
+                    draw_history_series(
+                        target_hdc,
+                        &target_rect,
+                        plot_layout,
+                        HistorySeries {
+                            history: &averaged_kernel,
+                            color: ChartColor::Red,
+                            stop_on_zero: false,
+                        },
+                    );
+                }
+            }
+
             if self.cpu_history_mode == CpuHistoryMode::Panes as i32 {
                 draw_history_series(
                     target_hdc,
                     &target_rect,
                     plot_layout,
                     HistorySeries {
-                        history: &self.kernel_history[pane_index],
-                        color: ChartColor::Red,
+                        history: &self.cpu_history[pane_index],
+                        color: ChartColor::Green,
                         stop_on_zero: false,
                     },
                 );
             } else {
-                let averaged_kernel = average_history(&self.kernel_history);
+                let averaged_cpu = average_history(&self.cpu_history);
                 draw_history_series(
                     target_hdc,
                     &target_rect,
                     plot_layout,
                     HistorySeries {
-                        history: &averaged_kernel,
-                        color: ChartColor::Red,
+                        history: &averaged_cpu,
+                        color: ChartColor::Green,
                         stop_on_zero: false,
                     },
                 );
             }
-        }
 
-        if self.cpu_history_mode == CpuHistoryMode::Panes as i32 {
-            draw_history_series(
-                target_hdc,
-                &target_rect,
-                plot_layout,
-                HistorySeries {
-                    history: &self.cpu_history[pane_index],
-                    color: ChartColor::Green,
-                    stop_on_zero: false,
-                },
-            );
-        } else {
-            let averaged_cpu = average_history(&self.cpu_history);
-            draw_history_series(
-                target_hdc,
-                &target_rect,
-                plot_layout,
-                HistorySeries {
-                    history: &averaged_cpu,
-                    color: ChartColor::Green,
-                    stop_on_zero: false,
-                },
-            );
-        }
-
-        if use_backbuffer {
-            let x_diff = (self.graph_bitmap_width - width).max(0);
-            BitBlt(
-                hdc,
-                rect.left,
-                rect.top,
-                width,
-                height,
-                self.graph_dc,
-                x_diff,
-                0,
-                SRCCOPY,
-            );
+            if use_backbuffer {
+                let x_diff = (self.graph_bitmap_width - width).max(0);
+                BitBlt(
+                    hdc,
+                    rect.left,
+                    rect.top,
+                    width,
+                    height,
+                    self.graph_dc,
+                    x_diff,
+                    0,
+                    SRCCOPY,
+                );
+            }
         }
     }
 
-    pub unsafe fn draw_mem_graph(&self, hdc: HDC, rect: RECT) {
-        // 内存历史图复用 CPU 图的绘制策略，只是数据源和颜色不同。
-        if self.draw_mem_graph_gpu(hdc, rect) {
-            return;
-        }
-
-        let width = (rect.right - rect.left).max(1);
-        let height = (rect.bottom - rect.top).max(1);
-        let use_backbuffer = !self.graph_dc.is_null()
-            && self.graph_bitmap_width >= width
-            && self.graph_bitmap_height >= height;
-        let target_hdc = if use_backbuffer { self.graph_dc } else { hdc };
-        let target_rect = if use_backbuffer {
-            RECT {
-                left: 0,
-                top: 0,
-                right: width,
-                bottom: height,
+    pub fn draw_mem_graph(&self, hdc: HDC, rect: RECT) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 内存历史图复用 CPU 图的绘制策略，只是数据源和颜色不同。
+            if self.draw_mem_graph_gpu(hdc, rect) {
+                return;
             }
-        } else {
-            rect
-        };
 
-        fill_black(target_hdc, &target_rect);
-        draw_grid_width(target_hdc, &target_rect, width, self.scroll_offset);
-        let scale = ((width - 1) / HIST_SIZE as i32).max(0);
-        let scale = if scale == 0 { 2 } else { scale } as usize;
-        draw_history_series(
-            target_hdc,
-            &target_rect,
-            HistoryPlotLayout {
-                graph_height: (target_rect.bottom - target_rect.top - 1).max(1),
-                width,
-                scale,
-            },
-            HistorySeries {
-                history: &self.mem_history,
-                color: ChartColor::Yellow,
-                stop_on_zero: true,
-            },
-        );
+            let width = (rect.right - rect.left).max(1);
+            let height = (rect.bottom - rect.top).max(1);
+            let use_backbuffer = !self.graph_dc.is_null()
+                && self.graph_bitmap_width >= width
+                && self.graph_bitmap_height >= height;
+            let target_hdc = if use_backbuffer { self.graph_dc } else { hdc };
+            let target_rect = if use_backbuffer {
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: height,
+                }
+            } else {
+                rect
+            };
 
-        if use_backbuffer {
-            BitBlt(
-                hdc,
-                rect.left,
-                rect.top,
-                width,
-                height,
-                self.graph_dc,
-                0,
-                0,
-                SRCCOPY,
+            fill_black(target_hdc, &target_rect);
+            draw_grid_width(target_hdc, &target_rect, width, self.scroll_offset);
+            let scale = ((width - 1) / HIST_SIZE as i32).max(0);
+            let scale = if scale == 0 { 2 } else { scale } as usize;
+            draw_history_series(
+                target_hdc,
+                &target_rect,
+                HistoryPlotLayout {
+                    graph_height: (target_rect.bottom - target_rect.top - 1).max(1),
+                    width,
+                    scale,
+                },
+                HistorySeries {
+                    history: &self.mem_history,
+                    color: ChartColor::Yellow,
+                    stop_on_zero: true,
+                },
             );
+
+            if use_backbuffer {
+                BitBlt(
+                    hdc,
+                    rect.left,
+                    rect.top,
+                    width,
+                    height,
+                    self.graph_dc,
+                    0,
+                    0,
+                    SRCCOPY,
+                );
+            }
         }
     }
 
     #[allow(dead_code)]
-    unsafe fn draw_cpu_graph_gpu(&self, hdc: HDC, rect: RECT, pane_index: usize) -> bool {
+    fn draw_cpu_graph_gpu(&self, hdc: HDC, rect: RECT, pane_index: usize) -> bool {
         let Some(frame) = self.chart_renderer.begin_frame(hdc, rect) else {
             return false;
         };
@@ -519,7 +540,7 @@ impl PerformancePageState {
         frame.end()
     }
 
-    unsafe fn draw_mem_graph_gpu(&self, hdc: HDC, rect: RECT) -> bool {
+    fn draw_mem_graph_gpu(&self, hdc: HDC, rect: RECT) -> bool {
         let Some(frame) = self.chart_renderer.begin_frame(hdc, rect) else {
             return false;
         };
@@ -548,7 +569,7 @@ impl PerformancePageState {
         frame.end()
     }
 
-    pub unsafe fn draw_cpu_meter(&self, hdc: HDC, rect: RECT) {
+    pub fn draw_cpu_meter(&self, hdc: HDC, rect: RECT) {
         // CPU 仪表优先复用 LED 条形位图，不可用时再退回纯 GDI 绘制。
         if self.draw_strip_meter(
             hdc,
@@ -579,7 +600,7 @@ impl PerformancePageState {
         );
     }
 
-    pub unsafe fn draw_mem_meter(&self, hdc: HDC, rect: RECT) {
+    pub fn draw_mem_meter(&self, hdc: HDC, rect: RECT) {
         // 内存仪表显示的是已用内存字节量文本，而不是百分比文本。
         let mem_percent = if self.physical_mem_limit_kb == 0 {
             0
@@ -603,185 +624,208 @@ impl PerformancePageState {
         );
     }
 
-    pub unsafe fn size_page(&mut self, hwnd_page: HWND, main_hwnd: HWND) {
-        // 布局逻辑尽量贴近经典 Task Manager：
-        // 先算整体可用高度，再分配图表、仪表和底部统计区的位置。
-        if hwnd_page.is_null() {
-            return;
-        }
+    pub fn size_page(&mut self, hwnd_page: HWND, main_hwnd: HWND) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 布局逻辑尽量贴近经典 Task Manager：
+            // 先算整体可用高度，再分配图表、仪表和底部统计区的位置。
+            if hwnd_page.is_null() {
+                return;
+            }
 
-        let mut parent_rect = zeroed::<RECT>();
-        if self.no_title {
-            // C++ uses GetClientRect(g_hMainWnd) directly — no mapping
-            GetClientRect(main_hwnd, &mut parent_rect);
-        } else {
-            GetClientRect(hwnd_page, &mut parent_rect);
-        }
+            let mut parent_rect = zeroed::<RECT>();
+            if self.no_title {
+                // C++ uses GetClientRect(g_hMainWnd) directly — no mapping
+                GetClientRect(main_hwnd, &mut parent_rect);
+            } else {
+                GetClientRect(hwnd_page, &mut parent_rect);
+            }
 
-        let pane_count = self.visible_cpu_graph_count();
+            let pane_count = self.visible_cpu_graph_count();
 
-        let units = GetDialogBaseUnits() as usize;
-        let spacing = PerfDialogSpacing {
-            def_spacing: (DEFSPACING_BASE * i32::from(loword(units))) / DLG_SCALE_X,
-            inner_spacing: (INNERSPACING_BASE * i32::from(loword(units))) / DLG_SCALE_X,
-            top_spacing: (TOPSPACING_BASE * i32::from(hiword(units))) / DLG_SCALE_Y,
-        };
+            let units = GetDialogBaseUnits() as usize;
+            let spacing = PerfDialogSpacing {
+                def_spacing: (DEFSPACING_BASE * i32::from(loword(units))) / DLG_SCALE_X,
+                inner_spacing: (INNERSPACING_BASE * i32::from(loword(units))) / DLG_SCALE_X,
+                top_spacing: (TOPSPACING_BASE * i32::from(hiword(units))) / DLG_SCALE_Y,
+            };
 
-        let anchors = PerfLayoutAnchors {
-            master_rect: window_rect_relative_to_page(
-                GetDlgItem(hwnd_page, IDC_STATIC5),
-                hwnd_page,
-            ),
-            top_frame: window_rect_relative_to_page(GetDlgItem(hwnd_page, IDC_STATIC13), hwnd_page),
-            cpu_history_frame: window_rect_relative_to_page(
+            let anchors = PerfLayoutAnchors {
+                master_rect: window_rect_relative_to_page(
+                    GetDlgItem(hwnd_page, IDC_STATIC5),
+                    hwnd_page,
+                ),
+                top_frame: window_rect_relative_to_page(
+                    GetDlgItem(hwnd_page, IDC_STATIC13),
+                    hwnd_page,
+                ),
+                cpu_history_frame: window_rect_relative_to_page(
+                    GetDlgItem(hwnd_page, crate::resource::IDC_CPUFRAME),
+                    hwnd_page,
+                ),
+                cpu_usage_frame: window_rect_relative_to_page(
+                    GetDlgItem(hwnd_page, CPU_USAGE_FRAME_ID),
+                    hwnd_page,
+                ),
+                mem_bar_frame: window_rect_relative_to_page(
+                    GetDlgItem(hwnd_page, IDC_MEMBARFRAME),
+                    hwnd_page,
+                ),
+                mem_frame: window_rect_relative_to_page(
+                    GetDlgItem(hwnd_page, IDC_MEMFRAME),
+                    hwnd_page,
+                ),
+            };
+            let layout =
+                compute_perf_layout(parent_rect, anchors, spacing, pane_count, self.no_title);
+
+            let defer_hint = (PERF_LAYOUT_CONTROLS.len() + self.cpu_graph_slot_count() + 6) as i32;
+            let mut hdwp: HDWP = BeginDeferWindowPos(defer_hint);
+            if hdwp.is_null() {
+                return;
+            }
+            let redraw_windows = self.redraw_windows(hwnd_page);
+            set_redraw_for_windows(&redraw_windows, false);
+
+            let resize_flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW;
+            let move_flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW;
+
+            if !self.no_title {
+                for control_id in PERF_LAYOUT_CONTROLS {
+                    let hwnd_ctrl = GetDlgItem(hwnd_page, control_id);
+                    if hwnd_ctrl.is_null() {
+                        continue;
+                    }
+                    let rect = window_rect_relative_to_page(hwnd_ctrl, hwnd_page);
+                    hdwp = DeferWindowPos(
+                        hdwp,
+                        hwnd_ctrl,
+                        null_mut(),
+                        rect.left,
+                        rect.top + layout.detail_shift_y,
+                        0,
+                        0,
+                        move_flags,
+                    );
+                }
+            }
+
+            hdwp = defer_resize(
+                hdwp,
                 GetDlgItem(hwnd_page, crate::resource::IDC_CPUFRAME),
-                hwnd_page,
-            ),
-            cpu_usage_frame: window_rect_relative_to_page(
-                GetDlgItem(hwnd_page, CPU_USAGE_FRAME_ID),
-                hwnd_page,
-            ),
-            mem_bar_frame: window_rect_relative_to_page(
-                GetDlgItem(hwnd_page, IDC_MEMBARFRAME),
-                hwnd_page,
-            ),
-            mem_frame: window_rect_relative_to_page(GetDlgItem(hwnd_page, IDC_MEMFRAME), hwnd_page),
-        };
-        let layout = compute_perf_layout(parent_rect, anchors, spacing, pane_count, self.no_title);
-
-        let defer_hint = (PERF_LAYOUT_CONTROLS.len() + self.cpu_graph_slot_count() + 6) as i32;
-        let mut hdwp: HDWP = BeginDeferWindowPos(defer_hint);
-        if hdwp.is_null() {
-            return;
-        }
-        let resize_flags = SWP_NOZORDER | SWP_NOACTIVATE;
-        let move_flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
-
-        for control_id in PERF_LAYOUT_CONTROLS {
-            let hwnd_ctrl = GetDlgItem(hwnd_page, control_id);
-            if hwnd_ctrl.is_null() {
-                continue;
-            }
-            let rect = window_rect_relative_to_page(hwnd_ctrl, hwnd_page);
-            hdwp = DeferWindowPos(
-                hdwp,
-                hwnd_ctrl,
-                null_mut(),
-                rect.left,
-                rect.top + layout.detail_shift_y,
-                0,
-                0,
-                move_flags,
+                layout.cpu_history_width,
+                layout.cpu_history_height,
             );
-        }
-        hdwp = defer_resize(
-            hdwp,
-            GetDlgItem(hwnd_page, crate::resource::IDC_CPUFRAME),
-            layout.cpu_history_width,
-            layout.cpu_history_height,
-        );
 
-        hdwp = defer_resize(
-            hdwp,
-            GetDlgItem(hwnd_page, CPU_USAGE_FRAME_ID),
-            layout.cpu_usage_frame_width,
-            layout.cpu_history_height,
-        );
+            hdwp = defer_resize(
+                hdwp,
+                GetDlgItem(hwnd_page, CPU_USAGE_FRAME_ID),
+                layout.cpu_usage_frame_width,
+                layout.cpu_history_height,
+            );
 
-        hdwp = DeferWindowPos(
-            hdwp,
-            GetDlgItem(hwnd_page, IDC_CPUMETER),
-            null_mut(),
-            layout.meter_rect.left,
-            layout.meter_rect.top,
-            layout.meter_rect.right - layout.meter_rect.left,
-            layout.meter_rect.bottom - layout.meter_rect.top,
-            resize_flags,
-        );
-
-        hdwp = DeferWindowPos(
-            hdwp,
-            GetDlgItem(hwnd_page, IDC_MEMBARFRAME),
-            null_mut(),
-            layout.mem_bar_frame_rect.left,
-            layout.mem_bar_frame_rect.top,
-            layout.mem_bar_frame_rect.right - layout.mem_bar_frame_rect.left,
-            layout.mem_bar_frame_rect.bottom - layout.mem_bar_frame_rect.top,
-            resize_flags,
-        );
-
-        hdwp = DeferWindowPos(
-            hdwp,
-            GetDlgItem(hwnd_page, IDC_MEMMETER),
-            null_mut(),
-            layout.meter_rect.left,
-            layout.mem_bar_frame_rect.top + spacing.top_spacing,
-            layout.meter_rect.right - layout.meter_rect.left,
-            layout.meter_rect.bottom - layout.meter_rect.top,
-            resize_flags,
-        );
-
-        hdwp = DeferWindowPos(
-            hdwp,
-            GetDlgItem(hwnd_page, IDC_MEMFRAME),
-            null_mut(),
-            layout.mem_frame_rect.left,
-            layout.mem_frame_rect.top,
-            layout.mem_frame_rect.right - layout.mem_frame_rect.left,
-            layout.mem_frame_rect.bottom - layout.mem_frame_rect.top,
-            resize_flags,
-        );
-
-        hdwp = DeferWindowPos(
-            hdwp,
-            GetDlgItem(hwnd_page, IDC_MEMGRAPH),
-            null_mut(),
-            layout.mem_graph_rect.left,
-            layout.mem_graph_rect.top,
-            layout.mem_graph_rect.right - layout.mem_graph_rect.left,
-            layout.mem_graph_rect.bottom - layout.mem_graph_rect.top,
-            resize_flags,
-        );
-
-        for (pane_index, pane_rect) in layout.cpu_pane_rects.iter().enumerate() {
-            let cpu_graph = self.cpu_graph_hwnd(hwnd_page, pane_index);
-            if cpu_graph.is_null() {
-                continue;
-            }
             hdwp = DeferWindowPos(
                 hdwp,
-                cpu_graph,
+                GetDlgItem(hwnd_page, IDC_CPUMETER),
                 null_mut(),
-                pane_rect.left,
-                pane_rect.top,
-                pane_rect.right - pane_rect.left,
-                pane_rect.bottom - pane_rect.top,
+                layout.meter_rect.left,
+                layout.meter_rect.top,
+                layout.meter_rect.right - layout.meter_rect.left,
+                layout.meter_rect.bottom - layout.meter_rect.top,
                 resize_flags,
             );
-        }
 
-        EndDeferWindowPos(hdwp);
-        self.ensure_graph_surface(
-            hwnd_page,
-            layout.graph_surface_width,
-            layout.graph_surface_height,
-        );
+            if !self.no_title {
+                hdwp = DeferWindowPos(
+                    hdwp,
+                    GetDlgItem(hwnd_page, IDC_MEMBARFRAME),
+                    null_mut(),
+                    layout.mem_bar_frame_rect.left,
+                    layout.mem_bar_frame_rect.top,
+                    layout.mem_bar_frame_rect.right - layout.mem_bar_frame_rect.left,
+                    layout.mem_bar_frame_rect.bottom - layout.mem_bar_frame_rect.top,
+                    resize_flags,
+                );
+
+                hdwp = DeferWindowPos(
+                    hdwp,
+                    GetDlgItem(hwnd_page, IDC_MEMMETER),
+                    null_mut(),
+                    layout.meter_rect.left,
+                    layout.mem_bar_frame_rect.top + spacing.top_spacing,
+                    layout.meter_rect.right - layout.meter_rect.left,
+                    layout.meter_rect.bottom - layout.meter_rect.top,
+                    resize_flags,
+                );
+
+                hdwp = DeferWindowPos(
+                    hdwp,
+                    GetDlgItem(hwnd_page, IDC_MEMFRAME),
+                    null_mut(),
+                    layout.mem_frame_rect.left,
+                    layout.mem_frame_rect.top,
+                    layout.mem_frame_rect.right - layout.mem_frame_rect.left,
+                    layout.mem_frame_rect.bottom - layout.mem_frame_rect.top,
+                    resize_flags,
+                );
+
+                hdwp = DeferWindowPos(
+                    hdwp,
+                    GetDlgItem(hwnd_page, IDC_MEMGRAPH),
+                    null_mut(),
+                    layout.mem_graph_rect.left,
+                    layout.mem_graph_rect.top,
+                    layout.mem_graph_rect.right - layout.mem_graph_rect.left,
+                    layout.mem_graph_rect.bottom - layout.mem_graph_rect.top,
+                    resize_flags,
+                );
+            }
+
+            for (pane_index, pane_rect) in layout.cpu_pane_rects.iter().enumerate() {
+                let cpu_graph = self.cpu_graph_hwnd(hwnd_page, pane_index);
+                if cpu_graph.is_null() {
+                    continue;
+                }
+                hdwp = DeferWindowPos(
+                    hdwp,
+                    cpu_graph,
+                    null_mut(),
+                    pane_rect.left,
+                    pane_rect.top,
+                    pane_rect.right - pane_rect.left,
+                    pane_rect.bottom - pane_rect.top,
+                    resize_flags,
+                );
+            }
+
+            EndDeferWindowPos(hdwp);
+            self.ensure_graph_surface(
+                hwnd_page,
+                layout.graph_surface_width,
+                layout.graph_surface_height,
+            );
+            set_redraw_for_windows(&redraw_windows, true);
+            self.redraw_after_layout(hwnd_page);
+        }
     }
 
-    pub unsafe fn destroy(&mut self) {
-        // 性能页销毁时顺带释放仪表位图和共享离屏表面。
-        self.destroy_graph_surface();
-        if !self.strip_lit_bitmap.is_null() {
-            DeleteObject(self.strip_lit_bitmap as _);
-            self.strip_lit_bitmap = null_mut();
-        }
-        if !self.strip_lit_red_bitmap.is_null() {
-            DeleteObject(self.strip_lit_red_bitmap as _);
-            self.strip_lit_red_bitmap = null_mut();
-        }
-        if !self.strip_unlit_bitmap.is_null() {
-            DeleteObject(self.strip_unlit_bitmap as _);
-            self.strip_unlit_bitmap = null_mut();
+    pub fn destroy(&mut self) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 性能页销毁时顺带释放仪表位图和共享离屏表面。
+            self.destroy_graph_surface();
+            if !self.strip_lit_bitmap.is_null() {
+                DeleteObject(self.strip_lit_bitmap as _);
+                self.strip_lit_bitmap = null_mut();
+            }
+            if !self.strip_lit_red_bitmap.is_null() {
+                DeleteObject(self.strip_lit_red_bitmap as _);
+                self.strip_lit_red_bitmap = null_mut();
+            }
+            if !self.strip_unlit_bitmap.is_null() {
+                DeleteObject(self.strip_unlit_bitmap as _);
+                self.strip_unlit_bitmap = null_mut();
+            }
         }
     }
 
@@ -804,7 +848,7 @@ impl PerformancePageState {
         self.mem_history = vec![0; HIST_SIZE];
     }
 
-    unsafe fn refresh_measurements(&mut self, hwnd_page: HWND) {
+    fn refresh_measurements(&mut self, hwnd_page: HWND) {
         // 这里集中采集所有性能相关数据，确保一次刷新内各图表看到的是同一时刻的快照。
         if self.processor_count == 0 {
             self.ensure_history_capacity(1);
@@ -814,108 +858,122 @@ impl PerformancePageState {
         self.refresh_system_info(hwnd_page);
     }
 
-    unsafe fn refresh_cpu_histories(&mut self) {
-        // 内核返回的是累积 CPU 时间，所以这里必须与上一轮做差，
-        // 再换算成本轮使用率和内核时间占比。
-        let mut processor_info =
-            vec![SystemProcessorPerformanceInformation::default(); self.processor_count];
-        let status = NtQuerySystemInformation(
-            SystemInformationClass::ProcessorPerformanceInformation as i32,
-            processor_info.as_mut_ptr() as *mut c_void,
-            (processor_info.len() * size_of::<SystemProcessorPerformanceInformation>()) as u32,
-            null_mut(),
-        );
-        if status < 0 {
-            return;
-        }
+    fn refresh_cpu_histories(&mut self) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 内核返回的是累积 CPU 时间，所以这里必须与上一轮做差，
+            // 再换算成本轮使用率和内核时间占比。
+            let mut processor_info =
+                vec![SystemProcessorPerformanceInformation::default(); self.processor_count];
+            let status = NtQuerySystemInformation(
+                SystemInformationClass::ProcessorPerformanceInformation as i32,
+                processor_info.as_mut_ptr() as *mut c_void,
+                (processor_info.len() * size_of::<SystemProcessorPerformanceInformation>()) as u32,
+                null_mut(),
+            );
+            if status < 0 {
+                return;
+            }
 
-        let mut sum_idle = 0i64;
-        let mut sum_total = 0i64;
-        let mut sum_kernel = 0i64;
+            let mut sum_idle = 0i64;
+            let mut sum_total = 0i64;
+            let mut sum_kernel = 0i64;
 
-        for (index, entry) in processor_info.iter().enumerate() {
-            let idle_time = entry.idle_time;
-            let kernel_time = entry.kernel_time.saturating_sub(entry.idle_time);
-            let total_time = entry.kernel_time.saturating_add(entry.user_time);
+            for (index, entry) in processor_info.iter().enumerate() {
+                let idle_time = entry.idle_time;
+                let kernel_time = entry.kernel_time.saturating_sub(entry.idle_time);
+                let total_time = entry.kernel_time.saturating_add(entry.user_time);
 
-            let delta_idle = idle_time.saturating_sub(self.previous_idle_times[index]);
-            let delta_kernel = kernel_time.saturating_sub(self.previous_kernel_times[index]);
-            let delta_total = total_time.saturating_sub(self.previous_total_times[index]);
+                let delta_idle = idle_time.saturating_sub(self.previous_idle_times[index]);
+                let delta_kernel = kernel_time.saturating_sub(self.previous_kernel_times[index]);
+                let delta_total = total_time.saturating_sub(self.previous_total_times[index]);
 
-            sum_idle = sum_idle.saturating_add(delta_idle);
-            sum_kernel = sum_kernel.saturating_add(delta_kernel);
-            sum_total = sum_total.saturating_add(delta_total);
+                sum_idle = sum_idle.saturating_add(delta_idle);
+                sum_kernel = sum_kernel.saturating_add(delta_kernel);
+                sum_total = sum_total.saturating_add(delta_total);
 
-            let cpu_percent = if delta_total > 0 {
-                (100 - ((delta_idle * 100) / delta_total)).clamp(0, 100) as u8
+                let cpu_percent = if delta_total > 0 {
+                    (100 - ((delta_idle * 100) / delta_total)).clamp(0, 100) as u8
+                } else {
+                    0
+                };
+                let kernel_percent = if delta_total > 0 {
+                    ((delta_kernel * 100) / delta_total).clamp(0, 100) as u8
+                } else {
+                    0
+                };
+
+                push_history(&mut self.cpu_history[index], cpu_percent);
+                push_history(&mut self.kernel_history[index], kernel_percent);
+
+                self.previous_idle_times[index] = idle_time;
+                self.previous_total_times[index] = total_time;
+                self.previous_kernel_times[index] = kernel_time;
+            }
+
+            self.cpu_usage = if sum_total > 0 {
+                (100 - ((sum_idle * 100) / sum_total)).clamp(0, 100) as u8
             } else {
                 0
             };
-            let kernel_percent = if delta_total > 0 {
-                ((delta_kernel * 100) / delta_total).clamp(0, 100) as u8
+            self.kernel_usage = if sum_total > 0 {
+                ((sum_kernel * 100) / sum_total).clamp(0, 100) as u8
             } else {
                 0
             };
-
-            push_history(&mut self.cpu_history[index], cpu_percent);
-            push_history(&mut self.kernel_history[index], kernel_percent);
-
-            self.previous_idle_times[index] = idle_time;
-            self.previous_total_times[index] = total_time;
-            self.previous_kernel_times[index] = kernel_time;
         }
-
-        self.cpu_usage = if sum_total > 0 {
-            (100 - ((sum_idle * 100) / sum_total)).clamp(0, 100) as u8
-        } else {
-            0
-        };
-        self.kernel_usage = if sum_total > 0 {
-            ((sum_kernel * 100) / sum_total).clamp(0, 100) as u8
-        } else {
-            0
-        };
     }
 
-    unsafe fn refresh_system_info(&mut self, hwnd_page: HWND) {
-        // 系统级内存、Commit、句柄、线程、进程总数都来源于同一份快照，
-        // 统一在这里采样可以保证页面上的数字属于同一个刷新时刻。
-        let mut perf = zeroed::<PERFORMANCE_INFORMATION>();
-        perf.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
-        if K32GetPerformanceInfo(&mut perf, perf.cb) == 0 {
-            return;
+    fn refresh_system_info(&mut self, hwnd_page: HWND) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 系统级内存、Commit、句柄、线程、进程总数都来源于同一份快照，
+            // 统一在这里采样可以保证页面上的数字属于同一个刷新时刻。
+            let mut perf = zeroed::<PERFORMANCE_INFORMATION>();
+            perf.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
+            if K32GetPerformanceInfo(&mut perf, perf.cb) == 0 {
+                return;
+            }
+
+            let page_kb = (perf.PageSize / 1024).max(1);
+            let pages_to_kb = |page_count: usize| -> u32 {
+                page_count.saturating_mul(page_kb).min(u32::MAX as usize) as u32
+            };
+
+            self.total_physical_kb = pages_to_kb(perf.PhysicalTotal);
+            self.avail_physical_kb = pages_to_kb(perf.PhysicalAvailable);
+            self.file_cache_kb = pages_to_kb(perf.SystemCache);
+            self.physical_mem_limit_kb = self.total_physical_kb;
+            self.physical_mem_usage_kb = self
+                .total_physical_kb
+                .saturating_sub(self.avail_physical_kb);
+            self.commit_total_kb = pages_to_kb(perf.CommitTotal);
+            self.commit_limit_kb = pages_to_kb(perf.CommitLimit);
+            self.commit_peak_kb = pages_to_kb(perf.CommitPeak);
+            self.kernel_total_kb = pages_to_kb(perf.KernelTotal);
+            self.kernel_paged_kb = pages_to_kb(perf.KernelPaged);
+            self.kernel_nonpaged_kb = pages_to_kb(perf.KernelNonpaged);
+            self.handle_count = perf.HandleCount;
+            self.process_count = perf.ProcessCount;
+            self.thread_count = perf.ThreadCount;
+
+            let mem_percent = if self.physical_mem_limit_kb == 0 {
+                0
+            } else {
+                ((self.physical_mem_usage_kb.saturating_mul(100)) / self.physical_mem_limit_kb)
+                    .min(100) as u8
+            };
+            push_history(&mut self.mem_history, mem_percent);
+
+            if !self.no_title {
+                self.update_detail_texts(hwnd_page);
+            }
         }
+    }
 
-        let page_kb = (perf.PageSize / 1024).max(1);
-        let pages_to_kb = |page_count: usize| -> u32 {
-            page_count.saturating_mul(page_kb).min(u32::MAX as usize) as u32
-        };
-
-        self.total_physical_kb = pages_to_kb(perf.PhysicalTotal);
-        self.avail_physical_kb = pages_to_kb(perf.PhysicalAvailable);
-        self.file_cache_kb = pages_to_kb(perf.SystemCache);
-        self.physical_mem_limit_kb = self.total_physical_kb;
-        self.physical_mem_usage_kb = self
-            .total_physical_kb
-            .saturating_sub(self.avail_physical_kb);
-        self.commit_total_kb = pages_to_kb(perf.CommitTotal);
-        self.commit_limit_kb = pages_to_kb(perf.CommitLimit);
-        self.commit_peak_kb = pages_to_kb(perf.CommitPeak);
-        self.kernel_total_kb = pages_to_kb(perf.KernelTotal);
-        self.kernel_paged_kb = pages_to_kb(perf.KernelPaged);
-        self.kernel_nonpaged_kb = pages_to_kb(perf.KernelNonpaged);
-        self.handle_count = perf.HandleCount;
-        self.process_count = perf.ProcessCount;
-        self.thread_count = perf.ThreadCount;
-
-        let mem_percent = if self.physical_mem_limit_kb == 0 {
-            0
-        } else {
-            ((self.physical_mem_usage_kb.saturating_mul(100)) / self.physical_mem_limit_kb).min(100)
-                as u8
-        };
-        push_history(&mut self.mem_history, mem_percent);
-
+    fn update_detail_texts(&self, hwnd_page: HWND) {
+        // 底部统计文本在无标题模式下会被图表覆盖；只在详情区可见时写控件文本，
+        // 避免隐藏 static 控件被后续重绘消息带回图表表面。
         set_numeric_text(hwnd_page, IDC_TOTAL_PHYSICAL, self.total_physical_kb);
         set_numeric_text(hwnd_page, IDC_AVAIL_PHYSICAL, self.avail_physical_kb);
         set_numeric_text(hwnd_page, IDC_FILE_CACHE, self.file_cache_kb);
@@ -930,7 +988,7 @@ impl PerformancePageState {
         set_numeric_text(hwnd_page, IDC_TOTAL_PROCESSES, self.process_count);
     }
 
-    unsafe fn load_meter_bitmaps(&mut self) {
+    fn load_meter_bitmaps(&mut self) {
         // 条形仪表优先复用资源位图；如果资源已经加载过，就不再重复创建 GDI 对象。
         if !self.strip_lit_bitmap.is_null() {
             return;
@@ -941,7 +999,7 @@ impl PerformancePageState {
         self.strip_unlit_bitmap = load_bitmap_from_file("ledunlit.bmp");
     }
 
-    unsafe fn draw_strip_meter(
+    fn draw_strip_meter(
         &self,
         hdc: HDC,
         rect: RECT,
@@ -949,87 +1007,90 @@ impl PerformancePageState {
         lit_percent: u8,
         red_percent: u8,
     ) -> bool {
-        // 位图仪表把点亮区、未点亮区和红色内核区拼接成最终视觉效果。
-        if self.strip_lit_bitmap.is_null()
-            || self.strip_unlit_bitmap.is_null()
-            || (red_percent != 0 && self.strip_lit_red_bitmap.is_null())
-        {
-            return false;
-        }
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 位图仪表把点亮区、未点亮区和红色内核区拼接成最终视觉效果。
+            if self.strip_lit_bitmap.is_null()
+                || self.strip_unlit_bitmap.is_null()
+                || (red_percent != 0 && self.strip_lit_red_bitmap.is_null())
+            {
+                return false;
+            }
 
-        let black = GetStockObject(BLACK_BRUSH) as HBRUSH;
-        let old = SelectObject(hdc, black as HGDIOBJ);
-        Rectangle(hdc, rect.left, rect.top, rect.right, rect.bottom);
+            let black = GetStockObject(BLACK_BRUSH) as HBRUSH;
+            let old = SelectObject(hdc, black as HGDIOBJ);
+            Rectangle(hdc, rect.left, rect.top, rect.right, rect.bottom);
 
-        let units = GetDialogBaseUnits() as usize;
-        let def_spacing = (DEFSPACING_BASE * i32::from(loword(units))) / DLG_SCALE_X;
-        let x_bar_offset = ((rect.right - rect.left) - STRIP_WIDTH) / 2;
-        let bar_height = rect.bottom - rect.top - (current_font_height(hdc) + def_spacing * 3);
-        if bar_height <= 0 {
-            SelectObject(hdc, old);
-            return true;
-        }
+            let units = GetDialogBaseUnits() as usize;
+            let def_spacing = (DEFSPACING_BASE * i32::from(loword(units))) / DLG_SCALE_X;
+            let x_bar_offset = ((rect.right - rect.left) - STRIP_WIDTH) / 2;
+            let bar_height = rect.bottom - rect.top - (current_font_height(hdc) + def_spacing * 3);
+            if bar_height <= 0 {
+                SelectObject(hdc, old);
+                return true;
+            }
 
-        SetBkMode(hdc, TRANSPARENT as i32);
-        SetTextColor(hdc, rgb(0, 255, 0));
-        let mut label_rect = rect;
-        label_rect.bottom -= 4;
-        let mut label_wide = to_wide_null(label);
-        DrawTextW(
-            hdc,
-            label_wide.as_mut_ptr(),
-            -1,
-            &mut label_rect,
-            DT_SINGLELINE | DT_CENTER | DT_BOTTOM,
-        );
+            SetBkMode(hdc, TRANSPARENT as i32);
+            SetTextColor(hdc, rgb(0, 255, 0));
+            let mut label_rect = rect;
+            label_rect.bottom -= 4;
+            let mut label_wide = to_wide_null(label);
+            DrawTextW(
+                hdc,
+                label_wide.as_mut_ptr(),
+                -1,
+                &mut label_rect,
+                DT_SINGLELINE | DT_CENTER | DT_BOTTOM,
+            );
 
-        let hdc_mem = CreateCompatibleDC(hdc);
-        if hdc_mem.is_null() {
-            SelectObject(hdc, old);
-            return true;
-        }
+            let hdc_mem = CreateCompatibleDC(hdc);
+            if hdc_mem.is_null() {
+                SelectObject(hdc, old);
+                return true;
+            }
 
-        let target_lit = ((i32::from(lit_percent) * bar_height) / 100).max(0);
-        let target_red = ((i32::from(red_percent) * bar_height) / 100).clamp(0, target_lit);
-        let unlit_pixels = ((bar_height - target_lit) / 3) * 3;
-        let lit_pixels = bar_height - unlit_pixels;
-        let lit_only_pixels = (lit_pixels - target_red).max(0);
+            let target_lit = ((i32::from(lit_percent) * bar_height) / 100).max(0);
+            let target_red = ((i32::from(red_percent) * bar_height) / 100).clamp(0, target_lit);
+            let unlit_pixels = ((bar_height - target_lit) / 3) * 3;
+            let lit_pixels = bar_height - unlit_pixels;
+            let lit_only_pixels = (lit_pixels - target_red).max(0);
 
-        self.blit_meter_strip(
-            hdc,
-            hdc_mem,
-            self.strip_unlit_bitmap,
-            x_bar_offset,
-            def_spacing,
-            bar_height - lit_pixels,
-        );
-        if lit_only_pixels > 0 {
             self.blit_meter_strip(
                 hdc,
                 hdc_mem,
-                self.strip_lit_bitmap,
+                self.strip_unlit_bitmap,
                 x_bar_offset,
-                def_spacing + (bar_height - lit_pixels),
-                lit_only_pixels,
+                def_spacing,
+                bar_height - lit_pixels,
             );
-        }
-        if target_red > 0 {
-            self.blit_meter_strip(
-                hdc,
-                hdc_mem,
-                self.strip_lit_red_bitmap,
-                x_bar_offset,
-                def_spacing + (bar_height - target_red),
-                target_red,
-            );
-        }
+            if lit_only_pixels > 0 {
+                self.blit_meter_strip(
+                    hdc,
+                    hdc_mem,
+                    self.strip_lit_bitmap,
+                    x_bar_offset,
+                    def_spacing + (bar_height - lit_pixels),
+                    lit_only_pixels,
+                );
+            }
+            if target_red > 0 {
+                self.blit_meter_strip(
+                    hdc,
+                    hdc_mem,
+                    self.strip_lit_red_bitmap,
+                    x_bar_offset,
+                    def_spacing + (bar_height - target_red),
+                    target_red,
+                );
+            }
 
-        DeleteDC(hdc_mem);
-        SelectObject(hdc, old);
-        true
+            DeleteDC(hdc_mem);
+            SelectObject(hdc, old);
+            true
+        }
     }
 
-    unsafe fn blit_meter_strip(
+    fn blit_meter_strip(
         &self,
         hdc: HDC,
         hdc_mem: HDC,
@@ -1038,117 +1099,129 @@ impl PerformancePageState {
         start_y: i32,
         height: i32,
     ) {
-        // 条形位图按固定高度平铺，直到覆盖目标像素高度。
-        if bitmap.is_null() || height <= 0 {
-            return;
-        }
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 条形位图按固定高度平铺，直到覆盖目标像素高度。
+            if bitmap.is_null() || height <= 0 {
+                return;
+            }
 
-        let old_bitmap = SelectObject(hdc_mem, bitmap as HGDIOBJ);
-        let mut remaining = height;
-        let mut offset = 0;
-        while remaining > 0 {
-            let chunk = remaining.min(STRIP_HEIGHT);
-            BitBlt(
-                hdc,
-                x,
-                start_y + offset,
-                STRIP_WIDTH,
-                chunk,
-                hdc_mem,
-                0,
-                0,
-                SRCCOPY,
+            let old_bitmap = SelectObject(hdc_mem, bitmap as HGDIOBJ);
+            let mut remaining = height;
+            let mut offset = 0;
+            while remaining > 0 {
+                let chunk = remaining.min(STRIP_HEIGHT);
+                BitBlt(
+                    hdc,
+                    x,
+                    start_y + offset,
+                    STRIP_WIDTH,
+                    chunk,
+                    hdc_mem,
+                    0,
+                    0,
+                    SRCCOPY,
+                );
+                remaining -= chunk;
+                offset += chunk;
+            }
+            SelectObject(hdc_mem, old_bitmap);
+        }
+    }
+
+    fn ensure_graph_surface(&mut self, hwnd_page: HWND, width: i32, height: i32) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 图表表面的目标尺寸由布局层决定；
+            // 这里仅负责按容量策略确保一份足够大的共享离屏表面存在。
+            //
+            // 图表缓冲按容量管理而不是按精确像素管理：
+            // 只有需求超过当前容量时才扩容，并按固定量子向上取整。
+            // 这样在慢速拖动窗口边缘时不会因为每增长 1 像素就重建一次位图。
+            if width <= 0 || height <= 0 {
+                self.destroy_graph_surface();
+                return;
+            }
+
+            if self.graph_bitmap_width >= width
+                && self.graph_bitmap_height >= height
+                && !self.graph_dc.is_null()
+                && !self.graph_bitmap.is_null()
+            {
+                return;
+            }
+
+            let target_width = next_graph_surface_extent(
+                self.graph_bitmap_width,
+                width,
+                GRAPH_SURFACE_WIDTH_QUANTUM,
             );
-            remaining -= chunk;
-            offset += chunk;
-        }
-        SelectObject(hdc_mem, old_bitmap);
-    }
+            let target_height = next_graph_surface_extent(
+                self.graph_bitmap_height,
+                height,
+                GRAPH_SURFACE_HEIGHT_QUANTUM,
+            );
 
-    unsafe fn ensure_graph_surface(&mut self, hwnd_page: HWND, width: i32, height: i32) {
-        // 图表表面的目标尺寸由布局层决定；
-        // 这里仅负责按容量策略确保一份足够大的共享离屏表面存在。
-        //
-        // 图表缓冲按容量管理而不是按精确像素管理：
-        // 只有需求超过当前容量时才扩容，并按固定量子向上取整。
-        // 这样在慢速拖动窗口边缘时不会因为每增长 1 像素就重建一次位图。
-        if width <= 0 || height <= 0 {
-            self.destroy_graph_surface();
-            return;
-        }
+            let page_dc = GetDC(hwnd_page);
+            if page_dc.is_null() {
+                return;
+            }
 
-        if self.graph_bitmap_width >= width
-            && self.graph_bitmap_height >= height
-            && !self.graph_dc.is_null()
-            && !self.graph_bitmap.is_null()
-        {
-            return;
-        }
+            let graph_dc = CreateCompatibleDC(page_dc);
+            if graph_dc.is_null() {
+                ReleaseDC(hwnd_page, page_dc);
+                return;
+            }
 
-        let target_width =
-            next_graph_surface_extent(self.graph_bitmap_width, width, GRAPH_SURFACE_WIDTH_QUANTUM);
-        let target_height = next_graph_surface_extent(
-            self.graph_bitmap_height,
-            height,
-            GRAPH_SURFACE_HEIGHT_QUANTUM,
-        );
-
-        let page_dc = GetDC(hwnd_page);
-        if page_dc.is_null() {
-            return;
-        }
-
-        let graph_dc = CreateCompatibleDC(page_dc);
-        if graph_dc.is_null() {
+            let graph_bitmap = CreateCompatibleBitmap(page_dc, target_width, target_height);
             ReleaseDC(hwnd_page, page_dc);
-            return;
-        }
-
-        let graph_bitmap = CreateCompatibleBitmap(page_dc, target_width, target_height);
-        ReleaseDC(hwnd_page, page_dc);
-        if graph_bitmap.is_null() {
-            DeleteDC(graph_dc);
-            return;
-        }
-
-        let old_bitmap = SelectObject(graph_dc, graph_bitmap as HGDIOBJ);
-        let previous_dc = self.graph_dc;
-        let previous_bitmap = self.graph_bitmap;
-        let previous_old = self.graph_bitmap_old;
-
-        self.graph_dc = graph_dc;
-        self.graph_bitmap = graph_bitmap;
-        self.graph_bitmap_old = old_bitmap;
-        self.graph_bitmap_width = target_width;
-        self.graph_bitmap_height = target_height;
-
-        if !previous_dc.is_null() {
-            if !previous_old.is_null() {
-                SelectObject(previous_dc, previous_old);
+            if graph_bitmap.is_null() {
+                DeleteDC(graph_dc);
+                return;
             }
-            DeleteDC(previous_dc);
-        }
-        if !previous_bitmap.is_null() {
-            DeleteObject(previous_bitmap as _);
+
+            let old_bitmap = SelectObject(graph_dc, graph_bitmap as HGDIOBJ);
+            let previous_dc = self.graph_dc;
+            let previous_bitmap = self.graph_bitmap;
+            let previous_old = self.graph_bitmap_old;
+
+            self.graph_dc = graph_dc;
+            self.graph_bitmap = graph_bitmap;
+            self.graph_bitmap_old = old_bitmap;
+            self.graph_bitmap_width = target_width;
+            self.graph_bitmap_height = target_height;
+
+            if !previous_dc.is_null() {
+                if !previous_old.is_null() {
+                    SelectObject(previous_dc, previous_old);
+                }
+                DeleteDC(previous_dc);
+            }
+            if !previous_bitmap.is_null() {
+                DeleteObject(previous_bitmap as _);
+            }
         }
     }
 
-    unsafe fn destroy_graph_surface(&mut self) {
-        // 共享离屏表面销毁时需要先把旧位图选回 DC 再删对象。
-        if !self.graph_dc.is_null() {
-            if !self.graph_bitmap_old.is_null() {
-                SelectObject(self.graph_dc, self.graph_bitmap_old);
-                self.graph_bitmap_old = null_mut();
+    fn destroy_graph_surface(&mut self) {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            // 共享离屏表面销毁时需要先把旧位图选回 DC 再删对象。
+            if !self.graph_dc.is_null() {
+                if !self.graph_bitmap_old.is_null() {
+                    SelectObject(self.graph_dc, self.graph_bitmap_old);
+                    self.graph_bitmap_old = null_mut();
+                }
+                DeleteDC(self.graph_dc);
+                self.graph_dc = null_mut();
             }
-            DeleteDC(self.graph_dc);
-            self.graph_dc = null_mut();
+            if !self.graph_bitmap.is_null() {
+                DeleteObject(self.graph_bitmap as _);
+                self.graph_bitmap = null_mut();
+            }
+            self.graph_bitmap_width = 0;
+            self.graph_bitmap_height = 0;
         }
-        if !self.graph_bitmap.is_null() {
-            DeleteObject(self.graph_bitmap as _);
-            self.graph_bitmap = null_mut();
-        }
-        self.graph_bitmap_width = 0;
-        self.graph_bitmap_height = 0;
     }
 
     fn cpu_graph_slot_count(&self) -> usize {
@@ -1161,11 +1234,14 @@ impl PerformancePageState {
         IDC_CPUGRAPH + pane_index as i32
     }
 
-    unsafe fn cpu_graph_hwnd(&self, hwnd_page: HWND, pane_index: usize) -> HWND {
-        if pane_index < self.cpu_graph_slot_count() {
-            GetDlgItem(hwnd_page, self.cpu_graph_control_id(pane_index))
-        } else {
-            null_mut()
+    fn cpu_graph_hwnd(&self, hwnd_page: HWND, pane_index: usize) -> HWND {
+        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        unsafe {
+            if pane_index < self.cpu_graph_slot_count() {
+                GetDlgItem(hwnd_page, self.cpu_graph_control_id(pane_index))
+            } else {
+                null_mut()
+            }
         }
     }
 
@@ -1177,355 +1253,123 @@ impl PerformancePageState {
             1
         }
     }
-}
 
-unsafe fn window_rect_relative_to_page(hwnd: HWND, page_hwnd: HWND) -> RECT {
-    // 把子控件屏幕坐标转换成页面客户区坐标，便于统一布局计算。
-    let mut rect = zeroed::<RECT>();
-    GetWindowRect(hwnd, &mut rect);
-    MapWindowPoints(null_mut(), page_hwnd, &mut rect as *mut _ as _, 2);
-    rect
-}
+    fn redraw_windows(&self, hwnd_page: HWND) -> Vec<HWND> {
+        // Resize 时只暂停性能页及其图表相关控件，避免全局重绘状态影响其它页面。
+        let mut windows =
+            Vec::with_capacity(PERF_LAYOUT_CONTROLS.len() + self.cpu_graph_slot_count() + 8);
+        push_unique_window(&mut windows, hwnd_page);
 
-unsafe fn defer_resize(hdwp: HDWP, hwnd: HWND, width: i32, height: i32) -> HDWP {
-    // 只改尺寸不改位置，是性能页布局中最常见的 `DeferWindowPos` 变体。
-    if hwnd.is_null() {
-        return hdwp;
-    }
-    DeferWindowPos(
-        hdwp,
-        hwnd,
-        null_mut(),
-        0,
-        0,
-        width,
-        height,
-        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-    )
-}
+        // SAFETY: all child lookups target controls owned by the provided performance page HWND.
+        unsafe {
+            if !self.no_title {
+                for control_id in PERF_LAYOUT_CONTROLS {
+                    push_unique_window(&mut windows, GetDlgItem(hwnd_page, control_id));
+                }
+            }
 
-fn push_history(history: &mut [u8], value: u8) {
-    // 历史值按“最新在前”滚动，绘图时就可以直接从右向左连接。
-    if history.is_empty() {
-        return;
-    }
-    history.copy_within(..history.len() - 1, 1);
-    history[0] = value;
-}
+            for control_id in [
+                crate::resource::IDC_CPUFRAME,
+                CPU_USAGE_FRAME_ID,
+                IDC_CPUMETER,
+            ] {
+                push_unique_window(&mut windows, GetDlgItem(hwnd_page, control_id));
+            }
 
-unsafe fn set_numeric_text(hwnd_page: HWND, control_id: i32, value: u32) {
-    // 数字文本统一在这里转成字符串再写入对话框控件。
-    let text = to_wide_null(&value.to_string());
-    SetDlgItemTextW(hwnd_page, control_id, text.as_ptr());
-}
-
-unsafe fn format_mem_meter_text(mem_usage_kb: u32) -> String {
-    // 优先借用系统的字节数格式化；失败时再用本地紧凑格式兜底。
-    let mut buffer = [0u16; 32];
-    if !StrFormatByteSizeW(
-        i64::from(mem_usage_kb) * 1024,
-        buffer.as_mut_ptr(),
-        buffer.len() as u32,
-    )
-    .is_null()
-    {
-        let len = buffer
-            .iter()
-            .position(|&ch| ch == 0)
-            .unwrap_or(buffer.len());
-        return String::from_utf16_lossy(&buffer[..len]);
-    }
-
-    // Match XP intent: prefer compact byte-size text over raw kilobytes.
-    let mem_usage_bytes = u64::from(mem_usage_kb) * 1024;
-    let gib = 1024_u64 * 1024 * 1024;
-    let mib = 1024_u64 * 1024;
-    if mem_usage_bytes >= gib {
-        format!("{:.1} GB", mem_usage_bytes as f64 / gib as f64)
-    } else if mem_usage_bytes >= mib {
-        format!("{:.1} MB", mem_usage_bytes as f64 / mib as f64)
-    } else {
-        format!("{mem_usage_kb} KB")
-    }
-}
-
-unsafe fn fill_black(hdc: HDC, rect: &RECT) {
-    // 图表背景统一是黑底，单独抽成 helper 便于复用。
-    FillRect(hdc, rect, GetStockObject(BLACK_BRUSH) as HBRUSH);
-}
-
-unsafe fn draw_grid_width(hdc: HDC, rect: &RECT, width: i32, scroll_offset: i32) {
-    // 网格会跟着 scroll_offset 横向平移，视觉上形成持续向左滚动的历史时间轴。
-    let pen = CreatePen(PS_SOLID, 1, rgb(0, 128, 64));
-    if pen.is_null() {
-        return;
-    }
-
-    let old_pen = SelectObject(hdc, pen as _);
-    let left = rect.right - width.max(0);
-    let right = rect.right;
-    let top = rect.top;
-    let bottom = rect.bottom;
-
-    let mut y = top + GRAPH_GRID - 1;
-    while y < bottom {
-        MoveToEx(hdc, left, y, null_mut());
-        LineTo(hdc, right, y);
-        y += GRAPH_GRID;
-    }
-
-    let mut x = right - scroll_offset;
-    while x > left {
-        MoveToEx(hdc, x, top, null_mut());
-        LineTo(hdc, x, bottom);
-        x -= GRAPH_GRID;
-    }
-
-    SelectObject(hdc, old_pen);
-    DeleteObject(pen as _);
-}
-
-#[derive(Clone, Copy)]
-struct HistoryPlotLayout {
-    graph_height: i32,
-    width: i32,
-    scale: usize,
-}
-
-#[derive(Clone, Copy)]
-struct HistorySeries<'a> {
-    history: &'a [u8],
-    color: ChartColor,
-    stop_on_zero: bool,
-}
-
-unsafe fn draw_history_series(
-    hdc: HDC,
-    rect: &RECT,
-    layout: HistoryPlotLayout,
-    series: HistorySeries<'_>,
-) {
-    // 同一套折线绘制既服务 CPU 曲线，也服务内存曲线；
-    // `stop_on_zero` 用来阻止内存图在历史尚未填满时画出一条贴底长线。
-    if series.history.is_empty() {
-        return;
-    }
-
-    let pen = CreatePen(
-        PS_SOLID,
-        2,
-        match series.color {
-            ChartColor::Black => rgb(0, 0, 0),
-            ChartColor::Green => rgb(0, 255, 0),
-            ChartColor::Yellow => rgb(255, 255, 0),
-            ChartColor::Red => rgb(255, 0, 0),
-            ChartColor::Grid => rgb(0, 128, 64),
-        },
-    );
-    if pen.is_null() {
-        return;
-    }
-
-    let old_pen = SelectObject(hdc, pen as _);
-    MoveToEx(
-        hdc,
-        rect.right,
-        rect.bottom - (i32::from(series.history[0]) * layout.graph_height) / 100,
-        null_mut(),
-    );
-
-    for (index, value) in series.history.iter().enumerate() {
-        if index * layout.scale >= layout.width as usize {
-            break;
-        }
-        if series.stop_on_zero && *value == 0 {
-            break;
+            if !self.no_title {
+                for control_id in [IDC_MEMBARFRAME, IDC_MEMMETER, IDC_MEMFRAME, IDC_MEMGRAPH] {
+                    push_unique_window(&mut windows, GetDlgItem(hwnd_page, control_id));
+                }
+            }
         }
 
-        LineTo(
-            hdc,
-            rect.right - (layout.scale * index) as i32,
-            rect.bottom - (i32::from(*value) * layout.graph_height) / 100,
+        for pane_index in 0..self.cpu_graph_slot_count() {
+            push_unique_window(&mut windows, self.cpu_graph_hwnd(hwnd_page, pane_index));
+        }
+
+        windows
+    }
+
+    pub fn redraw_after_layout(&self, hwnd_page: HWND) {
+        let redraw_windows = self.redraw_windows(hwnd_page);
+        redraw_performance_page(hwnd_page, &redraw_windows);
+    }
+}
+
+fn push_unique_window(windows: &mut Vec<HWND>, hwnd: HWND) {
+    if hwnd.is_null() || windows.contains(&hwnd) {
+        return;
+    }
+    windows.push(hwnd);
+}
+
+fn set_redraw_for_windows(windows: &[HWND], enabled: bool) {
+    // SAFETY: callers pass HWNDs collected from the active performance page; WM_SETREDRAW only
+    // toggles paint dispatch for those windows and does not transfer ownership.
+    unsafe {
+        for &hwnd in windows {
+            SendMessageW(hwnd, WM_SETREDRAW, usize::from(enabled), 0);
+        }
+    }
+}
+
+fn redraw_performance_page(hwnd_page: HWND, redraw_windows: &[HWND]) {
+    if hwnd_page.is_null() {
+        return;
+    }
+
+    // SAFETY: the HWNDs belong to the active performance page. The parent clears stale child
+    // positions first, then only visible children repaint from their final layout.
+    unsafe {
+        RedrawWindow(
+            hwnd_page,
+            null(),
+            null_mut(),
+            RDW_INVALIDATE | RDW_ERASE | RDW_NOCHILDREN | RDW_UPDATENOW,
         );
-    }
 
-    SelectObject(hdc, old_pen);
-    DeleteObject(pen as _);
-}
+        for &hwnd in redraw_windows {
+            if hwnd == hwnd_page || IsWindowVisible(hwnd) == 0 {
+                continue;
+            }
 
-fn draw_grid_width_gpu(frame: &ChartFrame<'_>, rect: &RECT, width: i32, scroll_offset: i32) {
-    let left = rect.right - width.max(0);
-    let right = rect.right;
-    let top = rect.top;
-    let bottom = rect.bottom;
-
-    let mut y = top + GRAPH_GRID - 1;
-    while y < bottom {
-        frame.draw_grid_line(
-            left as f32,
-            y as f32,
-            right as f32,
-            y as f32,
-            ChartColor::Grid,
-        );
-        y += GRAPH_GRID;
-    }
-
-    let mut x = right - scroll_offset;
-    while x > left {
-        frame.draw_grid_line(
-            x as f32,
-            top as f32,
-            x as f32,
-            bottom as f32,
-            ChartColor::Grid,
-        );
-        x -= GRAPH_GRID;
-    }
-}
-
-fn draw_history_series_gpu(
-    frame: &ChartFrame<'_>,
-    rect: &RECT,
-    layout: HistoryPlotLayout,
-    series: HistorySeries<'_>,
-) {
-    if series.history.is_empty() {
-        return;
-    }
-
-    let mut previous_x = rect.right as f32;
-    let mut previous_y =
-        (rect.bottom - (i32::from(series.history[0]) * layout.graph_height) / 100) as f32;
-
-    for (index, value) in series.history.iter().enumerate() {
-        if index * layout.scale >= layout.width as usize {
-            break;
+            InvalidateRect(
+                hwnd,
+                null(),
+                if should_erase_redraw_window(hwnd) {
+                    1
+                } else {
+                    0
+                },
+            );
+            UpdateWindow(hwnd);
         }
-        if series.stop_on_zero && *value == 0 {
-            break;
+    }
+}
+
+fn should_erase_redraw_window(hwnd: HWND) -> bool {
+    should_erase_redraw_control(unsafe { GetDlgCtrlID(hwnd) })
+}
+
+fn should_erase_redraw_control(control_id: i32) -> bool {
+    // Frame controls paint a gray interior during WM_ERASEBKGND. Erasing them after a resize
+    // clears old chart pixels that can otherwise remain inside group-box interiors.
+    PERF_FRAME_CONTROLS.contains(&control_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn performance_frames_are_erased_after_layout_redraw() {
+        for control_id in PERF_FRAME_CONTROLS {
+            assert!(should_erase_redraw_control(control_id));
         }
-
-        let x = (rect.right - (layout.scale * index) as i32) as f32;
-        let y = (rect.bottom - (i32::from(*value) * layout.graph_height) / 100) as f32;
-        frame.draw_series_line(previous_x, previous_y, x, y, series.color);
-        previous_x = x;
-        previous_y = y;
-    }
-}
-
-unsafe fn draw_meter(
-    hdc: HDC,
-    rect: RECT,
-    label: &str,
-    fill_percent: u8,
-    red_percent: u8,
-    main_color: u32,
-    red_color: u32,
-) {
-    fill_black(hdc, &rect);
-
-    let mut text_rect = rect;
-    text_rect.top = rect.bottom - 18;
-
-    let graph_top = rect.top + 4;
-    let graph_bottom = (text_rect.top - 4).max(graph_top);
-    let graph_height = (graph_bottom - graph_top).max(1);
-    let bar_width = 20;
-    let bar_left = rect.left + ((rect.right - rect.left - bar_width) / 2).max(0);
-    let bar_right = bar_left + bar_width;
-
-    let lit_pixels = ((graph_height * i32::from(fill_percent)) / 100).clamp(0, graph_height);
-    let red_pixels = ((graph_height * i32::from(red_percent)) / 100).clamp(0, lit_pixels);
-
-    if lit_pixels < graph_height {
-        let unlit_rect = RECT {
-            left: bar_left,
-            top: graph_top,
-            right: bar_right,
-            bottom: graph_bottom - lit_pixels,
-        };
-        fill_rect_color(hdc, &unlit_rect, rgb(32, 32, 32));
     }
 
-    if lit_pixels > red_pixels {
-        let lit_rect = RECT {
-            left: bar_left,
-            top: graph_bottom - lit_pixels,
-            right: bar_right,
-            bottom: graph_bottom - red_pixels,
-        };
-        fill_rect_color(hdc, &lit_rect, main_color);
+    #[test]
+    fn non_frame_text_controls_do_not_request_erasing_redraw() {
+        assert!(!should_erase_redraw_control(IDC_STATIC2));
     }
-
-    if red_pixels > 0 {
-        let red_rect = RECT {
-            left: bar_left,
-            top: graph_bottom - red_pixels,
-            right: bar_right,
-            bottom: graph_bottom,
-        };
-        fill_rect_color(hdc, &red_rect, red_color);
-    }
-
-    SetBkMode(hdc, TRANSPARENT as i32);
-    SetTextColor(hdc, rgb(0, 255, 0));
-    let mut label_wide = to_wide_null(label);
-    DrawTextW(
-        hdc,
-        label_wide.as_mut_ptr(),
-        -1,
-        &mut text_rect,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-    );
-}
-
-unsafe fn fill_rect_color(hdc: HDC, rect: &RECT, color: u32) {
-    let brush = CreateSolidBrush(color);
-    if brush.is_null() {
-        return;
-    }
-    FillRect(hdc, rect, brush);
-    DeleteObject(brush as _);
-}
-
-fn average_history(history_sets: &[Vec<u8>]) -> Vec<u8> {
-    // “所有 CPU 合并图”不是重新采样，而是把同一时间点上的每核数据做平均。
-    let Some(first_history) = history_sets.first() else {
-        return Vec::new();
-    };
-
-    let mut averaged = vec![0u8; first_history.len()];
-    for (index, value) in averaged.iter_mut().enumerate() {
-        let sum = history_sets
-            .iter()
-            .map(|history| u32::from(history.get(index).copied().unwrap_or_default()))
-            .sum::<u32>();
-        *value = (sum / history_sets.len() as u32).min(100) as u8;
-    }
-
-    averaged
-}
-
-unsafe fn current_font_height(hdc: HDC) -> i32 {
-    let font = GetCurrentObject(hdc, OBJ_FONT as u32);
-    if font.is_null() {
-        return 0;
-    }
-
-    let mut font_info = zeroed::<LOGFONTW>();
-    if GetObjectW(
-        font,
-        size_of::<LOGFONTW>() as i32,
-        &mut font_info as *mut _ as *mut c_void,
-    ) == 0
-    {
-        return 0;
-    }
-
-    font_info.lfHeight.abs()
-}
-
-const fn rgb(red: u8, green: u8, blue: u8) -> u32 {
-    red as u32 | ((green as u32) << 8) | ((blue as u32) << 16)
 }

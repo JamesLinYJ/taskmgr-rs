@@ -68,28 +68,28 @@ use crate::resource::*;
 use crate::runtime_menu::{MenuItemState, PopupMenu};
 use crate::winutil::{
     append_32_bit_suffix, finish_list_view_update_deferred, get_window_userdata,
-    is_32_bit_process_handle, load_string, loword, set_window_userdata, subclass_list_view,
+    is_32_bit_process_handle, loword, set_window_userdata, subclass_list_view,
     to_wide_null,
 };
 
 const PROCESS_COLUMNS: [ProcessColumn; NUM_COLUMN] = [
     // 列定义和旧版 Task Manager 保持兼容，既决定标题也决定默认宽度与对齐方式。
-    ProcessColumn::new(IDS_COL_IMAGENAME, LVCFMT_LEFT, 107),
-    ProcessColumn::new(IDS_COL_PID, LVCFMT_RIGHT, 50),
-    ProcessColumn::new(IDS_COL_USERNAME, LVCFMT_LEFT, 107),
-    ProcessColumn::new(IDS_COL_SESSIONID, LVCFMT_RIGHT, 60),
-    ProcessColumn::new(IDS_COL_CPU, LVCFMT_RIGHT, 35),
-    ProcessColumn::new(IDS_COL_CPUTIME, LVCFMT_RIGHT, 70),
-    ProcessColumn::new(IDS_COL_MEMUSAGE, LVCFMT_RIGHT, 70),
-    ProcessColumn::new(IDS_COL_MEMUSAGEDIFF, LVCFMT_RIGHT, 70),
-    ProcessColumn::new(IDS_COL_PAGEFAULTS, LVCFMT_RIGHT, 70),
-    ProcessColumn::new(IDS_COL_PAGEFAULTSDIFF, LVCFMT_RIGHT, 70),
-    ProcessColumn::new(IDS_COL_COMMITCHARGE, LVCFMT_RIGHT, 70),
-    ProcessColumn::new(IDS_COL_PAGEDPOOL, LVCFMT_RIGHT, 70),
-    ProcessColumn::new(IDS_COL_NONPAGEDPOOL, LVCFMT_RIGHT, 70),
-    ProcessColumn::new(IDS_COL_BASEPRIORITY, LVCFMT_RIGHT, 60),
-    ProcessColumn::new(IDS_COL_HANDLECOUNT, LVCFMT_RIGHT, 60),
-    ProcessColumn::new(IDS_COL_THREADCOUNT, LVCFMT_RIGHT, 60),
+    ProcessColumn::new(TextKey::ProcessColumnImageName, LVCFMT_LEFT, 107),
+    ProcessColumn::new(TextKey::ProcessColumnPid, LVCFMT_RIGHT, 50),
+    ProcessColumn::new(TextKey::ProcessColumnUserName, LVCFMT_LEFT, 107),
+    ProcessColumn::new(TextKey::ProcessColumnSessionId, LVCFMT_RIGHT, 60),
+    ProcessColumn::new(TextKey::ProcessColumnCpu, LVCFMT_RIGHT, 35),
+    ProcessColumn::new(TextKey::ProcessColumnCpuTime, LVCFMT_RIGHT, 70),
+    ProcessColumn::new(TextKey::ProcessColumnMemoryUsage, LVCFMT_RIGHT, 70),
+    ProcessColumn::new(TextKey::ProcessColumnMemoryUsageDelta, LVCFMT_RIGHT, 70),
+    ProcessColumn::new(TextKey::ProcessColumnPageFaults, LVCFMT_RIGHT, 70),
+    ProcessColumn::new(TextKey::ProcessColumnPageFaultsDelta, LVCFMT_RIGHT, 70),
+    ProcessColumn::new(TextKey::ProcessColumnVirtualMemorySize, LVCFMT_RIGHT, 70),
+    ProcessColumn::new(TextKey::ProcessColumnPagedPool, LVCFMT_RIGHT, 70),
+    ProcessColumn::new(TextKey::ProcessColumnNonPagedPool, LVCFMT_RIGHT, 70),
+    ProcessColumn::new(TextKey::ProcessColumnBasePriority, LVCFMT_RIGHT, 60),
+    ProcessColumn::new(TextKey::ProcessColumnHandleCount, LVCFMT_RIGHT, 60),
+    ProcessColumn::new(TextKey::ProcessColumnThreadCount, LVCFMT_RIGHT, 60),
 ];
 
 const COLUMN_DIALOG_IDS: [i32; NUM_COLUMN] = [
@@ -118,15 +118,15 @@ const TEXT_CALLBACK_WIDE: *mut u16 = -1isize as *mut u16;
 #[derive(Clone, Copy)]
 struct ProcessColumn {
     // `ProcessColumn` 描述一列在 UI 层的静态元数据。
-    title_id: u32,
+    title_key: TextKey,
     fmt: i32,
     default_width: i32,
 }
 
 impl ProcessColumn {
-    const fn new(title_id: u32, fmt: i32, default_width: i32) -> Self {
+    const fn new(title_key: TextKey, fmt: i32, default_width: i32) -> Self {
         Self {
-            title_id,
+            title_key,
             fmt,
             default_width,
         }
@@ -379,7 +379,7 @@ impl ProcessPageState {
         Self::default()
     }
 
-    pub fn no_title(&self) -> bool {
+    pub unsafe fn no_title(&self) -> bool {
         self.no_title
     }
 
@@ -725,28 +725,28 @@ impl ProcessPageState {
         unsafe { GetDlgItem(self.hwnd_page, IDC_PROCLIST) }
     }
 
-    unsafe fn load_strings(&mut self) {
+    fn load_strings(&mut self) {
         // 常用错误文案和优先级文本在这里集中缓存，避免命令执行路径上反复查资源。
-        self.strings.warning = load_string(self.hinstance, IDS_WARNING);
-        self.strings.invalid_option = load_string(self.hinstance, IDS_INVALIDOPTION);
-        self.strings.no_affinity_mask = load_string(self.hinstance, IDS_NOAFFINITYMASK);
-        self.strings.kill = load_string(self.hinstance, IDS_KILL);
+        self.strings.warning = text(TextKey::WarningTitle).to_string();
+        self.strings.invalid_option = text(TextKey::InvalidOptionTitle).to_string();
+        self.strings.no_affinity_mask = text(TextKey::NoAffinityMaskMessage).to_string();
+        self.strings.kill = text(TextKey::KillProcessWarning).to_string();
         self.strings.kill_tree = text(TextKey::KillProcessTreePrompt).to_string();
         self.strings.kill_tree_fail = text(TextKey::KillProcessTreeFailed).to_string();
         self.strings.kill_tree_fail_body = text(TextKey::KillProcessTreeFailedBody).to_string();
-        self.strings.debug = load_string(self.hinstance, IDS_DEBUG);
-        self.strings.prichange = load_string(self.hinstance, IDS_PRICHANGE);
-        self.strings.cant_kill = load_string(self.hinstance, IDS_CANTKILL);
-        self.strings.cant_debug = load_string(self.hinstance, IDS_CANTDEBUG);
-        self.strings.cant_change_priority = load_string(self.hinstance, IDS_CANTCHANGEPRI);
-        self.strings.cant_set_affinity = load_string(self.hinstance, IDS_CANTSETAFFINITY);
+        self.strings.debug = text(TextKey::DebugProcessWarning).to_string();
+        self.strings.prichange = text(TextKey::PriorityChangeWarning).to_string();
+        self.strings.cant_kill = text(TextKey::UnableToTerminateProcess).to_string();
+        self.strings.cant_debug = text(TextKey::UnableToAttachDebugger).to_string();
+        self.strings.cant_change_priority = text(TextKey::UnableToChangePriority).to_string();
+        self.strings.cant_set_affinity = text(TextKey::UnableToSetAffinity).to_string();
         self.strings.cant_open_file_location = text(TextKey::UnableToOpenFileLocation).to_string();
-        self.strings.priority_low = plain_text(TextKey::Low);
-        self.strings.priority_below_normal = plain_text(TextKey::BelowNormal);
-        self.strings.priority_normal = plain_text(TextKey::Normal);
-        self.strings.priority_above_normal = plain_text(TextKey::AboveNormal);
-        self.strings.priority_high = plain_text(TextKey::High);
-        self.strings.priority_realtime = plain_text(TextKey::Realtime);
+        self.strings.priority_low = text(TextKey::Low).to_string();
+        self.strings.priority_below_normal = text(TextKey::BelowNormal).to_string();
+        self.strings.priority_normal = text(TextKey::Normal).to_string();
+        self.strings.priority_above_normal = text(TextKey::AboveNormal).to_string();
+        self.strings.priority_high = text(TextKey::High).to_string();
+        self.strings.priority_realtime = text(TextKey::Realtime).to_string();
         self.strings.priority_unknown = text(TextKey::Unknown).to_string();
     }
 
@@ -990,7 +990,7 @@ impl ProcessPageState {
                 .copied()
                 .filter(|value| *value > 0)
                 .unwrap_or(column.default_width);
-            let title = load_string(self.hinstance, column.title_id);
+            let title = text(column.title_key).to_string();
             let mut title_wide = to_wide_null(&title);
             let mut lv_column = LVCOLUMNW {
                 mask: LVCF_FMT | LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM,
@@ -2216,26 +2216,6 @@ fn utf16_buffer_to_string(buffer: &[u16]) -> String {
         .position(|value| *value == 0)
         .unwrap_or(buffer.len());
     String::from_utf16_lossy(&buffer[..length])
-}
-
-fn plain_text(key: TextKey) -> String {
-    strip_access_key_markers(text(key))
-}
-
-fn strip_access_key_markers(label: &str) -> String {
-    let mut plain = String::with_capacity(label.len());
-    let mut chars = label.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '&' {
-            if matches!(chars.peek(), Some('&')) {
-                plain.push('&');
-                chars.next();
-            }
-            continue;
-        }
-        plain.push(ch);
-    }
-    plain
 }
 
 fn cpu_percent_from_delta(delta_100ns: u64, total_delta_100ns: u64) -> u8 {
