@@ -23,7 +23,7 @@ pub const HIST_SIZE: usize = 2000;
 pub const GRAPH_GRID: i32 = 12;
 
 pub fn defer_resize(hdwp: HDWP, hwnd: HWND, width: i32, height: i32) -> HDWP {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         // 只改尺寸不改位置，是性能页布局中最常见的 `DeferWindowPos` 变体。
         if hwnd.is_null() {
@@ -43,7 +43,7 @@ pub fn defer_resize(hdwp: HDWP, hwnd: HWND, width: i32, height: i32) -> HDWP {
 }
 
 pub fn set_numeric_text(hwnd_page: HWND, control_id: i32, value: u32) {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         let mut buf = [0u16; 16];
         write_u32_utf16(value, &mut buf);
@@ -68,7 +68,7 @@ fn write_u32_utf16(mut value: u32, buf: &mut [u16]) {
 }
 
 pub fn format_mem_meter_text(mem_usage_kb: u32) -> String {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         let mut buffer = [0u16; 32];
         if !StrFormatByteSizeW(
@@ -100,7 +100,7 @@ pub fn format_mem_meter_text(mem_usage_kb: u32) -> String {
 }
 
 pub fn draw_grid_width(hdc: HDC, rect: &RECT, width: i32, scroll_offset: i32) {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         let old_pen = SelectObject(hdc, GetStockObject(DC_PEN as i32) as _);
         SetDCPenColor(hdc, rgb(0, 128, 64));
@@ -147,7 +147,7 @@ pub fn draw_history_series(
     layout: HistoryPlotLayout,
     series: HistorySeries<'_>,
 ) {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         if series.history.is_empty() {
             return;
@@ -261,7 +261,7 @@ pub fn draw_meter(
     main_color: u32,
     red_color: u32,
 ) {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         fill_black(hdc, &rect);
 
@@ -336,7 +336,7 @@ pub fn average_history_into(history_sets: &[Vec<u8>], out: &mut Vec<u8>) {
     }
 }
 pub fn current_font_height(hdc: HDC) -> i32 {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         let font = GetCurrentObject(hdc, OBJ_FONT as u32);
         if font.is_null() {

@@ -89,7 +89,7 @@ impl UserPageState {
     pub fn initialize(&mut self, hwnd: HWND) {
         // 用户页初始化时把 ListView 立刻配置好并做首轮会话枚举，
         // 这样页面第一次切入就已经带着当前在线用户状态。
-        // SAFETY: all Win32 calls target the user page HWND and its child controls during UI-thread
+        // 安全性: all Win32 calls target the user page HWND and its child controls during UI-thread
         // initialization.
         unsafe {
             self.hinstance =
@@ -127,7 +127,7 @@ impl UserPageState {
 
     pub fn size_page(&self) {
         // 用户页采用“列表占满上方，按钮固定在下方右侧”的经典布局。
-        // SAFETY: layout only queries and moves child controls belonging to this page HWND.
+        // 安全性: layout only queries and moves child controls belonging to this page HWND.
         unsafe {
             if self.hwnd.is_null() {
                 return;
@@ -186,7 +186,7 @@ impl UserPageState {
     }
     pub fn handle_notify(&mut self, lparam: isize) -> isize {
         // 选择变化用于驱动按钮可用性，列点击则触发当前会话列表重新排序。
-        // SAFETY: `lparam` is provided by WM_NOTIFY and points to an NMLISTVIEW for this handler.
+        // 安全性: `lparam` is provided by WM_NOTIFY and points to an NMLISTVIEW for this handler.
         unsafe {
             let notify = &*(lparam as *const NMLISTVIEW);
             if notify.hdr.idFrom as i32 == IDC_USERLIST {
@@ -237,7 +237,7 @@ impl UserPageState {
 
     pub fn show_context_menu(&mut self, x: i32, y: i32) {
         // 右键菜单只在有选择时弹出，并按当前会话状态动态禁用不合法操作。
-        // SAFETY: context menu and selection queries are UI-thread operations for this page.
+        // 安全性: context menu and selection queries are UI-thread operations for this page.
         unsafe {
             let selected = self.selected_session_ids();
             if selected.is_empty() {
@@ -258,7 +258,7 @@ impl UserPageState {
     }
 
     fn configure_columns(&self) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 用户页列固定，直接按当前语言文本重建整套列表头即可。
             let list = self.list_hwnd();
@@ -299,7 +299,7 @@ impl UserPageState {
     }
 
     fn refresh(&mut self) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 刷新时先保存上一轮会话映射，再和新枚举结果做比对，
             // 这样可以知道哪些行真正发生了变化。
@@ -414,7 +414,7 @@ impl UserPageState {
     }
 
     fn update_listview(&self) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 用户列表也采用增量同步策略，减少重排带来的闪烁和选择状态丢失。
             let list = self.list_hwnd();
@@ -464,7 +464,7 @@ impl UserPageState {
     }
 
     fn insert_row(&self, list: HWND, index: usize, session: &UserSessionEntry) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             let mut user_name = to_wide_null(&session.display_name);
             let mut item = LVITEMW {
@@ -482,7 +482,7 @@ impl UserPageState {
     }
 
     fn replace_row(&self, list: HWND, index: usize, session: &UserSessionEntry) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             let mut user_name = to_wide_null(&session.display_name);
             let mut item = LVITEMW {
@@ -500,7 +500,7 @@ impl UserPageState {
     }
 
     fn update_row(&self, list: HWND, index: usize, session: &UserSessionEntry) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 第 1 列是字符串，第 2 列显示 session id，其余列回填状态和客户端信息。
             let row = [
@@ -531,7 +531,7 @@ impl UserPageState {
     }
 
     fn restore_selection(&self, session_id: u32) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             let list = self.list_hwnd();
             if list.is_null() {
@@ -558,7 +558,7 @@ impl UserPageState {
     }
 
     fn current_selected_session_id(&self) -> Option<u32> {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             let list = self.list_hwnd();
             if list.is_null() {
@@ -585,7 +585,7 @@ impl UserPageState {
     }
 
     fn update_ui_state(&self) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // “发送消息”只要有选择就可用；
             // “断开”则不能对已经断开的会话再次执行。
@@ -622,7 +622,7 @@ impl UserPageState {
     }
 
     fn selected_session_ids(&self) -> Vec<u32> {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 批量操作都基于当前多选会话列表，因此这里统一把所有选中项提取出来。
             let list = self.list_hwnd();
@@ -657,7 +657,7 @@ impl UserPageState {
     }
 
     fn update_menu_state(&self, popup: HMENU, selected: &[u32]) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             let send_enabled = !selected.is_empty();
             let mut disconnect_enabled = !selected.is_empty();
@@ -710,7 +710,7 @@ impl UserPageState {
     }
 
     fn send_message(&mut self) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 发送消息会先弹出输入对话框，再逐个会话调用 WTSSendMessageW。
             let selected = self.selected_session_ids();
@@ -755,7 +755,7 @@ impl UserPageState {
     }
 
     fn change_session_state(&mut self, command_id: u16) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 断开/注销属于高影响操作，先确认，再逐个会话执行，失败时立即报错并停止。
             let selected = self.selected_session_ids();
@@ -801,7 +801,7 @@ impl UserPageState {
     }
 
     fn show_command_failure(&self, message: &str) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 统一附带最后一个 Win32 错误码，方便排查权限或会话状态问题。
             let last_error = GetLastError();
@@ -826,13 +826,13 @@ impl UserPageState {
     }
 
     fn list_hwnd(&self) -> HWND {
-        // SAFETY: this only queries a child HWND from this page dialog; null is allowed.
+        // 安全性: this only queries a child HWND from this page dialog; null is allowed.
         unsafe { GetDlgItem(self.hwnd, IDC_USERLIST) }
     }
 }
 
 fn query_session_string(session_id: u32, info_class: i32) -> String {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         // 终端服务 API 返回的是系统分配的 UTF-16 缓冲区，需要在复制完字符串后手动释放。
         let mut buffer = null_mut();
@@ -951,7 +951,7 @@ unsafe extern "system" fn message_dialog_proc(
 }
 
 fn get_dialog_item_text(hwnd: HWND, control_id: i32) -> String {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         // 小型输入对话框直接把控件文本读回为 Rust String，便于后续传给 WTS API。
         let control = GetDlgItem(hwnd, control_id);

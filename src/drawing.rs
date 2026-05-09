@@ -15,14 +15,14 @@ pub fn push_history(history: &mut [u8], value: u8) {
 }
 
 pub fn fill_black(hdc: HDC, rect: &RECT) {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         FillRect(hdc, rect, GetStockObject(BLACK_BRUSH) as HBRUSH);
     }
 }
 
 pub fn fill_rect_color(hdc: HDC, rect: &RECT, color: u32) {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         let brush = CreateSolidBrush(color);
         if brush.is_null() {

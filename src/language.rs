@@ -46,7 +46,7 @@ include!(concat!(env!("OUT_DIR"), "/localization_generated.rs"));
 pub fn current_language() -> UiLanguage {
     // 语言探测只做一次，后续都走缓存，避免每次查字符串都调用系统 API。
     *UI_LANGUAGE.get_or_init(|| {
-        // SAFETY: `GetUserDefaultUILanguage` is a process-local query with no pointer inputs.
+        // 安全性: `GetUserDefaultUILanguage` is a process-local query with no pointer inputs.
         let lang_id = unsafe { GetUserDefaultUILanguage() };
         let primary = lang_id & 0x03ff;
         let sub = (lang_id >> 10) & 0x003f;

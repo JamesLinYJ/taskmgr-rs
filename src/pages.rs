@@ -424,12 +424,12 @@ impl DialogPage {
 
         if self.hwnd.is_null() {
             self.state.destroy();
-            // SAFETY: retrieving the last-error code immediately after dialog creation failed.
+            // 安全性: retrieving the last-error code immediately after dialog creation failed.
             Err(unsafe { GetLastError() })
         } else {
             localize_dialog(self.hwnd, self.dialog_id);
             if let Err(error) = self.state.complete_initialize() {
-                // SAFETY: `self.hwnd` is the just-created dialog owned by this page.
+                // 安全性: `self.hwnd` is the just-created dialog owned by this page.
                 unsafe { DestroyWindow(self.hwnd) };
                 self.hwnd = null_mut();
                 self.state.destroy();
@@ -450,11 +450,11 @@ impl DialogPage {
         // 激活页面时顺带切换主菜单和焦点目标，
         // 这样每个页面都能看起来像自己“拥有”一套独立菜单。
         if self.hwnd.is_null() {
-            // SAFETY: used only to preserve the previous error reporting contract.
+            // 安全性: used only to preserve the previous error reporting contract.
             return Err(unsafe { GetLastError() });
         }
 
-        // SAFETY: `self.hwnd` was checked and belongs to this page.
+        // 安全性: `self.hwnd` was checked and belongs to this page.
         unsafe {
             ShowWindow(self.hwnd, SW_SHOW);
             SetWindowPos(self.hwnd, null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
@@ -464,15 +464,15 @@ impl DialogPage {
             PageFocusTarget::None => {}
             PageFocusTarget::Tabs => {
                 if !self.hwnd_tabs.is_null() {
-                    // SAFETY: focusing a live tab HWND.
+                    // 安全性: focusing a live tab HWND.
                     unsafe { SetFocus(self.hwnd_tabs) };
                 }
             }
             PageFocusTarget::Control(control_id) => {
-                // SAFETY: child lookup only borrows the page dialog HWND.
+                // 安全性: child lookup only borrows the page dialog HWND.
                 let focus_hwnd = unsafe { GetDlgItem(self.hwnd, control_id) };
                 if !focus_hwnd.is_null() {
-                    // SAFETY: focusing the child HWND returned by Win32.
+                    // 安全性: focusing the child HWND returned by Win32.
                     unsafe { SetFocus(focus_hwnd) };
                 }
             }
@@ -480,13 +480,13 @@ impl DialogPage {
 
         let previous_menu = *current_menu;
         let Some(next_menu) = build_main_menu(self.menu_id, processor_count) else {
-            // SAFETY: used only to preserve the previous error reporting contract.
+            // 安全性: used only to preserve the previous error reporting contract.
             return Err(unsafe { GetLastError() });
         };
 
         *current_menu = next_menu;
         if !options.no_title() {
-            // SAFETY: `next_menu` is a valid menu handle transferred to the main window.
+            // 安全性: `next_menu` is a valid menu handle transferred to the main window.
             unsafe {
                 SetMenu(main_hwnd, next_menu);
                 DrawMenuBar(main_hwnd);
@@ -529,7 +529,7 @@ impl DialogPage {
         // 其它页面如果没有额外状态，就只需要隐藏窗口。
         self.state.deactivate(options);
         if !self.hwnd.is_null() {
-            // SAFETY: hiding this page dialog HWND.
+            // 安全性: hiding this page dialog HWND.
             unsafe { ShowWindow(self.hwnd, SW_HIDE) };
         }
     }
@@ -538,7 +538,7 @@ impl DialogPage {
         // 页面销毁分为“业务资源销毁”和“窗口销毁”两层，前者有些并不依赖窗口仍然存在。
         self.state.destroy();
         if !self.hwnd.is_null() {
-            // SAFETY: destroying this page dialog HWND exactly once.
+            // 安全性: destroying this page dialog HWND exactly once.
             unsafe { DestroyWindow(self.hwnd) };
             self.hwnd = null_mut();
         }
@@ -588,7 +588,7 @@ fn page_from_hwnd(hwnd: HWND, lparam: LPARAM) -> *mut DialogPage {
 
 fn bind_page(hwnd: HWND, lparam: LPARAM, page: *mut DialogPage) {
     if !page.is_null() {
-        // SAFETY: WM_INITDIALOG supplies the DialogPage pointer passed to CreateDialogParam.
+        // 安全性: WM_INITDIALOG supplies the DialogPage pointer passed to CreateDialogParam.
         unsafe {
             (*page).hwnd = hwnd;
             set_window_userdata(hwnd, lparam);
@@ -635,7 +635,7 @@ unsafe extern "system" fn dialog_page_proc(
     lparam: LPARAM,
 ) -> isize {
     // 通用页面过程只负责完成对象绑定和最基础的对话框初始化。
-    // SAFETY: WM_INITDIALOG LPARAM is the DialogPage pointer supplied to CreateDialogParam.
+    // 安全性: WM_INITDIALOG LPARAM is the DialogPage pointer supplied to CreateDialogParam.
     unsafe {
         match msg {
             WM_INITDIALOG => {
@@ -656,7 +656,7 @@ fn redraw_plain_page(hwnd: HWND) {
         return;
     }
 
-    // SAFETY: the page HWND is owned by the current dialog page; ordinary pages can use a normal
+    // 安全性: the page HWND is owned by the current dialog page; ordinary pages can use a normal
     // erased invalidation because they do not overlay hidden statistic controls onto owner-draw graphs.
     unsafe {
         InvalidateRect(hwnd, null_mut(), 1);
@@ -673,7 +673,7 @@ unsafe extern "system" fn task_page_proc(
     // 各具体页面过程在通用对话框流程之上，补充自己的通知和命令处理。
     let page = page_from_hwnd(hwnd, lparam);
 
-    // SAFETY: dialog messages are delivered on the UI thread; `page` is either the stored
+    // 安全性: dialog messages are delivered on the UI thread; `page` is either the stored
     // DialogPage pointer or null, and all dereferences are guarded by null checks.
     unsafe {
         match msg {
@@ -740,7 +740,7 @@ unsafe extern "system" fn proc_page_proc(
     // 来减轻列表与按钮区域一起重绘时的闪烁。
     let page = page_from_hwnd(hwnd, lparam);
 
-    // SAFETY: dialog messages are delivered on the UI thread; `page` is either the stored
+    // 安全性: dialog messages are delivered on the UI thread; `page` is either the stored
     // DialogPage pointer or null, and all dereferences are guarded by null checks.
     unsafe {
         match msg {
@@ -811,7 +811,7 @@ unsafe extern "system" fn performance_page_proc(
     // 性能页会处理自绘图表和自绘仪表，因此消息种类比其它页面更丰富。
     let page = page_from_hwnd(hwnd, lparam);
 
-    // SAFETY: owner-draw/control messages carry Win32-provided pointers valid for the duration
+    // 安全性: owner-draw/control messages carry Win32-provided pointers valid for the duration
     // of the synchronous callback; page dereferences are null-checked.
     unsafe {
         match msg {
@@ -916,7 +916,7 @@ unsafe extern "system" fn network_page_proc(
     // 网络页除了普通刷新，还要响应滚动条和图表 owner-draw 消息。
     let page = page_from_hwnd(hwnd, lparam);
 
-    // SAFETY: owner-draw/control messages carry Win32-provided pointers valid for the duration
+    // 安全性: owner-draw/control messages carry Win32-provided pointers valid for the duration
     // of the synchronous callback; page dereferences are null-checked.
     unsafe {
         match msg {
@@ -995,7 +995,7 @@ unsafe extern "system" fn users_page_proc(
     // 用户页的交互主要围绕 ListView 选择变化和上下文菜单操作展开。
     let page = page_from_hwnd(hwnd, lparam);
 
-    // SAFETY: dialog messages are delivered on the UI thread; `page` is either the stored
+    // 安全性: dialog messages are delivered on the UI thread; `page` is either the stored
     // DialogPage pointer or null, and all dereferences are guarded by null checks.
     unsafe {
         match msg {

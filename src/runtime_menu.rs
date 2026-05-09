@@ -46,7 +46,7 @@ pub struct PopupMenu {
 impl PopupMenu {
     pub fn new() -> Option<Self> {
         // `PopupMenu` 拥有一个独立的弹出菜单句柄。
-        // SAFETY: creating a new menu has no preconditions beyond process Win32 availability.
+        // 安全性: creating a new menu has no preconditions beyond process Win32 availability.
         let handle = unsafe { CreatePopupMenu() };
         if handle.is_null() {
             None
@@ -77,13 +77,13 @@ impl PopupMenu {
         if state.checked {
             flags |= MF_CHECKED;
         }
-        // SAFETY: `self.handle` is owned by this menu and `wide` is a live NUL-terminated label.
+        // 安全性: `self.handle` is owned by this menu and `wide` is a live NUL-terminated label.
         unsafe { AppendMenuW(self.handle, flags, usize::from(command_id), wide.as_ptr()) != 0 }
     }
 
     pub fn append_separator(&mut self) -> bool {
         // 分隔线不携带文本和命令 ID。
-        // SAFETY: appending a separator does not dereference the null text pointer.
+        // 安全性: appending a separator does not dereference the null text pointer.
         unsafe { AppendMenuW(self.handle, MF_SEPARATOR, 0, null()) != 0 }
     }
 
@@ -91,7 +91,7 @@ impl PopupMenu {
         // 子菜单会接管传入 `PopupMenu` 的句柄所有权。
         let wide = to_wide_null(label);
         let submenu_handle = submenu.into_raw();
-        // SAFETY: both menu handles are valid and the label buffer lives for the call.
+        // 安全性: both menu handles are valid and the label buffer lives for the call.
         let appended = unsafe {
             AppendMenuW(
                 self.handle,
@@ -101,7 +101,7 @@ impl PopupMenu {
             ) != 0
         };
         if !appended {
-            // SAFETY: ownership was taken from `submenu`; on failure this function must release it.
+            // 安全性: ownership was taken from `submenu`; on failure this function must release it.
             unsafe { DestroyMenu(submenu_handle) };
         }
         appended
@@ -110,7 +110,7 @@ impl PopupMenu {
 
 impl Drop for PopupMenu {
     fn drop(&mut self) {
-        // SAFETY: a non-null handle is still owned by this wrapper and has not been transferred.
+        // 安全性: a non-null handle is still owned by this wrapper and has not been transferred.
         unsafe {
             // 只有句柄仍然归当前对象所有时才销毁。
             if !self.handle.is_null() {
@@ -127,7 +127,7 @@ pub struct MenuBar {
 impl MenuBar {
     pub fn new() -> Option<Self> {
         // `MenuBar` 对应窗口主菜单，而不是右键弹出菜单。
-        // SAFETY: creating a new menu bar has no additional preconditions.
+        // 安全性: creating a new menu bar has no additional preconditions.
         let handle = unsafe { CreateMenu() };
         if handle.is_null() {
             None
@@ -147,7 +147,7 @@ impl MenuBar {
         // 主菜单只接受子级弹出菜单，不直接追加普通命令项。
         let wide = to_wide_null(label);
         let submenu_handle = submenu.into_raw();
-        // SAFETY: both menu handles are valid and the label buffer lives for the call.
+        // 安全性: both menu handles are valid and the label buffer lives for the call.
         let appended = unsafe {
             AppendMenuW(
                 self.handle,
@@ -157,7 +157,7 @@ impl MenuBar {
             ) != 0
         };
         if !appended {
-            // SAFETY: ownership was transferred out of `submenu`; release it on append failure.
+            // 安全性: ownership was transferred out of `submenu`; release it on append failure.
             unsafe { DestroyMenu(submenu_handle) };
         }
         appended
@@ -166,7 +166,7 @@ impl MenuBar {
 
 impl Drop for MenuBar {
     fn drop(&mut self) {
-        // SAFETY: a non-null handle is still owned by this wrapper and has not been attached.
+        // 安全性: a non-null handle is still owned by this wrapper and has not been attached.
         unsafe {
             if !self.handle.is_null() {
                 DestroyMenu(self.handle);

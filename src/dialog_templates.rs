@@ -811,7 +811,7 @@ pub fn create_dialog(
         return std::ptr::null_mut();
     };
     let template = DialogTemplateBuilder::new().build(spec);
-    // SAFETY: the generated template buffer is valid for the duration of the call; Win32 copies
+    // 安全性: the generated template buffer is valid for the duration of the call; Win32 copies
     // or consumes it before returning the dialog handle.
     unsafe {
         CreateDialogIndirectParamW(
@@ -835,7 +835,7 @@ pub fn dialog_box(
         return -1;
     };
     let template = DialogTemplateBuilder::new().build(spec);
-    // SAFETY: the generated template buffer remains alive while the modal dialog is created and
+    // 安全性: the generated template buffer remains alive while the modal dialog is created and
     // run by `DialogBoxIndirectParamW`.
     unsafe {
         DialogBoxIndirectParamW(

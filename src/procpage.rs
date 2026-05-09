@@ -3,6 +3,16 @@ use std::cmp::{Ordering, Reverse};
 // 进程页实现。
 // 这里负责采集进程列表、计算每轮刷新之间的增量数据、维护排序状态，
 // 并处理结束进程、调试、设置优先级和亲和性等操作。
+//
+// 线程模型：
+//   ProcWorkerCommand 工作线程在后台执行 collect_process_entries() 采样，
+//   UI 线程通过 mpsc channel 发送命令并同步等待结果。页面销毁时发送 Shutdown 并 join 线程。
+//
+// 缓存失效策略：
+//   pid_to_index (HashMap) 在每次 resort_entries 后从头重建，以匹配排序后的 entries 顺序。
+//   previous_samples (HashMap) 在 refresh_processes 末尾整体替换为当轮采样值，
+//   供下轮 delta（CPU、内存、缺页）计算使用。
+//   DirtyColumns / DirtyRowRange 作为行/列级脏标记，避免整表重绘。
 use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
 use std::path::Path;
@@ -144,6 +154,7 @@ struct PreviousProcSample {
     page_faults: u32,
 }
 
+// 列级脏标记位图。每轮刷新时标记变更列，rebuild_listview 只重绘被标记的行。
 #[derive(Clone, Copy, Default)]
 struct DirtyColumns(u32);
 
@@ -222,6 +233,7 @@ pub struct ProcEntry {
     dirty_columns: DirtyColumns,
 }
 
+// 常用文案缓存，避免命令执行路径上反复查本地化资源。
 #[derive(Default)]
 struct ProcessStrings {
     warning: String,
@@ -247,16 +259,19 @@ struct ProcessStrings {
     priority_unknown: String,
 }
 
+// “选择列”对话框的上下文，通过 LPARAM 传递给 dialog proc。
 struct ColumnDialogContext {
     page: *mut ProcessPageState,
     options: *mut Options,
 }
 
+// “设置亲和性”对话框的上下文，包含当前进程掩码。
 struct AffinityDialogContext {
     page: *mut ProcessPageState,
     process_mask: usize,
 }
 
+// 进程优先级枚举，对应 Win32 优先级类常量。
 #[derive(Clone, Copy)]
 enum ProcPriority {
     Low,
@@ -267,6 +282,7 @@ enum ProcPriority {
     Realtime,
 }
 
+// 进程右键菜单/命令按钮支持的操作命令枚举。
 #[derive(Clone, Copy)]
 enum ProcCommand {
     Terminate,
@@ -334,6 +350,15 @@ impl ProcCommand {
     }
 }
 
+// 工作线程命令枚举。
+// Collect:  在后台线程执行 collect_process_entries()，结果通过 reply channel 返回。
+// Shutdown: 通知线程退出主循环，配合 join 保证安全回收。
+//
+// 线程生命周期：
+//   1. initialize() -> start_worker_thread() 创建线程 + channel。
+//   2. 每轮 timer_event() -> refresh_processes() 发送 Collect 命令，同步等待结果。
+//   3. destroy() -> stop_worker_thread() 发送 Shutdown -> join 线程。
+//   线程内无限循环 recv()，遇到 Shutdown 才 break。
 enum ProcWorkerCommand {
     Collect {
         previous_samples: Arc<HashMap<u32, PreviousProcSample>>,
@@ -395,6 +420,8 @@ impl Default for ProcessPageState {
 }
 
 impl ProcessPageState {
+    // 创建工作线程和 mpsc channel。如果线程已存在则直接返回（幂等）。
+    // 工作线程循环接收 ProcWorkerCommand，遇到 Shutdown 才退出。
     fn start_worker_thread(&mut self) {
         if self.worker_sender.is_some() {
             return;
@@ -420,6 +447,7 @@ impl ProcessPageState {
         self.worker_thread = Some(worker);
     }
 
+    // 发送 Shutdown 命令并等待工作线程退出。清理线程句柄和 channel。
     fn stop_worker_thread(&mut self) {
         if let Some(sender) = self.worker_sender.take() {
             let _ = sender.send(ProcWorkerCommand::Shutdown);
@@ -534,6 +562,7 @@ impl ProcessPageState {
         }
     }
 
+    // 将命令 ID 分派到具体的进程操作（结束、调试、优先级、亲和性等）。
     pub unsafe fn handle_command(&mut self, command_id: u16, options: Option<&mut Options>) {
         let Some(command) = ProcCommand::from_command_id(command_id, IDC_TERMINATE as u16) else {
             return;
@@ -612,6 +641,7 @@ impl ProcessPageState {
         }
     }
 
+    // 构造进程右键菜单，包含结束进程、调试、打开文件位置、优先级和亲和性子菜单。
     unsafe fn build_context_menu(&self, entry: &ProcEntry) -> Option<PopupMenu> {
         let mut priority_menu = PopupMenu::new()?;
         let checked_priority = match entry.priority_class {
@@ -743,6 +773,7 @@ impl ProcessPageState {
         EndDeferWindowPos(hdwp);
     }
 
+    // 从进程页跳转到指定 PID 的行并高亮选中。由任务页的“转到进程”命令触发。
     pub unsafe fn find_process(&mut self, _thread_id: u32, pid: u32) -> bool {
         let target_pid = pid;
         let Some(index) = self
@@ -864,6 +895,7 @@ impl ProcessPageState {
         self.pass_count = self.pass_count.wrapping_add(1);
     }
 
+    // 按当前排序列和方向重排 entries。排序后 pid_to_index 索引从头重建以保证一致性。
     fn resort_entries(&mut self) {
         match self.sort_column {
             ColumnId::ImageName => {
@@ -1055,6 +1087,7 @@ impl ProcessPageState {
         copy_text_to_callback_buffer(item.pszText, item.cchTextMax as usize, &text);
     }
 
+    // 销毁现有列并按照 active_columns 重建所有列头。列宽优先从 options 读取，否则用默认值。
     unsafe fn setup_columns(&self, options: &Options) {
         let list_hwnd = self.list_hwnd();
         SendMessageW(list_hwnd, LVM_DELETEALLITEMS, 0, 0);
@@ -1165,6 +1198,7 @@ impl ProcessPageState {
         );
     }
 
+    // 结束指定 PID 的进程。先弹确认框，再通过 TerminateProcess 终止。
     unsafe fn kill_process(&mut self, pid: u32) -> bool {
         if !self.quick_confirm(&self.strings.warning, &self.strings.kill) {
             return false;
@@ -1193,6 +1227,7 @@ impl ProcessPageState {
         }
     }
 
+    // 结束进程以及所有子进程。按叶子优先的顺序遍历进程树，逐进程 TerminateProcess。
     unsafe fn kill_process_tree(&mut self, pid: u32) -> bool {
         if !self.quick_confirm(&self.strings.warning, &self.strings.kill_tree) {
             return false;
@@ -1253,6 +1288,7 @@ impl ProcessPageState {
         any_success
     }
 
+    // 以 AeDebug 注册表配置的调试器启动并附加到目标进程。命令行传 -p <pid>。
     unsafe fn attach_debugger(&mut self, pid: u32) -> bool {
         let Some(debugger_path) = self.debugger_path.as_ref() else {
             self.show_failure_message(&self.strings.cant_debug, 2);
@@ -1298,6 +1334,7 @@ impl ProcessPageState {
         }
     }
 
+    // 通过 explorer.exe /select 命令在资源管理器中定位进程的可执行文件。
     unsafe fn open_file_location(&mut self, pid: u32) -> bool {
         let Some(image_path) = query_process_image_path(pid) else {
             self.show_failure_message(
@@ -1313,7 +1350,7 @@ impl ProcessPageState {
         }
 
         let mut windir = vec![0u16; 260];
-        // SAFETY: GetWindowsDirectoryW fills the buffer with the canonical Windows directory.
+        // 安全性: GetWindowsDirectoryW fills the buffer with the canonical Windows directory.
         let windir_len =
             unsafe { GetWindowsDirectoryW(windir.as_mut_ptr(), windir.len() as u32) } as usize;
         let explorer_path = if windir_len > 0 && windir_len < windir.len() {
@@ -1359,6 +1396,7 @@ impl ProcessPageState {
         true
     }
 
+    // 通过 SetPriorityClass 修改进程优先级类。先弹确认框，操作成功后刷新列表。
     unsafe fn set_priority(&mut self, pid: u32, priority: ProcPriority) -> bool {
         let priority_class = match priority {
             ProcPriority::Low => IDLE_PRIORITY_CLASS,
@@ -1396,6 +1434,7 @@ impl ProcessPageState {
         }
     }
 
+    // 通过 SetProcessAffinityMask 设置进程 CPU 亲和性。用户通过对话框选择 CPU。
     unsafe fn set_affinity(&mut self, pid: u32) -> bool {
         let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION, 0, pid);
         if handle.is_null() {
@@ -1440,6 +1479,7 @@ impl ProcessPageState {
         success
     }
 
+    // 打开“选择列”对话框。通过 ColumnDialogContext 传递页面和选项指针给 dialog proc。
     unsafe fn pick_columns(&mut self, options: &mut Options) {
         let mut context = ColumnDialogContext {
             page: self as *mut ProcessPageState,
@@ -1455,6 +1495,7 @@ impl ProcessPageState {
     }
 }
 
+// “选择列”对话框过程。初始化时同步选项状态，确认时将选中的列写回 options。
 unsafe extern "system" fn column_select_dialog_proc(
     hwnd: HWND,
     msg: u32,
@@ -1502,6 +1543,8 @@ unsafe extern "system" fn column_select_dialog_proc(
     }
 }
 
+// “设置亲和性”对话框过程。根据 processor_count 启用/禁用 CPU 勾选框，
+// 确认时检查至少选中一个 CPU，否则弹错误提示。
 unsafe extern "system" fn affinity_dialog_proc(
     hwnd: HWND,
     msg: u32,
@@ -1563,6 +1606,7 @@ unsafe extern "system" fn affinity_dialog_proc(
     }
 }
 
+// 将对话框中的列勾选状态持久化到 options。保留已有列宽，新增列使用默认宽度。
 unsafe fn apply_selected_columns(hwnd: HWND, options: &mut Options) {
     let mut existing_widths = HashMap::with_capacity(NUM_COLUMN);
     for (index, value) in options.active_process_columns.iter().copied().enumerate() {
@@ -1656,6 +1700,7 @@ unsafe fn load_debugger_path() -> Option<String> {
     Path::new(&executable).is_file().then_some(executable)
 }
 
+// 引用命令行参数。只在包含空格、制表符或引号时加引号，并正确处理反斜杠转义。
 fn quote_command_line_arg(value: &str) -> String {
     if !value.contains([' ', '\t', '"']) {
         return value.to_string();
@@ -1692,6 +1737,7 @@ fn quote_command_line_arg(value: &str) -> String {
     quoted
 }
 
+// 从命令行字符串中提取第一个 token（即可执行文件路径）。处理引号包裹和非引号两种格式。
 fn extract_first_command_token(command_line: &str) -> String {
     let trimmed = command_line.trim();
     if let Some(rest) = trimmed.strip_prefix('"') {
@@ -1705,6 +1751,7 @@ fn extract_first_command_token(command_line: &str) -> String {
     }
 }
 
+// 将 AeDebug 注册表值规范化：展开环境变量后提取可执行文件路径，过滤无效调试器。
 fn normalize_debugger_command(command_line: &str, value_type: u32) -> Option<String> {
     normalize_debugger_command_with(command_line, value_type, expand_environment_variables)
 }
@@ -1734,8 +1781,10 @@ where
     }
 }
 
+// 展开字符串中的环境变量（如 %SystemRoot%）。
+// 使用 Win32 ExpandEnvironmentStringsW API，正确处理 WOW64 重定向和 %% 转义。
 fn expand_environment_variables(command_line: &str) -> String {
-    // SAFETY: the Win32 ExpandEnvironmentStringsW API reads the process environment block
+    // 安全性: the Win32 ExpandEnvironmentStringsW API reads the process environment block
     // maintained by the kernel, which handles system-variable edge cases (WOW64 redirections,
     // %% escaping, variable-length limits) correctly.
     let wide_input = to_wide_null(command_line);
@@ -1753,6 +1802,10 @@ fn expand_environment_variables(command_line: &str) -> String {
     String::from_utf16_lossy(&buffer[..len])
 }
 
+// 从进程令牌查询用户名和 SessionId。
+// 安全性: 通过 OpenProcessToken + GetTokenInformation 读取令牌信息，
+// TOKEN_USER 结构中的 SID 指针指向令牌内的内存，直接 read_unaligned 并用 LookupAccountSidW 解析。
+// handle 由调用方保证有效（OpenProcess 返回值且不为 NULL）。
 unsafe fn query_process_identity(process_handle: HANDLE) -> (String, u32) {
     // 从访问令牌补采用户名和 SessionId，
     // 这是对 WTS 进程枚举结果的补强，能覆盖更多权限和边界情况。
@@ -1796,6 +1849,7 @@ unsafe fn query_process_identity(process_handle: HANDLE) -> (String, u32) {
     (user_name, session_id)
 }
 
+// 检查 SID 是否为已知服务帐户（SYSTEM、LOCAL SERVICE、NETWORK SERVICE），返回对应名称。
 fn well_known_service_name(sid: *mut core::ffi::c_void) -> Option<String> {
     unsafe {
         if IsWellKnownSid(sid, WinLocalSystemSid) != 0 {
@@ -1810,6 +1864,7 @@ fn well_known_service_name(sid: *mut core::ffi::c_void) -> Option<String> {
     }
 }
 
+// 将进程令牌中的用户名、SessionId 和 32-bit 标记合并进 ProcEntry。
 unsafe fn merge_process_identity(entry: &mut ProcEntry, process_handle: HANDLE) {
     let (user_name, session_id) = query_process_identity(process_handle);
     if !user_name.is_empty() {
@@ -1822,6 +1877,7 @@ unsafe fn merge_process_identity(entry: &mut ProcEntry, process_handle: HANDLE) 
     entry.is_32_bit = is_32_bit_process_handle(process_handle);
 }
 
+// 通过 LookupAccountSidW 将 SID 解析为用户名。失败时回退到 well_known_service_name。
 unsafe fn lookup_account_name_from_sid(sid: *mut core::ffi::c_void) -> String {
     if sid.is_null() {
         return String::new();
@@ -1894,6 +1950,7 @@ unsafe fn collect_process_identity_map() -> HashMap<u32, (String, u32)> {
     identities
 }
 
+// 从 Options 中解析当前激活的列列表，过滤无效列 ID。
 fn columns_from_options(options: &Options) -> Vec<ColumnId> {
     options
         .active_process_columns
@@ -1903,6 +1960,7 @@ fn columns_from_options(options: &Options) -> Vec<ColumnId> {
         .collect()
 }
 
+// 将 i32 列 ID 映射回 ColumnId 枚举。超出范围的值返回 None。
 fn column_id_from_i32(value: i32) -> Option<ColumnId> {
     match value {
         x if x == ColumnId::ImageName as i32 => Some(ColumnId::ImageName),
@@ -1925,6 +1983,7 @@ fn column_id_from_i32(value: i32) -> Option<ColumnId> {
     }
 }
 
+// 进程表的通用比较函数。排序键由 sort_column 决定，兜底使用 PID 保证稳定性。
 fn compare_entries(
     left: &ProcEntry,
     right: &ProcEntry,
@@ -1966,6 +2025,7 @@ fn compare_entries(
     }
 }
 
+// 将 Win32 优先级类常量映射为排序用的数值等级。
 fn priority_rank(priority_class: u32) -> u8 {
     match priority_class {
         REALTIME_PRIORITY_CLASS => 5,
@@ -2008,6 +2068,7 @@ fn column_text(entry: &ProcEntry, column_id: ColumnId, strings: &ProcessStrings)
     }
 }
 
+// 将 100ns 精度的 CPU 时间格式化为 HH:MM:SS 友好显示。
 fn format_elapsed_time(total_100ns: u64) -> String {
     let total_seconds = total_100ns / 10_000_000;
     let hours = total_seconds / 3600;
@@ -2024,6 +2085,8 @@ fn format_signed_kilobytes(value: i64) -> String {
     format!("{value} K")
 }
 
+// 将 Rust 字符串复制到 Win32 LVITEMW.pszText 回调缓冲区，自动截断并置空终止。
+// 安全性: buffer 由 ListView 控件保证有效且容量足够，调用方负责确保不超过 cchTextMax。
 fn copy_text_to_callback_buffer(buffer: *mut u16, capacity: usize, text: &str) {
     if buffer.is_null() || capacity == 0 {
         return;
@@ -2041,6 +2104,8 @@ fn copy_text_to_callback_buffer(buffer: *mut u16, capacity: usize, text: &str) {
     }
 }
 
+// 遍历进程树，按“子进程先于父进程”的顺序返回终止列表（后序遍历）。
+// 使用 Toolhelp 快照建立父子关系表，递归收集子进程。
 fn collect_process_tree_termination_order(root_pid: u32) -> Vec<u32> {
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -2073,6 +2138,7 @@ fn collect_process_tree_termination_order(root_pid: u32) -> Vec<u32> {
     }
 }
 
+// 后序遍历进程树，将 PID 按叶子优先的顺序加入 order。visited 防止循环引用。
 fn collect_process_tree_children(
     pid: u32,
     child_map: &HashMap<u32, Vec<u32>>,
@@ -2092,6 +2158,7 @@ fn collect_process_tree_children(
     order.push(pid);
 }
 
+// 通过 QueryFullProcessImageNameW 查询进程可执行文件的全路径。
 unsafe fn query_process_image_path(pid: u32) -> Option<String> {
     let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
     if handle.is_null() {
@@ -2262,6 +2329,7 @@ unsafe fn collect_process_entries(
     (entries, next_samples)
 }
 
+// 读取系统总 CPU 时间（kernel + user），用于计算每轮刷新的 CPU 时间增量。
 unsafe fn current_system_time() -> u64 {
     let mut idle = zeroed::<FILETIME>();
     let mut kernel = zeroed::<FILETIME>();
@@ -2273,10 +2341,12 @@ unsafe fn current_system_time() -> u64 {
     }
 }
 
+// 将 Win32 FILETIME 结构合并为一个 u64（100ns 单位）。
 fn filetime_to_u64(filetime: FILETIME) -> u64 {
     (u64::from(filetime.dwHighDateTime) << 32) | u64::from(filetime.dwLowDateTime)
 }
 
+// 将以 null 结尾的 UTF-16 切片转换为 Rust String，忽略 BOM 和无效代理对。
 fn utf16_buffer_to_string(buffer: &[u16]) -> String {
     let length = buffer
         .iter()
@@ -2285,6 +2355,8 @@ fn utf16_buffer_to_string(buffer: &[u16]) -> String {
     String::from_utf16_lossy(&buffer[..length])
 }
 
+// 根据进程 CPU 时间增量与系统总时间增量计算 CPU 使用率百分比（0-99）。
+// 除 1000 再除 10 的等效运算，避免浮点计算。
 fn cpu_percent_from_delta(delta_100ns: u64, total_delta_100ns: u64) -> u8 {
     if total_delta_100ns == 0 {
         return 0;
@@ -2294,6 +2366,7 @@ fn cpu_percent_from_delta(delta_100ns: u64, total_delta_100ns: u64) -> u8 {
     (((delta_100ns / scaled_total) + 5) / 10).min(99) as u8
 }
 
+// 获取窗口相对于页面客户区的矩形坐标（MapWindowPoints）。
 unsafe fn window_rect_relative_to_page(hwnd: HWND, page_hwnd: HWND) -> RECT {
     let mut rect = zeroed::<RECT>();
     windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect);

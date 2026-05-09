@@ -124,7 +124,7 @@ pub struct App {
 pub fn run() -> i32 {
     // 主应用对象的生命周期由 `run()` 栈帧直接持有，
     // 主窗口过程通过窗口 user data 回到这份状态，而不是依赖可变全局单例。
-    // SAFETY: 进程启动阶段尚未暴露任何窗口回调，`App` 只在当前线程初始化并运行。
+    // 安全性: 进程启动阶段尚未暴露任何窗口回调，`App` 只在当前线程初始化并运行。
     unsafe {
         let hinstance = GetModuleHandleW(null());
         let mut app = App::new(hinstance);
@@ -147,7 +147,7 @@ unsafe extern "system" fn perf_frame_wndproc(
     // 性能页里的“框架控件”需要自绘背景，否则图表重绘时容易出现撕裂和闪烁。
     match msg {
         WM_CREATE => {
-            // SAFETY: `hwnd` is the window currently receiving WM_CREATE; only style bits are
+            // 安全性: `hwnd` is the window currently receiving WM_CREATE; only style bits are
             // read and updated.
             unsafe {
                 let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
@@ -156,7 +156,7 @@ unsafe extern "system" fn perf_frame_wndproc(
             0
         }
         WM_ERASEBKGND => {
-            // SAFETY: WM_ERASEBKGND supplies an HDC in WPARAM when nonzero; otherwise this
+            // 安全性: WM_ERASEBKGND supplies an HDC in WPARAM when nonzero; otherwise this
             // routine creates and releases its own clipped DC/region for the current window.
             unsafe {
                 let mut hdc = wparam as _;
@@ -193,11 +193,11 @@ unsafe extern "system" fn perf_frame_wndproc(
         }
         _ => {
             if let Some(base_wndproc) = FRAME_BASE_WNDPROC.get().copied().flatten() {
-                // SAFETY: `base_wndproc` was captured from the registered Button class and
+                // 安全性: `base_wndproc` was captured from the registered Button class and
                 // receives the original message parameters unchanged.
                 unsafe { call_window_proc(Some(base_wndproc), hwnd, msg, wparam, lparam) }
             } else {
-                // SAFETY: fallback default window processing for the current message.
+                // 安全性: fallback default window processing for the current message.
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
         }
@@ -208,12 +208,12 @@ type RunFileDialogFn =
     unsafe extern "system" fn(HWND, HICON, *const u16, *const u16, *const u16, u32) -> i32;
 
 fn load_run_file_dialog(shell32: HMODULE) -> Option<RunFileDialogFn> {
-    // SAFETY: `shell32` is a module handle returned by `LoadLibraryW`.
+    // 安全性: `shell32` is a module handle returned by `LoadLibraryW`.
     // Ordinal 61 is the only way to import `RunFileDlg` from shell32 — it is not
     // exported by name. This ordinal has been stable on all Windows versions since
     // Windows 2000 and is the same mechanism the original Task Manager uses.
     let proc_address = unsafe { GetProcAddress(shell32, 61usize as *const u8) }?;
-    // SAFETY: ordinal 61 in shell32 exports `RunFileDlg` with this callback signature
+    // 安全性: ordinal 61 in shell32 exports `RunFileDlg` with this callback signature
     // on all Win32 platform variants supported by this application.
     Some(unsafe {
         std::mem::transmute::<unsafe extern "system" fn() -> isize, RunFileDialogFn>(proc_address)
@@ -276,7 +276,7 @@ impl App {
         self.already_applied_initial_position = true;
         let saved_rect = self.options.window_rect;
         if width(&saved_rect) > 0 && height(&saved_rect) > 0 {
-            // SAFETY: the main HWND was just created and `saved_rect` was validated on load.
+            // 安全性: the main HWND was just created and `saved_rect` was validated on load.
             unsafe {
                 SetWindowPos(
                     self.main_hwnd,
@@ -290,13 +290,13 @@ impl App {
             }
         }
 
-        // SAFETY: the main HWND is live after successful dialog creation.
+        // 安全性: the main HWND is live after successful dialog creation.
         unsafe { ShowWindow(self.main_hwnd, SW_SHOW) };
         self.release_startup_mutex();
         // Defer icon loading to after first paint so the window appears instantly.
         unsafe { PostMessageW(self.main_hwnd, PWM_DEFERREDINIT, 0, 0) };
 
-        // SAFETY: message loop runs on the UI thread; `message` is a valid MSG buffer for all
+        // 安全性: message loop runs on the UI thread; `message` is a valid MSG buffer for all
         // synchronous Win32 message APIs used inside the loop.
         unsafe {
             SetProcessShutdownParameters(1, 0);
@@ -337,7 +337,7 @@ impl App {
     fn acquire_startup_mutex(&mut self) {
         // 命名互斥体用于串行化启动窗口，避免两个实例同时完成“是否已有实例”的判断。
         let mutex_name = to_wide_null(STARTUP_MUTEX_NAME);
-        // SAFETY: `mutex_name` is NUL-terminated and the returned handle is owned by App until
+        // 安全性: `mutex_name` is NUL-terminated and the returned handle is owned by App until
         // `release_startup_mutex`.
         unsafe {
             self.startup_mutex = CreateMutexW(null_mut(), TRUE, mutex_name.as_ptr());
@@ -352,7 +352,7 @@ impl App {
     fn release_startup_mutex(&mut self) {
         // 一旦主窗口已经创建或确认无需继续启动，就及时释放互斥体，避免阻塞后续实例探测。
         if !self.startup_mutex.is_null() {
-            // SAFETY: App owns this mutex HANDLE and releases/closes it at most once.
+            // 安全性: App owns this mutex HANDLE and releases/closes it at most once.
             unsafe {
                 ReleaseMutex(self.startup_mutex);
                 CloseHandle(self.startup_mutex);
@@ -369,14 +369,14 @@ impl App {
         }
 
         let title_wide = to_wide_null(&title);
-        // SAFETY: `title_wide` is NUL-terminated and lives through the FindWindowW call.
+        // 安全性: `title_wide` is NUL-terminated and lives through the FindWindowW call.
         let existing_hwnd = unsafe { FindWindowW(null(), title_wide.as_ptr()) };
         if existing_hwnd.is_null() {
             return false;
         }
 
         let mut result = 0usize;
-        // SAFETY: `existing_hwnd` was returned by FindWindowW and `result` is a valid out param.
+        // 安全性: `existing_hwnd` was returned by FindWindowW and `result` is a valid out param.
         (unsafe {
             SendMessageTimeoutW(
                 existing_hwnd,
@@ -399,7 +399,7 @@ impl App {
         let value_name = to_wide_null("DisableTaskMgr");
         let mut key: HKEY = null_mut();
 
-        // SAFETY: registry path buffers are NUL-terminated and `key` is a valid out parameter.
+        // 安全性: registry path buffers are NUL-terminated and `key` is a valid out parameter.
         if unsafe {
             RegOpenKeyExW(
                 HKEY_CURRENT_USER,
@@ -416,7 +416,7 @@ impl App {
         let mut value_type = 0u32;
         let mut raw_value = 0u32;
         let mut raw_size = size_of::<u32>() as u32;
-        // SAFETY: the value buffers are valid for the synchronous registry query; `key` is closed
+        // 安全性: the value buffers are valid for the synchronous registry query; `key` is closed
         // immediately after the query.
         let status = unsafe {
             let status = RegQueryValueExW(
@@ -434,7 +434,7 @@ impl App {
         if status == 0 && raw_value != 0 {
             let title = to_wide_null(text(TextKey::AppTitle));
             let body = to_wide_null(text(TextKey::TaskManagerDisabled));
-            // SAFETY: message box strings are NUL-terminated and valid for the call.
+            // 安全性: message box strings are NUL-terminated and valid for the call.
             unsafe {
                 MessageBoxW(
                     null_mut(),
@@ -455,7 +455,7 @@ impl App {
             dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_BAR_CLASSES,
         };
-        // SAFETY: `classes` is initialized according to the common-controls API contract.
+        // 安全性: `classes` is initialized according to the common-controls API contract.
         unsafe { InitCommonControlsEx(&classes) };
     }
 
@@ -469,9 +469,9 @@ impl App {
     }
 
     fn query_processor_count(&self) -> u8 {
-        // SAFETY: SYSTEM_INFO is a POD out buffer filled synchronously by GetSystemInfo.
+        // 安全性: SYSTEM_INFO is a POD out buffer filled synchronously by GetSystemInfo.
         let mut sysinfo = unsafe { zeroed::<SYSTEM_INFO>() };
-        // SAFETY: `sysinfo` is a valid out parameter.
+        // 安全性: `sysinfo` is a valid out parameter.
         unsafe { GetSystemInfo(&mut sysinfo) };
         sysinfo.dwNumberOfProcessors as u8
     }
@@ -479,7 +479,7 @@ impl App {
     fn on_init_dialog(&mut self, hwnd: HWND) -> isize {
         // 主对话框初始化会把“窗口样式、状态栏、标签页、托盘、定时器”全部串起来，
         // 这也是运行期状态第一次与持久化配置合流的地方。
-        // SAFETY: WM_INITDIALOG supplies the live main HWND; all child-control creation and
+        // 安全性: WM_INITDIALOG supplies the live main HWND; all child-control creation and
         // layout happens synchronously on the UI thread during initialization.
         unsafe {
             self.main_hwnd = hwnd;
@@ -598,7 +598,7 @@ impl App {
     }
 
     fn create_status_bar(&mut self) {
-        // SAFETY: creates a status bar child for the live main window and configures it
+        // 安全性: creates a status bar child for the live main window and configures it
         // synchronously before returning.
         unsafe {
             self.status_hwnd = CreateWindowExW(
@@ -636,7 +636,7 @@ impl App {
     }
 
     fn register_custom_controls(&self) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 性能页的 frame 控件借用了 Button 类的外观，但需要自定义背景擦除过程来降低闪烁。
             let mut button_class = zeroed::<WNDCLASSW>();
@@ -656,7 +656,7 @@ impl App {
 
     fn set_window_title(&self) {
         let title = to_wide_null(&self.strings.app_title);
-        // SAFETY: `title` is NUL-terminated and valid for the duration of the call.
+        // 安全性: `title` is NUL-terminated and valid for the duration of the call.
         unsafe { SetWindowTextW(self.main_hwnd, title.as_ptr()) };
     }
 
@@ -703,10 +703,10 @@ impl App {
                     self.menu.current_menu_mut(),
                 );
                 self.options.current_page = previous_page;
-                // SAFETY: retrieves and updates the tab control owned by the main window.
+                // 安全性: retrieves and updates the tab control owned by the main window.
                 let tabs_hwnd = unsafe { GetDlgItem(self.main_hwnd, IDC_TABS) };
                 if !tabs_hwnd.is_null() {
-                    // SAFETY: tab control HWND was returned by GetDlgItem and the message is
+                    // 安全性: tab control HWND was returned by GetDlgItem and the message is
                     // synchronous.
                     unsafe { SendMessageW(tabs_hwnd, TCM_SETCURSEL, previous_index, 0) };
                 }
@@ -720,7 +720,7 @@ impl App {
     fn update_menu_states(&self) {
         // 菜单状态完全由 `options` 和当前页状态派生，每次切页/改选项后都重新同步，
         // 避免菜单勾选与真实行为脱节。
-        // SAFETY: menu queries and updates target the main window's current menu.
+        // 安全性: menu queries and updates target the main window's current menu.
         let menu = unsafe { GetMenu(self.main_hwnd) };
         if menu.is_null() {
             return;
@@ -728,7 +728,7 @@ impl App {
 
         sanitize_task_manager_menu(menu, self.stats.processor_count as usize);
 
-        // SAFETY: all calls mutate only the menu handle retrieved from this main window.
+        // 安全性: all calls mutate only the menu handle retrieved from this main window.
         unsafe {
             CheckMenuRadioItem(
                 menu,
@@ -769,7 +769,7 @@ impl App {
             );
         }
 
-        // SAFETY: same menu handle as above.
+        // 安全性: same menu handle as above.
         unsafe {
             EnableMenuItem(
                 menu,
@@ -785,7 +785,7 @@ impl App {
     }
 
     fn check_menu(&self, menu: HMENU, item_id: u16, checked: bool) {
-        // SAFETY: caller passes a menu handle currently owned by the main window or popup menu.
+        // 安全性: caller passes a menu handle currently owned by the main window or popup menu.
         unsafe {
             CheckMenuItem(
                 menu,
@@ -832,7 +832,7 @@ impl App {
             return;
         }
 
-        // SAFETY: layout is performed on the UI thread against the main window and active page
+        // 安全性: layout is performed on the UI thread against the main window and active page
         // HWNDs owned by this App; null handles are checked above where needed.
         unsafe {
             if self.options.no_title() {
@@ -910,14 +910,14 @@ impl App {
     }
 
     fn toggle_no_title_mode(&mut self) {
-        // SAFETY: redraw suppression and final invalidation target the main window owned by App.
+        // 安全性: redraw suppression and final invalidation target the main window owned by App.
         unsafe { SendMessageW(self.main_hwnd, WM_SETREDRAW, 0, 0) };
 
         self.options.set_no_title(!self.options.no_title());
         self.apply_options_to_pages();
         self.update_menu_states();
         self.size_active_page();
-        // SAFETY: see the safety note above; this restores redraw and repaints the same window.
+        // 安全性: see the safety note above; this restores redraw and repaints the same window.
         unsafe {
             SendMessageW(self.main_hwnd, WM_SETREDRAW, 1, 0);
             RedrawWindow(
@@ -941,7 +941,7 @@ impl App {
 
     fn on_size(&mut self, hwnd: HWND, state: u32, width_px: i32, height_px: i32) {
         // 主窗口尺寸变化时同时维护状态栏、标签页和当前活动页。
-        // SAFETY: `hwnd` is the main window receiving WM_SIZE; child HWND lookups and moves stay
+        // 安全性: `hwnd` is the main window receiving WM_SIZE; child HWND lookups and moves stay
         // within this window hierarchy.
         unsafe {
             if state == SIZE_MINIMIZED
@@ -989,7 +989,7 @@ impl App {
 
     fn on_timer(&mut self, hwnd: HWND) {
         // 按住 Ctrl 时暂停自动刷新，这与经典 Task Manager 的交互保持一致。
-        // SAFETY: these calls only query foreground window and keyboard state.
+        // 安全性: these calls only query foreground window and keyboard state.
         if unsafe { GetForegroundWindow() == hwnd && GetAsyncKeyState(i32::from(VK_CONTROL)) < 0 } {
             return;
         }
@@ -1043,7 +1043,7 @@ impl App {
         let cpu_wide = to_wide_null(&cpu_text);
         let mem_wide = to_wide_null(&mem_text);
 
-        // SAFETY: status bar text messages synchronously copy from the provided UTF-16 buffers.
+        // 安全性: status bar text messages synchronously copy from the provided UTF-16 buffers.
         unsafe {
             SendMessageW(
                 self.status_hwnd,
@@ -1078,7 +1078,7 @@ impl App {
 
     fn show_running_instance(&self) {
         // 恢复窗口时顺带重新应用 topmost 状态，保持和当前选项一致。
-        // SAFETY: operations target the main HWND owned by this App.
+        // 安全性: operations target the main HWND owned by this App.
         unsafe {
             OpenIcon(self.main_hwnd);
             SetForegroundWindow(self.main_hwnd);
@@ -1112,7 +1112,7 @@ impl App {
             WM_RBUTTONDOWN => {
                 let popup = self.load_popup_menu(IDR_TRAYMENU);
                 if !popup.is_null() {
-                    // SAFETY: popup menu is valid until destroyed below; cursor/menu APIs are
+                    // 安全性: popup menu is valid until destroyed below; cursor/menu APIs are
                     // synchronous and target this app's main window.
                     let command = unsafe {
                         let mut cursor = zeroed::<POINT>();
@@ -1139,7 +1139,7 @@ impl App {
                         command
                     };
                     if command != 0 {
-                        // SAFETY: posts a synchronous command to our main window.
+                        // 安全性: posts a synchronous command to our main window.
                         unsafe { SendMessageW(self.main_hwnd, WM_COMMAND, command as usize, 0) };
                     }
                     destroy_menu_handle(popup);
@@ -1151,12 +1151,12 @@ impl App {
 
     fn show_help(&self, hwnd: HWND) {
         let help_path = to_wide_null("taskmgr.hlp");
-        // SAFETY: `help_path` is a NUL-terminated UTF-16 buffer valid for the duration of call.
+        // 安全性: `help_path` is a NUL-terminated UTF-16 buffer valid for the duration of call.
         unsafe { WinHelpW(hwnd, help_path.as_ptr(), HELP_FINDER, 0) };
     }
 
     fn on_menu_select(&mut self, wparam: WPARAM, lparam: LPARAM) -> isize {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 菜单高亮时，状态栏会临时切到“帮助文本”模式；
             // 退出菜单跟踪后，再恢复回实时统计栏。
@@ -1221,7 +1221,7 @@ impl App {
     }
 
     fn on_right_button_down(&mut self, hwnd: HWND) -> isize {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             if self.menu.can_temporarily_hide()
                 && !self.window_mode.is_temporarily_hidden()
@@ -1236,7 +1236,7 @@ impl App {
     }
 
     fn on_right_button_up(&mut self, hwnd: HWND) -> isize {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             if self.window_mode.is_temporarily_hidden() {
                 ReleaseCapture();
@@ -1256,7 +1256,7 @@ impl App {
     }
 
     fn show_run_dialog(&self) -> bool {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 新建任务对话框复用 shell32 导出的 RunFileDlg，
             // 这样能得到与系统一致的“运行”体验，而不是自造一个近似实现。
@@ -1301,7 +1301,7 @@ impl App {
     }
 
     fn on_command(&mut self, hwnd: HWND, command_id: u16) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 主命令分发层只负责修改全局选项、切页和把页面专属命令转发到对应子页面。
             // 真正的进程/任务/用户操作都在各自页面状态对象里完成。
@@ -1450,7 +1450,7 @@ impl App {
     }
 
     fn switch_tabs(&mut self, move_forward: bool) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             let current_index = self.options.current_page.max(0) as usize;
             let next_index = if move_forward {
@@ -1468,7 +1468,7 @@ impl App {
     }
 
     fn record_window_rect(&mut self, hwnd: HWND) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 只有在初始位置已经应用过之后，后续移动/缩放才应该回写配置，
             // 否则会把对话框默认位置误记成用户偏好。
@@ -1498,7 +1498,7 @@ impl App {
     }
 
     fn on_notify(&mut self, lparam: LPARAM) -> isize {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             let header = &*(lparam as *const NMHDR);
             if header.idFrom as i32 == IDC_TABS && header.code == TCN_SELCHANGE {
@@ -1512,7 +1512,7 @@ impl App {
     }
 
     fn on_find_process(&mut self, thread_id: u32, pid: u32) -> isize {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // “转到进程”来自任务页，需要先切到进程页，再尝试把对应进程行选中并滚动到可见区域。
             let tabs_hwnd = GetDlgItem(self.main_hwnd, IDC_TABS);
@@ -1532,7 +1532,7 @@ impl App {
     }
 
     fn shutdown(&mut self) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 关闭顺序按“停定时器 -> 让页面保存状态 -> 销毁页面资源 -> 移除托盘 -> 写配置”执行，
             // 避免还在刷新的页面访问已经销毁的窗口或句柄。
@@ -1568,7 +1568,7 @@ fn is_active_page(current_page: i32, page_count: usize, page_index: usize) -> bo
 }
 
 fn adjusted_tab_page_rect(tabs_hwnd: HWND, owner_hwnd: HWND) -> RECT {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         // Tab 控件的客户区需要通过 `TCM_ADJUSTRECT` 扣掉页签边框后，才能得到真正的页面矩形。
         let mut page_rect = zeroed::<RECT>();
@@ -1652,7 +1652,7 @@ unsafe extern "system" fn main_window_proc(
         PWM_INPOPUP => application.on_popup_state(wparam != 0),
         PWM_DEFERREDINIT => {
             application.tray.load_icons();
-            // SAFETY: main HWND is live; icon and tray setup after deferred icon loading.
+            // 安全性: main HWND is live; icon and tray setup after deferred icon loading.
             unsafe {
                 let icon = load_icon_from_file("main.ico", 0, 0, LR_DEFAULTCOLOR | LR_DEFAULTSIZE);
                 if !icon.is_null() {
@@ -1692,7 +1692,7 @@ unsafe extern "system" fn main_window_proc(
         WM_RBUTTONDOWN | WM_NCRBUTTONDOWN => application.on_right_button_down(hwnd),
         WM_RBUTTONUP | WM_NCRBUTTONUP => application.on_right_button_up(hwnd),
         WM_NCLBUTTONDBLCLK => {
-            // Only fall through to toggle no-title if we're already in no-title mode
+            // 仅在已处于无标题模式时才切换回普通模式
             if !application.options.no_title() {
                 return 0;
             }

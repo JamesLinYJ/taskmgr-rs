@@ -104,21 +104,21 @@ pub fn localize_dialog(hwnd: HWND, dialog_id: u16) {
 }
 
 fn dlg_item(hwnd: HWND, control_id: i32) -> HWND {
-    // SAFETY: lookup only borrows the dialog handle; failure is represented as a null HWND.
+    // 安全性: lookup only borrows the dialog handle; failure is represented as a null HWND.
     unsafe { GetDlgItem(hwnd, control_id) }
 }
 
 fn set_window_text(hwnd: HWND, text_key: TextKey) {
     // 窗口标题和普通控件文本共用同一套 `TextKey -> UTF-16` 转换。
     let wide = to_wide_null(text(text_key));
-    // SAFETY: `hwnd` is supplied by Win32 dialog creation and `wide` lives for the call.
+    // 安全性: `hwnd` is supplied by Win32 dialog creation and `wide` lives for the call.
     unsafe { SetWindowTextW(hwnd, wide.as_ptr()) };
 }
 
 fn set_dialog_item_text(hwnd: HWND, control_id: i32, text_key: TextKey) {
     // 按控件 ID 设置文本，适合按钮、标签和输入框标题等标准对话框子控件。
     let wide = to_wide_null(text(text_key));
-    // SAFETY: `hwnd` is a dialog window and `wide` lives for the call.
+    // 安全性: `hwnd` is a dialog window and `wide` lives for the call.
     unsafe { SetDlgItemTextW(hwnd, control_id, wide.as_ptr()) };
 }
 
@@ -128,6 +128,6 @@ fn set_control_text(hwnd: HWND, text_key: TextKey) {
         return;
     }
     let wide = to_wide_null(text(text_key));
-    // SAFETY: `hwnd` is checked non-null and `wide` lives for the call.
+    // 安全性: `hwnd` is checked non-null and `wide` lives for the call.
     unsafe { SetWindowTextW(hwnd, wide.as_ptr()) };
 }

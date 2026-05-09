@@ -46,14 +46,14 @@ pub struct OwnedWtsMemory<T> {
 
 pub fn destroy_menu_handle(menu: HMENU) {
     if !menu.is_null() {
-        // SAFETY: callers pass a raw menu handle they own and want to release.
+        // 安全性: callers pass a raw menu handle they own and want to release.
         unsafe { DestroyMenu(menu) };
     }
 }
 
 pub fn destroy_icon_handle(icon: HICON) {
     if !icon.is_null() {
-        // SAFETY: callers pass an icon handle they own and want to release.
+        // 安全性: callers pass an icon handle they own and want to release.
         unsafe { DestroyIcon(icon) };
     }
 }
@@ -71,7 +71,7 @@ impl<T> OwnedWtsMemory<T> {
 impl<T> Drop for OwnedWtsMemory<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            // SAFETY: `OwnedWtsMemory` exclusively owns a buffer allocated by WTS APIs.
+            // 安全性: `OwnedWtsMemory` exclusively owns a buffer allocated by WTS APIs.
             unsafe { WTSFreeMemory(self.ptr as _) };
         }
     }
@@ -90,7 +90,7 @@ impl OwnedHandle {
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
         if !self.handle.is_null() && self.handle != INVALID_HANDLE_VALUE {
-            // SAFETY: `OwnedHandle` exclusively owns this Win32 HANDLE.
+            // 安全性: `OwnedHandle` exclusively owns this Win32 HANDLE.
             unsafe { CloseHandle(self.handle) };
         }
     }
@@ -114,7 +114,7 @@ impl ListViewPaintState {
     }
 
     fn ensure_resources(&mut self) {
-        // SAFETY: these GDI objects are created for and owned by this paint state; null means
+        // 安全性: these GDI objects are created for and owned by this paint state; null means
         // the corresponding object has not been allocated yet.
         unsafe {
             if self.brush.is_null() {
@@ -132,7 +132,7 @@ impl ListViewPaintState {
 
 impl Drop for ListViewPaintState {
     fn drop(&mut self) {
-        // SAFETY: the GDI objects are owned by this per-window paint state and are released once.
+        // 安全性: the GDI objects are owned by this per-window paint state and are released once.
         unsafe {
             if !self.brush.is_null() {
                 DeleteObject(self.brush as _);
@@ -193,13 +193,13 @@ pub fn format_resource_string(template: &str, values: &[String]) -> String {
 }
 
 fn set_window_long_ptr_value(hwnd: HWND, index: i32, value: isize) -> isize {
-    // SAFETY: the caller supplies the target HWND/index/value tuple; this helper performs the
+    // 安全性: the caller supplies the target HWND/index/value tuple; this helper performs the
     // raw Win32 slot write and returns the previous value without creating references.
     unsafe { SetWindowLongPtrW(hwnd, index, value as _) as isize }
 }
 
 fn get_window_long_ptr_value(hwnd: HWND, index: i32) -> isize {
-    // SAFETY: reading a Win32 long-ptr slot does not create Rust references; callers interpret
+    // 安全性: reading a Win32 long-ptr slot does not create Rust references; callers interpret
     // the integer according to the slot they requested.
     unsafe { GetWindowLongPtrW(hwnd, index) as isize }
 }
@@ -255,7 +255,7 @@ pub fn sanitize_task_manager_menu(menu: HMENU, processor_count: usize) {
         return;
     }
 
-    // SAFETY: `menu` is checked non-null and remains owned by the caller while we remove items.
+    // 安全性: `menu` is checked non-null and remains owned by the caller while we remove items.
     unsafe {
         if SHRestricted(REST_NORUN) != 0 {
             DeleteMenu(menu, u32::from(IDM_RUN), MF_BYCOMMAND);
@@ -273,7 +273,7 @@ pub fn subclass_list_view(hwnd: HWND) {
         return;
     }
 
-    // SAFETY: all operations target a live ListView HWND supplied by the caller; userdata stores
+    // 安全性: all operations target a live ListView HWND supplied by the caller; userdata stores
     // the boxed subclass state until WM_NCDESTROY.
     unsafe {
         SendMessageW(
@@ -302,7 +302,7 @@ fn finish_list_view_update_internal(hwnd: HWND, invalidate: bool, immediate: boo
         return;
     }
 
-    // SAFETY: all calls target the provided ListView HWND; null handles were rejected above.
+    // 安全性: all calls target the provided ListView HWND; null handles were rejected above.
     unsafe {
         SendMessageW(hwnd, WM_SETREDRAW, 1, 0);
         if invalidate {
@@ -330,13 +330,13 @@ pub fn is_32_bit_process_handle(handle: HANDLE) -> bool {
     }
 
     let mut wow64 = 0;
-    // SAFETY: `handle` is checked non-null and only queried; `wow64` is a valid out parameter.
+    // 安全性: `handle` is checked non-null and only queried; `wow64` is a valid out parameter.
     unsafe { IsWow64Process(handle, &raw mut wow64) != 0 && wow64 != 0 }
 }
 
 pub fn is_32_bit_process_pid(pid: u32) -> bool {
     // 只为了查询位数时，打开最低限度的查询句柄即可，减少权限失败的概率。
-    // SAFETY: opening a process for query-only access; failure is represented as `None`.
+    // 安全性: opening a process for query-only access; failure is represented as `None`.
     OwnedHandle::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })
         .is_some_and(|handle| is_32_bit_process_handle(handle.as_raw()))
 }
@@ -359,7 +359,7 @@ unsafe fn wndproc_from_isize(value: isize) -> WNDPROC {
     if value == 0 {
         None
     } else {
-        // SAFETY: `value` originates from the `GWLP_WNDPROC` slot or `wndproc_to_isize`,
+        // 安全性: `value` originates from the `GWLP_WNDPROC` slot or `wndproc_to_isize`,
         // both of which store a valid window-proc function pointer representation.
         Some(unsafe { std::mem::transmute::<isize, RawWndProc>(value) })
     }
@@ -372,10 +372,10 @@ pub unsafe fn call_window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> isize {
-    // SAFETY: callers pass a WNDPROC previously returned by Win32 or installed through
+    // 安全性: callers pass a WNDPROC previously returned by Win32 or installed through
     // `wndproc_to_isize`, and the message parameters are forwarded unchanged.
     wndproc.map_or(0, |proc| {
-        // SAFETY: see the function-level safety note above.
+        // 安全性: see the function-level safety note above.
         unsafe { CallWindowProcW(Some(proc), hwnd, msg, wparam, lparam) }
     })
 }
@@ -385,7 +385,7 @@ fn list_view_state_ptr(hwnd: HWND) -> *mut ListViewPaintState {
 }
 
 fn set_rect_rgn_indirect(region: HRGN, rect: &RECT) {
-    // SAFETY: `region` is a caller-owned HRGN and `rect` is a valid borrowed RECT.
+    // 安全性: `region` is a caller-owned HRGN and `rect` is a valid borrowed RECT.
     unsafe { SetRectRgn(region, rect.left, rect.top, rect.right, rect.bottom) };
 }
 
@@ -397,23 +397,23 @@ fn list_view_get_view_rgn(hwnd: HWND, state: &mut ListViewPaintState) {
         return;
     }
 
-    // SAFETY: all GDI/message calls target the live ListView currently being subclassed; the
+    // 安全性: all GDI/message calls target the live ListView currently being subclassed; the
     // stack RECT is sized for LVM_GETITEMRECT and the regions are owned by `state`.
     unsafe {
         SetRectRgn(state.view_rgn, 0, 0, 0, 0);
     }
-    // SAFETY: read-only ListView query for item count.
+    // 安全性: read-only ListView query for item count.
     let item_count = unsafe { SendMessageW(hwnd, LVM_GETITEMCOUNT, 0, 0) as i32 };
-    // SAFETY: querying a process-global system metric has no caller-side invariants.
+    // 安全性: querying a process-global system metric has no caller-side invariants.
     let edge_width = unsafe { GetSystemMetrics(SM_CXEDGE) };
 
     for index in 0..item_count {
         let mut item_rect = RECT {
             left: LVIR_BOUNDS as i32,
-            // SAFETY: RECT is a plain old data Win32 struct where all-zero is valid.
+            // 安全性: RECT is a plain old data Win32 struct where all-zero is valid.
             ..unsafe { zeroed() }
         };
-        // SAFETY: LVM_GETITEMRECT writes into `item_rect`, whose pointer remains valid during
+        // 安全性: LVM_GETITEMRECT writes into `item_rect`, whose pointer remains valid during
         // the synchronous SendMessage call.
         if unsafe {
             SendMessageW(
@@ -429,7 +429,7 @@ fn list_view_get_view_rgn(hwnd: HWND, state: &mut ListViewPaintState) {
 
         item_rect.left += edge_width;
         set_rect_rgn_indirect(state.clip_rgn, &item_rect);
-        // SAFETY: all regions are valid GDI regions owned by `state`.
+        // 安全性: all regions are valid GDI regions owned by `state`.
         unsafe { CombineRgn(state.view_rgn, state.view_rgn, state.clip_rgn, RGN_OR) };
     }
 }
@@ -441,10 +441,10 @@ unsafe extern "system" fn list_view_wnd_proc(
     lparam: LPARAM,
 ) -> isize {
     // 自定义 ListView 窗口过程只接管背景擦除相关消息，其余消息回落给原始过程。
-    // SAFETY: the subclass installs a `ListViewPaintState` pointer in GWLP_USERDATA and removes
+    // 安全性: the subclass installs a `ListViewPaintState` pointer in GWLP_USERDATA and removes
     // it during WM_NCDESTROY; the mutable borrow is limited to this message dispatch.
     let state_ptr = list_view_state_ptr(hwnd);
-    // SAFETY: `state_ptr` either points to that live state object or is null.
+    // 安全性: `state_ptr` either points to that live state object or is null.
     let Some(state) = (unsafe { state_ptr.as_mut() }) else {
         return 0;
     };
@@ -452,18 +452,18 @@ unsafe extern "system" fn list_view_wnd_proc(
     match msg {
         WM_SYSCOLORCHANGE => {
             if !state.brush.is_null() {
-                // SAFETY: `brush` was created by GDI and is owned by `state`.
+                // 安全性: `brush` was created by GDI and is owned by `state`.
                 unsafe { DeleteObject(state.brush as _) };
                 state.brush = null_mut();
             }
-            // SAFETY: resources belong to this subclass state and `hwnd` is the current window.
+            // 安全性: resources belong to this subclass state and `hwnd` is the current window.
             unsafe {
                 state.ensure_resources();
                 InvalidateRect(hwnd, null_mut(), 1);
             }
         }
         WM_ERASEBKGND => {
-            // SAFETY: the erase message supplies a valid HDC in WPARAM and all GDI resources
+            // 安全性: the erase message supplies a valid HDC in WPARAM and all GDI resources
             // are owned by the per-window subclass state.
             unsafe {
                 state.ensure_resources();
@@ -482,7 +482,7 @@ unsafe extern "system" fn list_view_wnd_proc(
         }
         WM_NCDESTROY => {
             let original_wndproc = state.original_wndproc;
-            // SAFETY: teardown restores the original proc before releasing the boxed state.
+            // 安全性: teardown restores the original proc before releasing the boxed state.
             let result = unsafe {
                 set_window_userdata_ptr::<ListViewPaintState>(hwnd, null_mut());
                 let _ = set_window_long_ptr_value(
@@ -499,12 +499,12 @@ unsafe extern "system" fn list_view_wnd_proc(
         _ => {}
     }
 
-    // SAFETY: unhandled messages are forwarded unchanged to the original list-view proc.
+    // 安全性: unhandled messages are forwarded unchanged to the original list-view proc.
     unsafe { call_window_proc(state.original_wndproc, hwnd, msg, wparam, lparam) }
 }
 
 pub fn window_rect_relative_to_page(hwnd: HWND, page_hwnd: HWND) -> RECT {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         let mut rect = zeroed::<RECT>();
         GetWindowRect(hwnd, &mut rect);
@@ -521,7 +521,7 @@ pub fn copy_text_to_callback_buffer(buffer: *mut u16, capacity: usize, text: &st
     let max_len = capacity.saturating_sub(1);
     let encoded = text.encode_utf16().take(max_len).collect::<Vec<_>>();
 
-    // SAFETY: `buffer` is a caller-provided callback buffer with `capacity` UTF-16 slots; we
+    // 安全性: `buffer` is a caller-provided callback buffer with `capacity` UTF-16 slots; we
     // copy at most capacity-1 units and always write the trailing NUL.
     unsafe {
         std::ptr::copy_nonoverlapping(encoded.as_ptr(), buffer, encoded.len());
@@ -530,8 +530,8 @@ pub fn copy_text_to_callback_buffer(buffer: *mut u16, capacity: usize, text: &st
 }
 
 pub unsafe fn widestr_ptr_to_string(ptr: *const u16) -> String {
-    // SAFETY: callers must pass a valid pointer to a NUL-terminated UTF-16 string.
-    // The function reads up to MAX_WIDE_CHARS code units before stopping.
+    // 安全性: 调用方必须传入有效的、以 NUL 结尾的 UTF-16 字符串指针。
+    // 函数最多读取 MAX_WIDE_CHARS 个编码单元后停止。
     {
         if ptr.is_null() {
             return String::new();

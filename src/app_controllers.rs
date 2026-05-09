@@ -1,5 +1,11 @@
-//! Small controllers owned by the main application object.
-//! They keep long-lived UI state out of `App` while preserving the Win32 message flow.
+//! 主应用对象持有的小型控制器集合。
+//! 这些控制器把长期存活的 UI 状态从 `App` 中分离，同时保持 Win32 消息流完整。
+//!
+//! 四个控制器各司其职：
+//! - RuntimeStatsController：CPU/内存采样与差值计算
+//! - TrayController：托盘图标切换与提示文本
+//! - MenuController：菜单弹出/跟踪状态机
+//! - WindowModeController：无标题模式与置顶模式
 
 use std::mem::{size_of, zeroed};
 use windows_sys::Win32::Foundation::{FILETIME, HWND};
@@ -18,6 +24,8 @@ use crate::winutil::{format_resource_string, to_wide_null};
 
 const NOTIFY_ICON_TIP_CAPACITY: usize = 128;
 
+/// 运行时统计控制器。
+/// 通过 GetSystemTimes 差值计算 CPU 使用率，通过 GlobalMemoryStatusEx 获取内存占用。
 #[derive(Default)]
 pub struct RuntimeStatsController {
     pub cpu_usage: u8,
@@ -39,7 +47,7 @@ impl RuntimeStatsController {
     }
 
     pub fn refresh_runtime_stats(&mut self) {
-        // SAFETY: all Win32 calls write into initialized local output buffers.
+        // 安全性: all Win32 calls write into initialized local output buffers.
         unsafe {
             let mut idle = zeroed::<FILETIME>();
             let mut kernel = zeroed::<FILETIME>();
@@ -80,6 +88,8 @@ impl RuntimeStatsController {
     }
 }
 
+/// 托盘图标控制器。
+/// 管理 12 级 CPU 占用图标和通知区域提示文本。
 pub struct TrayController {
     icons: Vec<HICON>,
 }
@@ -107,7 +117,7 @@ impl TrayController {
     }
 
     pub fn update_tray(&self, main_hwnd: HWND, command: u32, icon: HICON, tip: &str) {
-        // SAFETY: `NOTIFYICONDATAW` is a Win32 POD struct where zero-initialization is valid.
+        // 安全性: `NOTIFYICONDATAW` is a Win32 POD struct where zero-initialization is valid.
         let mut data = unsafe { zeroed::<NOTIFYICONDATAW>() };
         data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
         data.hWnd = main_hwnd;
@@ -124,7 +134,7 @@ impl TrayController {
             data.szTip[index] = code_unit;
         }
 
-        // SAFETY: `data` is fully initialized for Shell_NotifyIconW and lives through the call.
+        // 安全性: `data` is fully initialized for Shell_NotifyIconW and lives through the call.
         unsafe { Shell_NotifyIconW(command, &data) };
     }
 
@@ -148,6 +158,9 @@ impl TrayController {
     }
 }
 
+/// 菜单状态控制器。
+/// 记录当前活动菜单句柄、菜单跟踪状态和弹出状态，用于任务管理器的
+/// "隐藏时最小化"和菜单自动关闭逻辑。
 #[derive(Default)]
 pub struct MenuController {
     current_menu: HMENU,
@@ -207,6 +220,9 @@ impl MenuController {
     }
 }
 
+/// 窗口模式控制器。
+/// 管理无标题模式（紧凑视图）和置顶模式的切换，包括窗口风格位操作
+/// 和窗口矩形的位置跟踪。
 #[derive(Default)]
 pub struct WindowModeController {
     framed_style: u32,

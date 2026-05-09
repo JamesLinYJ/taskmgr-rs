@@ -74,7 +74,7 @@ pub fn load_icon_from_file(file_name: &str, width: i32, height: i32, flags: u32)
         return null_mut();
     };
     let wide = to_wide_null(&path);
-    // SAFETY: `wide` is a live, NUL-terminated UTF-16 path and `LoadImageW` only borrows it
+    // 安全性: `wide` is a live, NUL-terminated UTF-16 path and `LoadImageW` only borrows it
     // for the duration of the call.
     unsafe {
         LoadImageW(
@@ -94,7 +94,7 @@ pub fn load_bitmap_from_file(file_name: &str) -> HBITMAP {
         return null_mut();
     };
     let wide = to_wide_null(&path);
-    // SAFETY: `wide` is a live, NUL-terminated UTF-16 path and `LoadImageW` only borrows it
+    // 安全性: `wide` is a live, NUL-terminated UTF-16 path and `LoadImageW` only borrows it
     // for the duration of the call.
     unsafe {
         LoadImageW(
@@ -142,6 +142,6 @@ pub fn create_accelerator_table() -> HACCEL {
             cmd: IDC_PREVTAB,
         },
     ];
-    // SAFETY: `accelerators` is a valid slice of ACCEL entries and the API copies the table.
+    // 安全性: `accelerators` is a valid slice of ACCEL entries and the API copies the table.
     unsafe { CreateAcceleratorTableW(accelerators.as_ptr(), accelerators.len() as i32) }
 }

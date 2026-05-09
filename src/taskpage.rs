@@ -223,7 +223,7 @@ impl TaskPageState {
     pub fn prepare_initialize(&mut self, hinstance: HINSTANCE, main_hwnd: HWND) -> Result<(), u32> {
         // 任务页真正创建窗口前，先把后台枚举线程和图标列表资源准备好，
         // 避免页面显示出来后才临时分配这些较重的对象。
-        // SAFETY: this pre-initialization runs on the UI thread and only creates resources owned
+        // 安全性: this pre-initialization runs on the UI thread and only creates resources owned
         // by this page state.
         unsafe {
             self.hinstance = hinstance;
@@ -286,7 +286,7 @@ impl TaskPageState {
 
     pub fn handle_init_dialog(&mut self, hwnd_page: HWND) -> isize {
         // 页面窗口建立后，图标列表和 ListView 才能真正绑定到控件上。
-        // SAFETY: WM_INITDIALOG supplies the page HWND; all child-control messages stay within
+        // 安全性: WM_INITDIALOG supplies the page HWND; all child-control messages stay within
         // this page and run synchronously on the UI thread.
         unsafe {
             self.hwnd_page = hwnd_page;
@@ -344,7 +344,7 @@ impl TaskPageState {
     }
 
     pub fn destroy(&mut self) {
-        // SAFETY: destruction releases resources exclusively owned by this page state.
+        // 安全性: destruction releases resources exclusively owned by this page state.
         unsafe {
             self.stop_worker_thread();
             if self.small_icons != 0 {
@@ -369,7 +369,7 @@ impl TaskPageState {
 
     pub fn handle_notify(&mut self, lparam: LPARAM) -> isize {
         // 任务页同样依赖 ListView 通知来驱动选择同步、双击切换和列表排序。
-        // SAFETY: task dialog proc forwards only WM_NOTIFY LPARAM values from Win32; each cast is
+        // 安全性: task dialog proc forwards only WM_NOTIFY LPARAM values from Win32; each cast is
         // matched to the notification code before accessing the payload.
         unsafe {
             let notify_header = &*(lparam as *const NMHDR);
@@ -418,7 +418,7 @@ impl TaskPageState {
     pub fn handle_command(&mut self, command_id: u16) {
         // 任务页命令大多直接映射到窗口管理动作：
         // 切换、平铺、层叠、最小化、最大化、结束任务或跳转到进程页。
-        // SAFETY: commands are handled on the UI thread and operate only on HWNDs collected from
+        // 安全性: commands are handled on the UI thread and operate only on HWNDs collected from
         // Win32 enumeration or this page's own controls.
         unsafe {
             match command_id {
@@ -505,7 +505,7 @@ impl TaskPageState {
 
     pub fn show_context_menu(&mut self, x: i32, y: i32) {
         // 没有选择项时显示“视图菜单”，有选择项时显示“窗口操作菜单”。
-        // SAFETY: popup construction and tracking are synchronous UI-thread operations; the menu
+        // 安全性: popup construction and tracking are synchronous UI-thread operations; the menu
         // handle is destroyed before returning.
         unsafe {
             let selected_hwnds = self.selected_hwnds(true);
@@ -561,7 +561,7 @@ impl TaskPageState {
 
     pub fn size_page(&self) {
         // 任务页布局规则与进程页类似：列表控件吃满剩余区域，右下角保留操作按钮。
-        // SAFETY: layout only reads/moves child controls owned by this page HWND.
+        // 安全性: layout only reads/moves child controls owned by this page HWND.
         unsafe {
             let mut parent_rect = zeroed::<RECT>();
             GetClientRect(self.hwnd_page, &mut parent_rect);
@@ -619,12 +619,12 @@ impl TaskPageState {
     }
 
     fn list_hwnd(&self) -> HWND {
-        // SAFETY: this only queries a child HWND from this page dialog; null is allowed.
+        // 安全性: this only queries a child HWND from this page dialog; null is allowed.
         unsafe { GetDlgItem(self.hwnd_page, IDC_TASKLIST) }
     }
 
     fn setup_columns(&self) -> Result<(), u32> {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 任务页列是固定集合，所以建列时可以完全按静态定义重建。
             let list_hwnd = self.list_hwnd();
@@ -662,7 +662,7 @@ impl TaskPageState {
     }
 
     fn apply_view_mode(&mut self, view_mode: i32) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 大图标/小图标/详细信息本质上是同一个 ListView 的不同 style 组合。
             self.current_view_mode = view_mode;
@@ -852,7 +852,7 @@ impl TaskPageState {
     }
 
     fn remove_stale_tasks(&mut self, current_pass: u64) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             let mut removed_small = Vec::with_capacity(self.tasks.len());
             let mut removed_large = Vec::with_capacity(self.tasks.len());
@@ -882,7 +882,7 @@ impl TaskPageState {
     }
 
     fn update_task_listview(&mut self) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 更新 ListView 时先暂停重绘，批量完成替换/删除/插入后再统一恢复。
             let list_hwnd = self.list_hwnd();
@@ -938,7 +938,7 @@ impl TaskPageState {
     }
 
     fn insert_row(&self, list_hwnd: HWND, index: usize, task: &TaskEntry) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             let image_index = if self.current_view_mode == ViewMode::LargeIcon as i32 {
                 task.large_icon as i32
@@ -965,7 +965,7 @@ impl TaskPageState {
     }
 
     fn replace_row(&self, list_hwnd: HWND, index: usize, task: &TaskEntry) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             let image_index = if self.current_view_mode == ViewMode::LargeIcon as i32 {
                 task.large_icon as i32
@@ -988,7 +988,7 @@ impl TaskPageState {
     }
 
     fn fill_display_info(&self, item: &mut LVITEMW) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             if (item.mask & LVIF_TEXT) == 0
                 || item.iItem < 0
@@ -1025,7 +1025,7 @@ impl TaskPageState {
     }
 
     fn reset_imagelists(&self) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             ImageList_Remove(self.small_icons, -1);
             ImageList_Remove(self.large_icons, -1);
@@ -1035,12 +1035,12 @@ impl TaskPageState {
     }
 
     fn selected_count(&self) -> u32 {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe { SendMessageW(self.list_hwnd(), LVM_GETSELECTEDCOUNT, 0, 0) as u32 }
     }
 
     fn update_ui_state(&self) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             let enabled = self.selected_count > 0;
             for control_id in [IDC_ENDTASK, IDC_SWITCHTO] {
@@ -1053,7 +1053,7 @@ impl TaskPageState {
     }
 
     fn selected_hwnds(&self, selected_only: bool) -> Vec<HWND> {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             if !selected_only {
                 return self.tasks.iter().map(|task| task.hwnd).collect();
@@ -1094,7 +1094,7 @@ impl TaskPageState {
     }
 
     fn ensure_not_minimized(&self, hwnds: &[HWND]) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             for hwnd in hwnds {
                 if IsIconic(*hwnd) != 0 {
@@ -1105,7 +1105,7 @@ impl TaskPageState {
     }
 
     fn show_selected_windows(&self, cmd_show: i32) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             for hwnd in self.selected_hwnds(self.selected_count > 0) {
                 ShowWindowAsync(hwnd, cmd_show);
@@ -1114,7 +1114,7 @@ impl TaskPageState {
     }
 
     fn tile_selected(&self, how: u32) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             let hwnds = self.selected_hwnds(self.selected_count > 0);
             self.ensure_not_minimized(&hwnds);
@@ -1129,7 +1129,7 @@ impl TaskPageState {
     }
 
     fn cascade_selected(&self) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             let hwnds = self.selected_hwnds(self.selected_count > 0);
             self.ensure_not_minimized(&hwnds);
@@ -1171,7 +1171,7 @@ fn collect_tasks_current_winsta(main_hwnd: HWND) -> Vec<WorkerTaskEntry> {
 }
 
 fn collect_tasks_current_winsta_worker(main_hwnd: HWND) -> Vec<WorkerTaskEntry> {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         let mut tasks = Vec::with_capacity(64);
         let mut seen_hwnds = HashSet::new();
@@ -1294,7 +1294,7 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
 }
 
 fn enum_desktops_for_current_winsta(context: &mut WindowStationEnumContext) {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         // 某些环境下按窗口站直接枚举桌面会失败；
         // 这时回退到当前线程桌面，保证至少能拿到当前桌面的任务窗口。
@@ -1325,7 +1325,7 @@ fn enum_desktops_for_current_winsta(context: &mut WindowStationEnumContext) {
 }
 
 fn current_user_object_name(handle: HANDLE) -> Option<String> {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         // 窗口站和桌面名都通过 `GetUserObjectInformationW(UOI_NAME)` 读取，
         // 这里统一封装成一个 UTF-16 -> Rust String 的助手。
@@ -1386,7 +1386,7 @@ fn fetch_window_icon(hwnd: HWND, small: bool) -> HICON {
 }
 
 fn query_window_icon(hwnd: HWND, icon_type: usize) -> HICON {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         let mut result = 0usize;
         SendMessageTimeoutW(
@@ -1407,7 +1407,7 @@ fn query_window_icon(hwnd: HWND, icon_type: usize) -> HICON {
 }
 
 fn query_class_icon(hwnd: HWND, class_index: i32) -> HICON {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         let class_icon = GetClassLongPtrW(hwnd, class_index) as usize;
         if class_icon != 0 {
@@ -1452,7 +1452,7 @@ fn compare_tasks(
 }
 
 fn add_icon(imagelist: HIMAGELIST, icon: HICON, default_icon: HICON) -> usize {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         // 自己复制得到的图标句柄在加入 ImageList 后就可以释放；
         // 默认图标是共享资源，不应在这里销毁。

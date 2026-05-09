@@ -148,9 +148,9 @@ impl Options {
             self.timer_interval = 0;
         }
 
-        // SAFETY: querying system metrics has no pointer inputs or lifetime requirements.
+        // 安全性: querying system metrics has no pointer inputs or lifetime requirements.
         let screen_width = unsafe { GetSystemMetrics(SM_CXMAXIMIZED) };
-        // SAFETY: querying system metrics has no pointer inputs or lifetime requirements.
+        // 安全性: querying system metrics has no pointer inputs or lifetime requirements.
         let screen_height = unsafe { GetSystemMetrics(SM_CYMAXIMIZED) };
 
         self.window_rect.left = (screen_width - min_width) / 2;
@@ -166,7 +166,7 @@ impl Options {
             return false;
         }
 
-        // SAFETY: registry buffers point to live local variables for the duration of each call;
+        // 安全性: registry buffers point to live local variables for the duration of each call;
         // loaded binary data is size/type checked before being used.
         unsafe {
             let key_name = to_wide_null(TASKMAN_KEY);
@@ -208,7 +208,7 @@ impl Options {
 
     pub fn save(&self) -> Result<(), u32> {
         // 整个结构体按历史格式整体写入注册表，保持与原版偏好布局兼容。
-        // SAFETY: registry handles are opened and closed in this block; the value buffer points
+        // 安全性: registry handles are opened and closed in this block; the value buffer points
         // to `self` and is written as the historical binary Options format.
         unsafe {
             let key_name = to_wide_null(TASKMAN_KEY);
@@ -300,9 +300,9 @@ impl Options {
     fn is_valid(&self) -> bool {
         // 这里显式校验所有会影响数组索引或窗口状态的字段，
         // 防止损坏的注册表值在后续刷新路径里触发越界或错误状态。
-        // SAFETY: querying system metrics has no pointer inputs or lifetime requirements.
+        // 安全性: querying system metrics has no pointer inputs or lifetime requirements.
         let max_width = unsafe { GetSystemMetrics(SM_CXMAXIMIZED) };
-        // SAFETY: querying system metrics has no pointer inputs or lifetime requirements.
+        // 安全性: querying system metrics has no pointer inputs or lifetime requirements.
         let max_height = unsafe { GetSystemMetrics(SM_CYMAXIMIZED) };
 
         self.cb_size == size_of::<Self>() as u32
@@ -335,7 +335,7 @@ impl Options {
 }
 
 fn modifiers_force_defaults() -> bool {
-    // SAFETY: `GetKeyState` only reads current keyboard state for virtual-key codes.
+    // 安全性: `GetKeyState` only reads current keyboard state for virtual-key codes.
     unsafe {
         GetKeyState(i32::from(VK_SHIFT)) < 0
             && GetKeyState(i32::from(VK_MENU)) < 0
@@ -371,7 +371,7 @@ fn is_valid_update_speed(value: i32) -> bool {
 
 fn screen_reader_enabled() -> bool {
     let mut enabled = 0i32;
-    // SAFETY: `enabled` is a valid writable out parameter for `SPI_GETSCREENREADER`.
+    // 安全性: `enabled` is a valid writable out parameter for `SPI_GETSCREENREADER`.
     unsafe {
         SystemParametersInfoW(
             SPI_GETSCREENREADER,

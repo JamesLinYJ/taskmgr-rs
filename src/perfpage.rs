@@ -193,7 +193,7 @@ impl PerformancePageState {
     }
 
     pub fn apply_options(&mut self, hwnd_page: HWND, options: &Options, processor_count: usize) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 配置变化会同时影响图表数量、是否叠加内核时间，以及文字区是否折叠。
             self.ensure_history_capacity(processor_count.max(1));
@@ -234,7 +234,7 @@ impl PerformancePageState {
     }
 
     pub fn timer_event(&mut self, hwnd_page: HWND, main_hwnd: HWND) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 定时器事件先刷新底层采样，再推动图表滚动与数值文本更新。
             self.refresh_measurements(hwnd_page);
@@ -280,7 +280,7 @@ impl PerformancePageState {
     }
 
     fn invalidate_graph_controls(&self, hwnd_page: HWND) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 图表刷新只失效图表控件本身，不整页重绘。
             for control_id in [IDC_CPUMETER, IDC_MEMMETER, IDC_MEMGRAPH] {
@@ -301,7 +301,7 @@ impl PerformancePageState {
     }
 
     pub fn draw_cpu_graph(&self, hdc: HDC, rect: RECT, pane_index: usize) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // CPU 图优先绘制到离屏 DC，再一次性拷回目标 DC，
             // 这样网格线和曲线更新时不会在前台逐步闪出来。
@@ -407,7 +407,7 @@ impl PerformancePageState {
     }
 
     pub fn draw_mem_graph(&self, hdc: HDC, rect: RECT) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 内存历史图复用 CPU 图的绘制策略，只是数据源和颜色不同。
             if self.draw_mem_graph_gpu(hdc, rect) {
@@ -624,7 +624,7 @@ impl PerformancePageState {
     }
 
     pub fn size_page(&mut self, hwnd_page: HWND, main_hwnd: HWND) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 布局逻辑尽量贴近经典 Task Manager：
             // 先算整体可用高度，再分配图表、仪表和底部统计区的位置。
@@ -809,7 +809,7 @@ impl PerformancePageState {
     }
 
     pub fn destroy(&mut self) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 性能页销毁时顺带释放仪表位图和共享离屏表面。
             self.destroy_graph_surface();
@@ -858,7 +858,7 @@ impl PerformancePageState {
     }
 
     fn refresh_cpu_histories(&mut self) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 内核返回的是累积 CPU 时间，所以这里必须与上一轮做差，
             // 再换算成本轮使用率和内核时间占比。
@@ -930,7 +930,7 @@ impl PerformancePageState {
     }
 
     fn refresh_system_info(&mut self, hwnd_page: HWND) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 系统级内存、Commit、句柄、线程、进程总数都来源于同一份快照，
             // 统一在这里采样可以保证页面上的数字属于同一个刷新时刻。
@@ -1012,7 +1012,7 @@ impl PerformancePageState {
         lit_percent: u8,
         red_percent: u8,
     ) -> bool {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 位图仪表把点亮区、未点亮区和红色内核区拼接成最终视觉效果。
             if self.strip_lit_bitmap.is_null()
@@ -1104,7 +1104,7 @@ impl PerformancePageState {
         start_y: i32,
         height: i32,
     ) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 条形位图按固定高度平铺，直到覆盖目标像素高度。
             if bitmap.is_null() || height <= 0 {
@@ -1135,7 +1135,7 @@ impl PerformancePageState {
     }
 
     fn ensure_graph_surface(&mut self, hwnd_page: HWND, width: i32, height: i32) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 图表表面的目标尺寸由布局层决定；
             // 这里仅负责按容量策略确保一份足够大的共享离屏表面存在。
@@ -1209,7 +1209,7 @@ impl PerformancePageState {
     }
 
     fn destroy_graph_surface(&mut self) {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 共享离屏表面销毁时需要先把旧位图选回 DC 再删对象。
             if !self.graph_dc.is_null() {
@@ -1240,7 +1240,7 @@ impl PerformancePageState {
     }
 
     fn cpu_graph_hwnd(&self, hwnd_page: HWND, pane_index: usize) -> HWND {
-        // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             if pane_index < self.cpu_graph_slot_count() {
                 GetDlgItem(hwnd_page, self.cpu_graph_control_id(pane_index))
@@ -1265,7 +1265,7 @@ impl PerformancePageState {
             Vec::with_capacity(PERF_LAYOUT_CONTROLS.len() + self.cpu_graph_slot_count() + 8);
         push_unique_window(&mut windows, hwnd_page);
 
-        // SAFETY: all child lookups target controls owned by the provided performance page HWND.
+        // 安全性: all child lookups target controls owned by the provided performance page HWND.
         unsafe {
             if !self.no_title {
                 for control_id in PERF_LAYOUT_CONTROLS {
@@ -1309,7 +1309,7 @@ fn push_unique_window(windows: &mut Vec<HWND>, hwnd: HWND) {
 }
 
 fn set_redraw_for_windows(windows: &[HWND], enabled: bool) {
-    // SAFETY: callers pass HWNDs collected from the active performance page; WM_SETREDRAW only
+    // 安全性: callers pass HWNDs collected from the active performance page; WM_SETREDRAW only
     // toggles paint dispatch for those windows and does not transfer ownership.
     unsafe {
         for &hwnd in windows {
@@ -1323,7 +1323,7 @@ fn redraw_performance_page(hwnd_page: HWND, redraw_windows: &[HWND]) {
         return;
     }
 
-    // SAFETY: the HWNDs belong to the active performance page. The parent clears stale child
+    // 安全性: the HWNDs belong to the active performance page. The parent clears stale child
     // positions first, then only visible children repaint from their final layout.
     unsafe {
         RedrawWindow(
