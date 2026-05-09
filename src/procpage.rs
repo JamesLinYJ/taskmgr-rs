@@ -1,5 +1,4 @@
 use std::cmp::{Ordering, Reverse};
-use std::env;
 
 // 进程页实现。
 // 这里负责采集进程列表、计算每轮刷新之间的增量数据、维护排序状态，
@@ -9,6 +8,9 @@ use std::mem::{size_of, zeroed};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::slice;
+use std::sync::mpsc::{channel, Sender};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, FILETIME, HANDLE, HINSTANCE, HWND, INVALID_HANDLE_VALUE, LPARAM, POINT, RECT,
@@ -23,6 +25,7 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
+use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
 };
@@ -33,6 +36,7 @@ use windows_sys::Win32::System::Registry::{
 use windows_sys::Win32::System::RemoteDesktop::{
     WTSEnumerateProcessesW, WTSFreeMemory, WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW,
 };
+use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetPriorityClass, GetProcessAffinityMask, GetProcessHandleCount,
     GetProcessTimes, GetSystemTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
@@ -68,8 +72,7 @@ use crate::resource::*;
 use crate::runtime_menu::{MenuItemState, PopupMenu};
 use crate::winutil::{
     append_32_bit_suffix, finish_list_view_update_deferred, get_window_userdata,
-    is_32_bit_process_handle, loword, set_window_userdata, subclass_list_view,
-    to_wide_null,
+    is_32_bit_process_handle, loword, set_window_userdata, subclass_list_view, to_wide_null,
 };
 
 const PROCESS_COLUMNS: [ProcessColumn; NUM_COLUMN] = [
@@ -197,8 +200,10 @@ pub struct ProcEntry {
     // `ProcEntry` 同时承载原始采样值、展示值和刷新期的脏信息。
     pid: u32,
     image_name: String,
+    image_name_lower: String,
     is_32_bit: bool,
     user_name: String,
+    user_name_lower: String,
     session_id: u32,
     cpu: u8,
     cpu_time_100ns: u64,
@@ -329,12 +334,22 @@ impl ProcCommand {
     }
 }
 
+enum ProcWorkerCommand {
+    Collect {
+        previous_samples: Arc<HashMap<u32, PreviousProcSample>>,
+        total_delta: u64,
+        reply: Sender<(Vec<ProcEntry>, HashMap<u32, PreviousProcSample>)>,
+    },
+    Shutdown,
+}
+
 pub struct ProcessPageState {
     // 进程页状态对象持有采样缓存、排序设置、列配置以及当前选中项。
     hinstance: HINSTANCE,
     hwnd_page: HWND,
     main_hwnd: HWND,
     entries: Vec<ProcEntry>,
+    pid_to_index: HashMap<u32, usize>,
     previous_samples: HashMap<u32, PreviousProcSample>,
     previous_system_time: u64,
     active_columns: Vec<ColumnId>,
@@ -348,6 +363,8 @@ pub struct ProcessPageState {
     debugger_path: Option<String>,
     strings: ProcessStrings,
     pass_count: u64,
+    worker_sender: Option<Sender<ProcWorkerCommand>>,
+    worker_thread: Option<JoinHandle<()>>,
 }
 
 impl Default for ProcessPageState {
@@ -357,6 +374,7 @@ impl Default for ProcessPageState {
             hwnd_page: null_mut(),
             main_hwnd: null_mut(),
             entries: Vec::with_capacity(128),
+            pid_to_index: HashMap::new(),
             previous_samples: HashMap::new(),
             previous_system_time: 0,
             active_columns: Vec::with_capacity(NUM_COLUMN),
@@ -370,11 +388,47 @@ impl Default for ProcessPageState {
             debugger_path: None,
             strings: ProcessStrings::default(),
             pass_count: 0,
+            worker_sender: None,
+            worker_thread: None,
         }
     }
 }
 
 impl ProcessPageState {
+    fn start_worker_thread(&mut self) {
+        if self.worker_sender.is_some() {
+            return;
+        }
+        let (tx, rx) = channel::<ProcWorkerCommand>();
+        let worker = thread::spawn(move || {
+            while let Ok(command) = rx.recv() {
+                match command {
+                    ProcWorkerCommand::Collect {
+                        previous_samples,
+                        total_delta,
+                        reply,
+                    } => {
+                        let result =
+                            unsafe { collect_process_entries(&previous_samples, total_delta) };
+                        let _ = reply.send(result);
+                    }
+                    ProcWorkerCommand::Shutdown => break,
+                }
+            }
+        });
+        self.worker_sender = Some(tx);
+        self.worker_thread = Some(worker);
+    }
+
+    fn stop_worker_thread(&mut self) {
+        if let Some(sender) = self.worker_sender.take() {
+            let _ = sender.send(ProcWorkerCommand::Shutdown);
+        }
+        if let Some(worker) = self.worker_thread.take() {
+            let _ = worker.join();
+        }
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -396,6 +450,7 @@ impl ProcessPageState {
         self.main_hwnd = main_hwnd;
         self.load_strings();
         self.debugger_path = load_debugger_path();
+        self.start_worker_thread();
 
         let list_hwnd = self.list_hwnd();
         subclass_list_view(list_hwnd);
@@ -437,6 +492,7 @@ impl ProcessPageState {
     }
 
     pub unsafe fn destroy(&mut self) {
+        self.stop_worker_thread();
         self.entries.clear();
         self.previous_samples.clear();
     }
@@ -761,20 +817,38 @@ impl ProcessPageState {
     }
 
     unsafe fn refresh_processes(&mut self) {
-        // 刷新过程分为“采样 -> 合并历史 -> 排序 -> 重建 ListView”四步，
-        // 这样既能保留增量列，又能避免界面状态与采样结果错位。
+        // 刷新过程分为”采样 -> 合并历史 -> 排序 -> 重建 ListView”四步。
+        // 采样阶段通过工作线程完成，避免 UI 线程因大量 syscall 阻塞。
         let previous_selection = self.current_selected_pid().or(self.selected_pid);
         let system_total = current_system_time();
         let total_delta = system_total.saturating_sub(self.previous_system_time);
-        let (entries, next_samples) = collect_process_entries(&self.previous_samples, total_delta);
+        let previous_samples = Arc::new(std::mem::take(&mut self.previous_samples));
+        let (entries, next_samples) = if let Some(sender) = self.worker_sender.as_ref() {
+            let (reply_tx, reply_rx) = channel();
+            let command = ProcWorkerCommand::Collect {
+                previous_samples: Arc::clone(&previous_samples),
+                total_delta,
+                reply: reply_tx,
+            };
+            if sender.send(command).is_err() {
+                collect_process_entries(&previous_samples, total_delta)
+            } else {
+                reply_rx
+                    .recv()
+                    .unwrap_or_else(|_| collect_process_entries(&previous_samples, total_delta))
+            }
+        } else {
+            collect_process_entries(&previous_samples, total_delta)
+        };
         let current_pass = self.pass_count;
+        let mut existing_by_pid = HashMap::with_capacity(self.entries.len());
+        for (index, entry) in self.entries.iter_mut().enumerate() {
+            existing_by_pid.insert(entry.pid, index);
+        }
 
         for snapshot in entries {
-            if let Some(existing) = self
-                .entries
-                .iter_mut()
-                .find(|entry| same_entry_identity(entry, &snapshot))
-            {
+            if let Some(&index) = existing_by_pid.get(&snapshot.pid) {
+                let existing = &mut self.entries[index];
                 update_process_entry(existing, &snapshot, current_pass);
             } else {
                 self.entries.push(snapshot.with_pass_count(current_pass));
@@ -817,6 +891,10 @@ impl ProcessPageState {
                     compare_entries(left, right, self.sort_column, self.sort_direction)
                 });
             }
+        }
+        self.pid_to_index.clear();
+        for (index, entry) in self.entries.iter().enumerate() {
+            self.pid_to_index.insert(entry.pid, index);
         }
     }
 
@@ -958,9 +1036,9 @@ impl ProcessPageState {
         }
 
         let entry = if item.lParam != 0 {
-            self.entries
-                .iter()
-                .find(|entry| entry.pid == item.lParam as u32)
+            self.pid_to_index
+                .get(&(item.lParam as u32))
+                .and_then(|&idx| self.entries.get(idx))
         } else {
             self.entries.get(item.iItem as usize)
         };
@@ -1181,11 +1259,6 @@ impl ProcessPageState {
             return false;
         };
 
-        if !std::path::Path::new(debugger_path).is_file() {
-            self.show_failure_message(&self.strings.cant_debug, 2);
-            return false;
-        }
-
         if !self.quick_confirm(&self.strings.warning, &self.strings.debug) {
             return false;
         }
@@ -1239,8 +1312,20 @@ impl ProcessPageState {
             return false;
         }
 
+        let mut windir = vec![0u16; 260];
+        // SAFETY: GetWindowsDirectoryW fills the buffer with the canonical Windows directory.
+        let windir_len =
+            unsafe { GetWindowsDirectoryW(windir.as_mut_ptr(), windir.len() as u32) } as usize;
+        let explorer_path = if windir_len > 0 && windir_len < windir.len() {
+            format!(
+                "{}\\explorer.exe",
+                String::from_utf16_lossy(&windir[..windir_len])
+            )
+        } else {
+            return false;
+        };
         let command_line = format!(
-            "explorer.exe /select,{}",
+            "{explorer_path} /select,{}",
             quote_command_line_arg(&image_path)
         );
         let mut command_line_wide = to_wide_null(&command_line);
@@ -1650,42 +1735,22 @@ where
 }
 
 fn expand_environment_variables(command_line: &str) -> String {
-    let mut expanded = String::with_capacity(command_line.len());
-    let mut cursor = command_line;
-
-    while let Some(start) = cursor.find('%') {
-        expanded.push_str(&cursor[..start]);
-        let remainder = &cursor[start + 1..];
-        let Some(end) = remainder.find('%') else {
-            expanded.push('%');
-            expanded.push_str(remainder);
-            return expanded;
-        };
-
-        let variable_name = &remainder[..end];
-        if variable_name.is_empty() {
-            expanded.push_str("%%");
-        } else if let Some(value) = lookup_environment_variable(variable_name) {
-            expanded.push_str(&value);
-        } else {
-            expanded.push('%');
-            expanded.push_str(variable_name);
-            expanded.push('%');
-        }
-
-        cursor = &remainder[end + 1..];
+    // SAFETY: the Win32 ExpandEnvironmentStringsW API reads the process environment block
+    // maintained by the kernel, which handles system-variable edge cases (WOW64 redirections,
+    // %% escaping, variable-length limits) correctly.
+    let wide_input = to_wide_null(command_line);
+    let required = unsafe { ExpandEnvironmentStringsW(wide_input.as_ptr(), null_mut(), 0) };
+    if required == 0 {
+        return command_line.to_string();
     }
-
-    expanded.push_str(cursor);
-    expanded
-}
-
-fn lookup_environment_variable(variable_name: &str) -> Option<String> {
-    env::vars_os().find_map(|(key, value)| {
-        key.to_str()
-            .filter(|key| key.eq_ignore_ascii_case(variable_name))
-            .map(|_| value.to_string_lossy().into_owned())
-    })
+    let mut buffer = vec![0u16; required as usize];
+    let written =
+        unsafe { ExpandEnvironmentStringsW(wide_input.as_ptr(), buffer.as_mut_ptr(), required) };
+    if written == 0 || written > required {
+        return command_line.to_string();
+    }
+    let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..len])
 }
 
 unsafe fn query_process_identity(process_handle: HANDLE) -> (String, u32) {
@@ -1723,7 +1788,7 @@ unsafe fn query_process_identity(process_handle: HANDLE) -> (String, u32) {
         &mut required,
     ) != 0
     {
-        let token_user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        let token_user = std::ptr::read_unaligned(buffer.as_ptr() as *const TOKEN_USER);
         user_name = lookup_account_name_from_sid(token_user.User.Sid);
     }
 
@@ -1749,6 +1814,7 @@ unsafe fn merge_process_identity(entry: &mut ProcEntry, process_handle: HANDLE) 
     let (user_name, session_id) = query_process_identity(process_handle);
     if !user_name.is_empty() {
         entry.user_name = user_name;
+        entry.user_name_lower = entry.user_name.to_lowercase();
     }
     if session_id != 0 || entry.session_id == 0 {
         entry.session_id = session_id;
@@ -1866,15 +1932,9 @@ fn compare_entries(
     sort_direction: i32,
 ) -> Ordering {
     let ordering = match sort_column {
-        ColumnId::ImageName => left
-            .image_name
-            .to_lowercase()
-            .cmp(&right.image_name.to_lowercase()),
+        ColumnId::ImageName => left.image_name_lower.cmp(&right.image_name_lower),
         ColumnId::Pid => left.pid.cmp(&right.pid),
-        ColumnId::Username => left
-            .user_name
-            .to_lowercase()
-            .cmp(&right.user_name.to_lowercase()),
+        ColumnId::Username => left.user_name_lower.cmp(&right.user_name_lower),
         ColumnId::SessionId => left.session_id.cmp(&right.session_id),
         ColumnId::Cpu => left.cpu.cmp(&right.cpu),
         ColumnId::CpuTime => left.cpu_time_100ns.cmp(&right.cpu_time_100ns),
@@ -1968,13 +2028,16 @@ fn copy_text_to_callback_buffer(buffer: *mut u16, capacity: usize, text: &str) {
     if buffer.is_null() || capacity == 0 {
         return;
     }
-
     let max_len = capacity.saturating_sub(1);
-    let encoded = text.encode_utf16().take(max_len).collect::<Vec<_>>();
-
+    let mut written = 0usize;
+    for code_unit in text.encode_utf16().take(max_len) {
+        unsafe {
+            *buffer.add(written) = code_unit;
+        }
+        written += 1;
+    }
     unsafe {
-        std::ptr::copy_nonoverlapping(encoded.as_ptr(), buffer, encoded.len());
-        *buffer.add(encoded.len()) = 0;
+        *buffer.add(written) = 0;
     }
 }
 
@@ -2072,9 +2135,11 @@ unsafe fn collect_process_entries(
             let image_name = utf16_buffer_to_string(&process_entry.szExeFile);
             let mut entry = ProcEntry {
                 pid,
-                image_name,
+                image_name: image_name.clone(),
+                image_name_lower: image_name.to_lowercase(),
                 is_32_bit: false,
                 user_name: String::new(),
+                user_name_lower: String::new(),
                 session_id: 0,
                 cpu: 0,
                 cpu_time_100ns: 0,
@@ -2096,11 +2161,13 @@ unsafe fn collect_process_entries(
 
             if let Some((user_name, session_id)) = identities.get(&pid) {
                 entry.user_name = user_name.clone();
+                entry.user_name_lower = user_name.to_lowercase();
                 entry.session_id = *session_id;
             }
 
             if pid == 0 {
                 entry.user_name = "SYSTEM".to_string();
+                entry.user_name_lower = "system".to_string();
             }
 
             let process_handle = if pid == 0 {
@@ -2242,10 +2309,6 @@ impl ProcEntry {
     }
 }
 
-fn same_entry_identity(existing: &ProcEntry, snapshot: &ProcEntry) -> bool {
-    existing.pid == snapshot.pid
-}
-
 fn update_process_entry(entry: &mut ProcEntry, snapshot: &ProcEntry, pass_count: u64) {
     // 增量更新时只给真正变更的列打脏标记，
     // 后续 ListView 才能做到“只重绘必要行/列”。
@@ -2253,6 +2316,7 @@ fn update_process_entry(entry: &mut ProcEntry, snapshot: &ProcEntry, pass_count:
 
     if entry.image_name != snapshot.image_name {
         entry.image_name.clone_from(&snapshot.image_name);
+        entry.image_name_lower = snapshot.image_name_lower.clone();
         entry.dirty_columns.mark(ColumnId::ImageName);
     }
     if entry.is_32_bit != snapshot.is_32_bit {
@@ -2265,6 +2329,7 @@ fn update_process_entry(entry: &mut ProcEntry, snapshot: &ProcEntry, pass_count:
     }
     if entry.user_name != snapshot.user_name {
         entry.user_name.clone_from(&snapshot.user_name);
+        entry.user_name_lower = snapshot.user_name_lower.clone();
         entry.dirty_columns.mark(ColumnId::Username);
     }
     if entry.session_id != snapshot.session_id {

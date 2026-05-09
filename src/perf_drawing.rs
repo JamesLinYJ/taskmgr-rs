@@ -4,16 +4,16 @@ use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
 
-use windows_sys::Win32::Foundation::{HWND, RECT};
+use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreatePen, DeleteObject, DrawTextW, GetCurrentObject, GetObjectW, LineTo, MoveToEx,
-    SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, HDC, LOGFONTW, OBJ_FONT, PS_SOLID, TRANSPARENT,
+    DrawTextW, GetCurrentObject, GetObjectW, GetStockObject, LineTo, MoveToEx, Polyline,
+    SelectObject, SetBkMode, SetDCPenColor, SetTextColor, DC_PEN, DT_CENTER, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, HDC, LOGFONTW, OBJ_FONT, TRANSPARENT,
 };
+use windows_sys::Win32::UI::Shell::StrFormatByteSizeW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DeferWindowPos, SetDlgItemTextW, HDWP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREDRAW, SWP_NOZORDER,
 };
-use windows_sys::Win32::UI::Shell::StrFormatByteSizeW;
 
 use crate::chart_renderer::{ChartColor, ChartFrame};
 use crate::drawing::{fill_black, fill_rect_color, rgb};
@@ -45,8 +45,25 @@ pub fn defer_resize(hdwp: HDWP, hwnd: HWND, width: i32, height: i32) -> HDWP {
 pub fn set_numeric_text(hwnd_page: HWND, control_id: i32, value: u32) {
     // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
-        let text = to_wide_null(&value.to_string());
-        SetDlgItemTextW(hwnd_page, control_id, text.as_ptr());
+        let mut buf = [0u16; 16];
+        write_u32_utf16(value, &mut buf);
+        SetDlgItemTextW(hwnd_page, control_id, buf.as_ptr());
+    }
+}
+
+fn write_u32_utf16(mut value: u32, buf: &mut [u16]) {
+    if value == 0 {
+        buf[0] = b'0' as u16;
+        return;
+    }
+    let mut i = buf.len();
+    while value > 0 && i > 0 {
+        i -= 1;
+        buf[i] = (b'0' + (value % 10) as u8) as u16;
+        value /= 10;
+    }
+    if i > 0 {
+        buf.copy_within(i.., 0);
     }
 }
 
@@ -85,12 +102,8 @@ pub fn format_mem_meter_text(mem_usage_kb: u32) -> String {
 pub fn draw_grid_width(hdc: HDC, rect: &RECT, width: i32, scroll_offset: i32) {
     // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
-        let pen = CreatePen(PS_SOLID, 1, rgb(0, 128, 64));
-        if pen.is_null() {
-            return;
-        }
-
-        let old_pen = SelectObject(hdc, pen as _);
+        let old_pen = SelectObject(hdc, GetStockObject(DC_PEN as i32) as _);
+        SetDCPenColor(hdc, rgb(0, 128, 64));
         let left = rect.right - width.max(0);
         let right = rect.right;
         let top = rect.top;
@@ -111,7 +124,6 @@ pub fn draw_grid_width(hdc: HDC, rect: &RECT, width: i32, scroll_offset: i32) {
         }
 
         SelectObject(hdc, old_pen);
-        DeleteObject(pen as _);
     }
 }
 
@@ -141,46 +153,41 @@ pub fn draw_history_series(
             return;
         }
 
-        let pen = CreatePen(
-            PS_SOLID,
-            2,
-            match series.color {
-                ChartColor::Black => rgb(0, 0, 0),
-                ChartColor::Green => rgb(0, 255, 0),
-                ChartColor::Yellow => rgb(255, 255, 0),
-                ChartColor::Red => rgb(255, 0, 0),
-                ChartColor::Grid => rgb(0, 128, 64),
-            },
-        );
-        if pen.is_null() {
-            return;
-        }
+        let color_rgb = match series.color {
+            ChartColor::Black => rgb(0, 0, 0),
+            ChartColor::Green => rgb(0, 255, 0),
+            ChartColor::Yellow => rgb(255, 255, 0),
+            ChartColor::Red => rgb(255, 0, 0),
+            ChartColor::Grid => rgb(0, 128, 64),
+        };
 
-        let old_pen = SelectObject(hdc, pen as _);
-        MoveToEx(
-            hdc,
-            rect.right,
-            rect.bottom - (i32::from(series.history[0]) * layout.graph_height) / 100,
-            null_mut(),
-        );
+        let old_pen = SelectObject(hdc, GetStockObject(DC_PEN as i32) as _);
+        SetDCPenColor(hdc, color_rgb);
 
-        for (index, value) in series.history.iter().enumerate() {
-            if index * layout.scale >= layout.width as usize {
-                break;
-            }
+        let max_points = (layout.width as usize / layout.scale).min(series.history.len());
+        let start_x = rect.right;
+        let start_y = rect.bottom - (i32::from(series.history[0]) * layout.graph_height) / 100;
+        let mut points = Vec::with_capacity(max_points + 1);
+        points.push(POINT {
+            x: start_x,
+            y: start_y,
+        });
+
+        for (index, value) in series.history.iter().enumerate().take(max_points) {
             if series.stop_on_zero && *value == 0 {
                 break;
             }
+            points.push(POINT {
+                x: rect.right - (layout.scale * index) as i32,
+                y: rect.bottom - (i32::from(*value) * layout.graph_height) / 100,
+            });
+        }
 
-            LineTo(
-                hdc,
-                rect.right - (layout.scale * index) as i32,
-                rect.bottom - (i32::from(*value) * layout.graph_height) / 100,
-            );
+        if points.len() > 1 {
+            Polyline(hdc, points.as_ptr(), points.len() as i32);
         }
 
         SelectObject(hdc, old_pen);
-        DeleteObject(pen as _);
     }
 }
 
@@ -314,23 +321,20 @@ pub fn draw_meter(
     }
 }
 
-pub fn average_history(history_sets: &[Vec<u8>]) -> Vec<u8> {
+pub fn average_history_into(history_sets: &[Vec<u8>], out: &mut Vec<u8>) {
     let Some(first_history) = history_sets.first() else {
-        return Vec::new();
+        out.clear();
+        return;
     };
-
-    let mut averaged = vec![0u8; first_history.len()];
-    for (index, value) in averaged.iter_mut().enumerate() {
+    out.resize(first_history.len(), 0u8);
+    for (index, value) in out.iter_mut().enumerate() {
         let sum = history_sets
             .iter()
             .map(|history| u32::from(history.get(index).copied().unwrap_or_default()))
             .sum::<u32>();
         *value = (sum / history_sets.len() as u32).min(100) as u8;
     }
-
-    averaged
 }
-
 pub fn current_font_height(hdc: HDC) -> i32 {
     // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {

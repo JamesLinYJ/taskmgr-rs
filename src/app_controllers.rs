@@ -220,7 +220,6 @@ impl WindowModeController {
         self.borderless_style = borderless_style;
     }
 
-
     pub fn is_temporarily_hidden(&self) -> bool {
         self.temporarily_hidden
     }

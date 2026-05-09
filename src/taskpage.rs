@@ -36,7 +36,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetMenuDefaultItem, SetWindowLongW, SetWindowPos, ShowWindow,
     ShowWindowAsync, TileWindows, TrackPopupMenuEx, GCL_HICON, GCL_HICONSM, HICON,
     MDITILE_HORIZONTAL, MDITILE_VERTICAL, MF_BYCOMMAND, MF_DISABLED, MF_GRAYED, SMTO_ABORTIFHUNG,
-    SMTO_BLOCK, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE,
+    SMTO_NORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE,
     SW_RESTORE, TPM_RETURNCMD, WM_COMMAND, WM_GETICON, WM_SETREDRAW,
 };
 
@@ -114,13 +114,15 @@ pub struct TaskEntry {
 }
 
 struct WorkerTaskEntry {
-    // 后台线程只返回与 UI 无关的纯数据，避免跨线程传递 GDI/窗口资源。
+    // 后台线程负责窗口枚举和图标抓取；图标句柄通过 channel 安全传递回 UI 线程。
     hwnd: isize,
     title: String,
     is_32_bit: bool,
     winstation: String,
     desktop: String,
     is_hung: bool,
+    small_icon: isize,
+    large_icon: isize,
 }
 
 enum WorkerCommand {
@@ -166,6 +168,7 @@ pub struct TaskPageState {
     hwnd_page: HWND,
     main_hwnd: HWND,
     tasks: Vec<TaskEntry>,
+    hwnd_to_index: HashMap<isize, usize>,
     small_icons: HIMAGELIST,
     large_icons: HIMAGELIST,
     default_small_icon: HICON,
@@ -189,6 +192,7 @@ impl Default for TaskPageState {
             hwnd_page: null_mut(),
             main_hwnd: null_mut(),
             tasks: Vec::with_capacity(128),
+            hwnd_to_index: HashMap::new(),
             small_icons: 0,
             large_icons: 0,
             default_small_icon: null_mut(),
@@ -717,12 +721,12 @@ impl TaskPageState {
             } else {
                 let small_icon = add_icon(
                     self.small_icons,
-                    fetch_window_icon(hwnd, true),
+                    worker_task.small_icon as HICON,
                     self.default_small_icon,
                 );
                 let large_icon = add_icon(
                     self.large_icons,
-                    fetch_window_icon(hwnd, false),
+                    worker_task.large_icon as HICON,
                     self.default_large_icon,
                 );
                 self.tasks.push(TaskEntry::from_worker(
@@ -736,6 +740,7 @@ impl TaskPageState {
         }
 
         self.remove_stale_tasks(current_pass);
+        self.rebuild_hwnd_index_map();
         self.update_task_listview();
         self.pass_count = self.pass_count.wrapping_add(1);
     }
@@ -779,6 +784,14 @@ impl TaskPageState {
                     compare_tasks(left, right, self.sort_column, self.sort_direction)
                 });
             }
+        }
+        self.rebuild_hwnd_index_map();
+    }
+
+    fn rebuild_hwnd_index_map(&mut self) {
+        self.hwnd_to_index.clear();
+        for (index, task) in self.tasks.iter().enumerate() {
+            self.hwnd_to_index.insert(task.hwnd as isize, index);
         }
     }
 
@@ -841,30 +854,28 @@ impl TaskPageState {
     fn remove_stale_tasks(&mut self, current_pass: u64) {
         // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
-            // 过期任务不仅要从数据数组里删掉，还要同步修正 ImageList 索引偏移。
-            let mut index = 0;
-            while index < self.tasks.len() {
-                if self.tasks[index].pass_count == current_pass {
-                    index += 1;
-                    continue;
-                }
+            let mut removed_small = Vec::with_capacity(self.tasks.len());
+            let mut removed_large = Vec::with_capacity(self.tasks.len());
 
-                let removed_task = self.tasks.remove(index);
-
-                if removed_task.small_icon > 0 {
-                    ImageList_Remove(self.small_icons, removed_task.small_icon as i32);
+            self.tasks.retain(|task| {
+                if task.pass_count == current_pass {
+                    true
+                } else {
+                    removed_small.push(task.small_icon);
+                    removed_large.push(task.large_icon);
+                    false
                 }
-                if removed_task.large_icon > 0 {
-                    ImageList_Remove(self.large_icons, removed_task.large_icon as i32);
-                }
+            });
 
+            normalize_removed_icon_indices(&mut removed_small);
+            normalize_removed_icon_indices(&mut removed_large);
+            remove_imagelist_indices(self.small_icons, &removed_small);
+            remove_imagelist_indices(self.large_icons, &removed_large);
+
+            if !removed_small.is_empty() || !removed_large.is_empty() {
                 for task in &mut self.tasks {
-                    if removed_task.small_icon > 0 && task.small_icon > removed_task.small_icon {
-                        task.small_icon -= 1;
-                    }
-                    if removed_task.large_icon > 0 && task.large_icon > removed_task.large_icon {
-                        task.large_icon -= 1;
-                    }
+                    task.small_icon = adjusted_icon_index(task.small_icon, &removed_small);
+                    task.large_icon = adjusted_icon_index(task.large_icon, &removed_large);
                 }
             }
         }
@@ -988,9 +999,9 @@ impl TaskPageState {
             }
 
             let task = if item.lParam != 0 {
-                self.tasks
-                    .iter()
-                    .find(|task| task.hwnd == item.lParam as HWND)
+                self.hwnd_to_index
+                    .get(&(item.lParam as isize))
+                    .and_then(|&idx| self.tasks.get(idx))
             } else {
                 self.tasks.get(item.iItem as usize)
             };
@@ -1144,7 +1155,15 @@ fn load_popup_menu(
 fn collect_tasks_worker(main_hwnd: isize) -> Vec<WorkerTaskEntry> {
     // SetProcessWindowStation 是进程级设置，不能在后台线程调用，
     // 因此工作线程只枚举当前窗口站，跨窗口站的枚举在 UI 线程完成。
-    collect_tasks_current_winsta_worker(main_hwnd as HWND)
+    let mut tasks = collect_tasks_current_winsta_worker(main_hwnd as HWND);
+    // 图标抓取通过 SendMessageTimeoutW 完成，放在后台线程避免了 UI 卡顿。
+    // SMTO_ABORTIFHUNG 确保单次不超过 100ms；挂起的窗口会被跳过。
+    for task in &mut tasks {
+        let hwnd = task.hwnd as HWND;
+        task.small_icon = fetch_window_icon(hwnd, true) as isize;
+        task.large_icon = fetch_window_icon(hwnd, false) as isize;
+    }
+    tasks
 }
 
 fn collect_tasks_current_winsta(main_hwnd: HWND) -> Vec<WorkerTaskEntry> {
@@ -1229,17 +1248,17 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         return 1;
     }
 
-    let mut buffer = vec![0u16; 260];
+    let mut stack_buf = [0u16; 260];
     let length = InternalGetWindowText(
         hwnd,
-        buffer.as_mut_ptr(),
-        i32::try_from(buffer.len()).expect("InternalGetWindowText buffer length fits in i32"),
+        stack_buf.as_mut_ptr(),
+        i32::try_from(stack_buf.len()).expect("InternalGetWindowText buffer length fits in i32"),
     );
     let Ok(length) = usize::try_from(length) else {
         return 1;
     };
 
-    let title = String::from_utf16_lossy(&buffer[..length]);
+    let title = String::from_utf16_lossy(&stack_buf[..length]);
     if title.is_empty() || title.eq_ignore_ascii_case("Program Manager") {
         return 1;
     }
@@ -1268,6 +1287,8 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         winstation: context.winstation.clone(),
         desktop: context.desktop.clone(),
         is_hung: IsHungAppWindow(hwnd) != 0,
+        small_icon: 0,
+        large_icon: 0,
     });
     1
 }
@@ -1373,7 +1394,7 @@ fn query_window_icon(hwnd: HWND, icon_type: usize) -> HICON {
             WM_GETICON,
             icon_type,
             0,
-            SMTO_BLOCK | SMTO_ABORTIFHUNG,
+            SMTO_NORMAL | SMTO_ABORTIFHUNG,
             ICON_FETCH_TIMEOUT_MS,
             &mut result,
         );
@@ -1453,6 +1474,30 @@ fn add_icon(imagelist: HIMAGELIST, icon: HICON, default_icon: HICON) -> usize {
     }
 }
 
+fn normalize_removed_icon_indices(indices: &mut Vec<usize>) {
+    indices.retain(|index| *index > 0);
+    indices.sort_unstable();
+    indices.dedup();
+}
+
+unsafe fn remove_imagelist_indices(imagelist: HIMAGELIST, indices: &[usize]) {
+    for &index in indices.iter().rev() {
+        ImageList_Remove(imagelist, index as i32);
+    }
+}
+
+fn adjusted_icon_index(index: usize, removed_indices: &[usize]) -> usize {
+    if index == 0 {
+        return 0;
+    }
+
+    let removed_before = removed_indices
+        .iter()
+        .take_while(|&&removed| removed < index)
+        .count();
+    index.saturating_sub(removed_before)
+}
+
 impl TaskEntry {
     fn from_worker(
         worker: WorkerTaskEntry,
@@ -1501,3 +1546,24 @@ fn update_task_entry(task: &mut TaskEntry, worker: &WorkerTaskEntry, pass_count:
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_removed_icon_indices_keeps_sorted_unique_non_default_indices() {
+        let mut indices = vec![5, 0, 2, 5, 1];
+        normalize_removed_icon_indices(&mut indices);
+
+        assert_eq!(indices, vec![1, 2, 5]);
+    }
+
+    #[test]
+    fn adjusted_icon_index_accounts_for_lower_removed_indices() {
+        let removed = vec![1, 3, 7];
+
+        assert_eq!(adjusted_icon_index(0, &removed), 0);
+        assert_eq!(adjusted_icon_index(2, &removed), 1);
+        assert_eq!(adjusted_icon_index(8, &removed), 5);
+    }
+}

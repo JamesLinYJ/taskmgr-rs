@@ -14,7 +14,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     CombineRgn, CreateRectRgn, CreateSolidBrush, DeleteObject, FillRgn, GetSysColor,
-    InvalidateRect, MapWindowPoints, SetRectRgn, UpdateWindow, COLOR_WINDOW, HBRUSH, HDC, HRGN, RGN_DIFF, RGN_OR,
+    InvalidateRect, MapWindowPoints, SetRectRgn, UpdateWindow, COLOR_WINDOW, HBRUSH, HDC, HRGN,
+    RGN_DIFF, RGN_OR,
 };
 use windows_sys::Win32::System::RemoteDesktop::WTSFreeMemory;
 use windows_sys::Win32::System::Threading::{
@@ -23,9 +24,9 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Controls::{LVIR_BOUNDS, LVM_GETITEMCOUNT, LVM_GETITEMRECT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, DeleteMenu, DestroyIcon, DestroyMenu, GetClientRect, GetSystemMetrics,
-    GetWindowLongPtrW, GetWindowRect, SendMessageW, SetWindowLongPtrW,
-    DWLP_MSGRESULT, GWLP_USERDATA, GWLP_WNDPROC, GWL_STYLE, HICON, HMENU, MF_BYCOMMAND,
-    SM_CXEDGE, WM_ERASEBKGND, WM_NCDESTROY, WM_SETREDRAW, WM_SYSCOLORCHANGE, WNDPROC,
+    GetWindowLongPtrW, GetWindowRect, SendMessageW, SetWindowLongPtrW, DWLP_MSGRESULT,
+    GWLP_USERDATA, GWLP_WNDPROC, GWL_STYLE, HICON, HMENU, MF_BYCOMMAND, SM_CXEDGE, WM_ERASEBKGND,
+    WM_NCDESTROY, WM_SETREDRAW, WM_SYSCOLORCHANGE, WNDPROC,
 };
 
 use crate::language::{text, TextKey};
@@ -79,10 +80,6 @@ impl<T> Drop for OwnedWtsMemory<T> {
 impl OwnedHandle {
     pub fn new(handle: HANDLE) -> Option<Self> {
         (!handle.is_null() && handle != INVALID_HANDLE_VALUE).then_some(Self { handle })
-    }
-
-    pub fn from_snapshot(handle: HANDLE) -> Option<Self> {
-        Self::new(handle)
     }
 
     pub fn as_raw(&self) -> HANDLE {
@@ -358,7 +355,7 @@ pub fn wndproc_to_isize(wndproc: WNDPROC) -> isize {
 
 type RawWndProc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> isize;
 
-pub unsafe fn wndproc_from_isize(value: isize) -> WNDPROC {
+unsafe fn wndproc_from_isize(value: isize) -> WNDPROC {
     if value == 0 {
         None
     } else {
@@ -393,7 +390,7 @@ fn set_rect_rgn_indirect(region: HRGN, rect: &RECT) {
 }
 
 fn list_view_get_view_rgn(hwnd: HWND, state: &mut ListViewPaintState) {
-    // 这里把“所有可视项区域”合成为一个区域，
+    // 这里把”所有可视项区域”合成为一个区域，
     // 让背景擦除只覆盖真正的空白区，而不是先把选中行也擦掉。
     state.ensure_resources();
     if state.view_rgn.is_null() || state.clip_rgn.is_null() {
@@ -532,9 +529,10 @@ pub fn copy_text_to_callback_buffer(buffer: *mut u16, capacity: usize, text: &st
     }
 }
 
-pub fn widestr_ptr_to_string(ptr: *const u16) -> String {
-    // SAFETY: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
-    unsafe {
+pub unsafe fn widestr_ptr_to_string(ptr: *const u16) -> String {
+    // SAFETY: callers must pass a valid pointer to a NUL-terminated UTF-16 string.
+    // The function reads up to MAX_WIDE_CHARS code units before stopping.
+    {
         if ptr.is_null() {
             return String::new();
         }

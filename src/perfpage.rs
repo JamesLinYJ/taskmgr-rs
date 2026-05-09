@@ -7,24 +7,24 @@ use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC,
-    DeleteObject, DrawTextW, GetDC, GetStockObject,
-    InvalidateRect, Rectangle, RedrawWindow, ReleaseDC,
-    SelectObject, SetBkMode, SetTextColor, UpdateWindow, BLACK_BRUSH, DT_BOTTOM, DT_CENTER, DT_SINGLELINE, HBITMAP, HBRUSH, HDC, HGDIOBJ, RDW_ERASE, RDW_INVALIDATE, RDW_NOCHILDREN, RDW_UPDATENOW, SRCCOPY, TRANSPARENT,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, DrawTextW, GetDC,
+    GetStockObject, InvalidateRect, Rectangle, RedrawWindow, ReleaseDC, SelectObject, SetBkMode,
+    SetTextColor, UpdateWindow, BLACK_BRUSH, DT_BOTTOM, DT_CENTER, DT_SINGLELINE, HBITMAP, HBRUSH,
+    HDC, HGDIOBJ, RDW_ERASE, RDW_INVALIDATE, RDW_NOCHILDREN, RDW_UPDATENOW, SRCCOPY, TRANSPARENT,
 };
 use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetClientRect, GetDialogBaseUnits,
-    GetDlgCtrlID, GetDlgItem, IsIconic, IsWindowVisible, SendMessageW, ShowWindow, HDWP, SWP_NOACTIVATE, SWP_NOREDRAW, SWP_NOSIZE,
-    SWP_NOZORDER, SW_HIDE, SW_SHOW, WM_SETREDRAW,
+    GetDlgCtrlID, GetDlgItem, IsIconic, IsWindowVisible, SendMessageW, ShowWindow, HDWP,
+    SWP_NOACTIVATE, SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WM_SETREDRAW,
 };
 
 use crate::assets::load_bitmap_from_file;
-use crate::drawing::{fill_black, push_history, rgb};
 use crate::chart_renderer::{ChartColor, ChartRenderer};
+use crate::drawing::{fill_black, push_history, rgb};
 use crate::options::{CpuHistoryMode, Options};
 use crate::perf_drawing::{
-    average_history, current_font_height, defer_resize, draw_grid_width, draw_grid_width_gpu,
+    average_history_into, current_font_height, defer_resize, draw_grid_width, draw_grid_width_gpu,
     draw_history_series, draw_history_series_gpu, draw_meter, format_mem_meter_text,
     set_numeric_text, HistoryPlotLayout, HistorySeries, GRAPH_GRID, HIST_SIZE,
 };
@@ -164,6 +164,9 @@ pub struct PerformancePageState {
     cpu_history: Vec<Vec<u8>>,
     kernel_history: Vec<Vec<u8>>,
     mem_history: Vec<u8>,
+    processor_info: Vec<SystemProcessorPerformanceInformation>,
+    cached_averaged_cpu: Vec<u8>,
+    cached_averaged_kernel: Vec<u8>,
     strip_lit_bitmap: HBITMAP,
     strip_lit_red_bitmap: HBITMAP,
     strip_unlit_bitmap: HBITMAP,
@@ -349,13 +352,12 @@ impl PerformancePageState {
                         },
                     );
                 } else {
-                    let averaged_kernel = average_history(&self.kernel_history);
                     draw_history_series(
                         target_hdc,
                         &target_rect,
                         plot_layout,
                         HistorySeries {
-                            history: &averaged_kernel,
+                            history: &self.cached_averaged_kernel,
                             color: ChartColor::Red,
                             stop_on_zero: false,
                         },
@@ -375,13 +377,12 @@ impl PerformancePageState {
                     },
                 );
             } else {
-                let averaged_cpu = average_history(&self.cpu_history);
                 draw_history_series(
                     target_hdc,
                     &target_rect,
                     plot_layout,
                     HistorySeries {
-                        history: &averaged_cpu,
+                        history: &self.cached_averaged_cpu,
                         color: ChartColor::Green,
                         stop_on_zero: false,
                     },
@@ -498,13 +499,12 @@ impl PerformancePageState {
                     },
                 );
             } else {
-                let averaged_kernel = average_history(&self.kernel_history);
                 draw_history_series_gpu(
                     &frame,
                     &target_rect,
                     plot_layout,
                     HistorySeries {
-                        history: &averaged_kernel,
+                        history: &self.cached_averaged_kernel,
                         color: ChartColor::Red,
                         stop_on_zero: false,
                     },
@@ -524,13 +524,12 @@ impl PerformancePageState {
                 },
             );
         } else {
-            let averaged_cpu = average_history(&self.cpu_history);
             draw_history_series_gpu(
                 &frame,
                 &target_rect,
                 plot_layout,
                 HistorySeries {
-                    history: &averaged_cpu,
+                    history: &self.cached_averaged_cpu,
                     color: ChartColor::Green,
                     stop_on_zero: false,
                 },
@@ -863,12 +862,15 @@ impl PerformancePageState {
         unsafe {
             // 内核返回的是累积 CPU 时间，所以这里必须与上一轮做差，
             // 再换算成本轮使用率和内核时间占比。
-            let mut processor_info =
-                vec![SystemProcessorPerformanceInformation::default(); self.processor_count];
+            self.processor_info.resize(
+                self.processor_count,
+                SystemProcessorPerformanceInformation::default(),
+            );
             let status = NtQuerySystemInformation(
                 SystemInformationClass::ProcessorPerformanceInformation as i32,
-                processor_info.as_mut_ptr() as *mut c_void,
-                (processor_info.len() * size_of::<SystemProcessorPerformanceInformation>()) as u32,
+                self.processor_info.as_mut_ptr() as *mut c_void,
+                (self.processor_info.len() * size_of::<SystemProcessorPerformanceInformation>())
+                    as u32,
                 null_mut(),
             );
             if status < 0 {
@@ -879,7 +881,7 @@ impl PerformancePageState {
             let mut sum_total = 0i64;
             let mut sum_kernel = 0i64;
 
-            for (index, entry) in processor_info.iter().enumerate() {
+            for (index, entry) in self.processor_info.iter().enumerate() {
                 let idle_time = entry.idle_time;
                 let kernel_time = entry.kernel_time.saturating_sub(entry.idle_time);
                 let total_time = entry.kernel_time.saturating_add(entry.user_time);
@@ -922,6 +924,9 @@ impl PerformancePageState {
                 0
             };
         }
+        // Pre-compute averaged histories once per tick rather than on every paint.
+        average_history_into(&self.cpu_history, &mut self.cached_averaged_cpu);
+        average_history_into(&self.kernel_history, &mut self.cached_averaged_kernel);
     }
 
     fn refresh_system_info(&mut self, hwnd_page: HWND) {

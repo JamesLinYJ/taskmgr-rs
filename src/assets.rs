@@ -57,9 +57,6 @@ fn candidate_roots() -> Vec<PathBuf> {
             current = path.parent().map(Path::to_path_buf);
         }
     }
-    if let Ok(current_dir) = env::current_dir() {
-        roots.push(current_dir);
-    }
     roots
 }
 

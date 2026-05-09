@@ -1,9 +1,9 @@
 // 跨图表复用的 GDI 绘图工具。
 // 性能页和网络页共享这些底层绘制原语，避免代码重复。
+use windows_sys::Win32::Foundation::RECT;
 use windows_sys::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, FillRect, GetStockObject, BLACK_BRUSH, HBRUSH, HDC,
 };
-use windows_sys::Win32::Foundation::RECT;
 
 pub fn push_history(history: &mut [u8], value: u8) {
     // 历史值按"最新在前"滚动，绘图时就可以直接从右向左连接。

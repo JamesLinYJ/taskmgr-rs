@@ -40,21 +40,21 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, DrawMenuBar, EnableMenuItem, FindWindowW, GetClassInfoW, GetClientRect,
     GetCursorPos, GetDlgItem, GetForegroundWindow, GetMenu, GetMenuItemInfoW, GetMessageW,
     GetShellWindow, GetWindowLongW, GetWindowPlacement, GetWindowRect, IsDialogMessageW, IsIconic,
-    IsWindowVisible, IsZoomed, KillTimer, MessageBoxW, OpenIcon, PostQuitMessage, RegisterClassW,
-    SendMessageTimeoutW, SendMessageW, SetForegroundWindow, SetMenu, SetMenuDefaultItem, SetTimer,
-    SetWindowLongW, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenuEx,
-    TranslateAcceleratorW, TranslateMessage, GWL_STYLE, HACCEL, HELP_FINDER, HICON, HMENU,
-    HTCAPTION, HTCLIENT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDCANCEL, LR_DEFAULTCOLOR,
-    LR_DEFAULTSIZE, MB_ICONSTOP, MB_OK, MENUITEMINFOW, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED,
-    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_SYSMENU, MF_UNCHECKED, MIIM_ID, MINMAXINFO, MSG,
-    SIZE_MINIMIZED, SMTO_ABORTIFHUNG, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREDRAW,
-    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_MINIMIZE, SW_SHOW, SW_SHOWMAXIMIZED, SW_SHOWMINNOACTIVE,
-    SW_SHOWNOACTIVATE, TPM_RETURNCMD, WINDOWPLACEMENT, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY,
-    WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITDIALOG, WM_INITMENU, WM_LBUTTONDBLCLK,
-    WM_MENUSELECT, WM_MOVE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP,
-    WM_NOTIFY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETICON, WM_SETREDRAW, WM_SIZE, WM_TIMER,
-    WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_DLGFRAME, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
-    WS_POPUP, WS_SYSMENU, WS_TILEDWINDOW, WS_VISIBLE,
+    IsWindowVisible, IsZoomed, KillTimer, MessageBoxW, OpenIcon, PostMessageW, PostQuitMessage,
+    RegisterClassW, SendMessageTimeoutW, SendMessageW, SetForegroundWindow, SetMenu,
+    SetMenuDefaultItem, SetTimer, SetWindowLongW, SetWindowPos, SetWindowTextW, ShowWindow,
+    TrackPopupMenuEx, TranslateAcceleratorW, TranslateMessage, GWL_STYLE, HACCEL, HELP_FINDER,
+    HICON, HMENU, HTCAPTION, HTCLIENT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDCANCEL,
+    LR_DEFAULTCOLOR, LR_DEFAULTSIZE, MB_ICONSTOP, MB_OK, MENUITEMINFOW, MF_BYCOMMAND, MF_CHECKED,
+    MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_SYSMENU, MF_UNCHECKED, MIIM_ID, MINMAXINFO,
+    MSG, SIZE_MINIMIZED, SMTO_ABORTIFHUNG, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_MINIMIZE, SW_SHOW, SW_SHOWMAXIMIZED,
+    SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, TPM_RETURNCMD, WINDOWPLACEMENT, WM_CLOSE, WM_COMMAND,
+    WM_CREATE, WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITDIALOG,
+    WM_INITMENU, WM_LBUTTONDBLCLK, WM_MENUSELECT, WM_MOVE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK,
+    WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETICON,
+    WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_DLGFRAME,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_TILEDWINDOW, WS_VISIBLE,
 };
 
 use crate::app_controllers::{
@@ -208,11 +208,13 @@ type RunFileDialogFn =
     unsafe extern "system" fn(HWND, HICON, *const u16, *const u16, *const u16, u32) -> i32;
 
 fn load_run_file_dialog(shell32: HMODULE) -> Option<RunFileDialogFn> {
-    // SAFETY: `shell32` is a module handle returned by `LoadLibraryW`; ordinal 61 is the
-    // documented-by-practice `RunFileDlg` export used by the classic Task Manager path.
+    // SAFETY: `shell32` is a module handle returned by `LoadLibraryW`.
+    // Ordinal 61 is the only way to import `RunFileDlg` from shell32 — it is not
+    // exported by name. This ordinal has been stable on all Windows versions since
+    // Windows 2000 and is the same mechanism the original Task Manager uses.
     let proc_address = unsafe { GetProcAddress(shell32, 61usize as *const u8) }?;
-    // SAFETY: ordinal 61 in shell32 exports `RunFileDlg` with this exact callback signature
-    // on the Win32 platform variants supported by this application.
+    // SAFETY: ordinal 61 in shell32 exports `RunFileDlg` with this callback signature
+    // on all Win32 platform variants supported by this application.
     Some(unsafe {
         std::mem::transmute::<unsafe extern "system" fn() -> isize, RunFileDialogFn>(proc_address)
     })
@@ -291,6 +293,8 @@ impl App {
         // SAFETY: the main HWND is live after successful dialog creation.
         unsafe { ShowWindow(self.main_hwnd, SW_SHOW) };
         self.release_startup_mutex();
+        // Defer icon loading to after first paint so the window appears instantly.
+        unsafe { PostMessageW(self.main_hwnd, PWM_DEFERREDINIT, 0, 0) };
 
         // SAFETY: message loop runs on the UI thread; `message` is a valid MSG buffer for all
         // synchronous Win32 message APIs used inside the loop.
@@ -462,7 +466,6 @@ impl App {
         self.strings.fmt_procs = text(TextKey::FormatProcesses).to_string();
         self.strings.fmt_cpu = text(TextKey::FormatCpuUsage).to_string();
         self.strings.fmt_mem = text(TextKey::FormatMemoryUsage).to_string();
-        self.tray.load_icons();
     }
 
     fn query_processor_count(&self) -> u8 {
@@ -522,16 +525,6 @@ impl App {
             }
 
             self.set_window_title();
-
-            let icon_handle =
-                load_icon_from_file("main.ico", 0, 0, LR_DEFAULTCOLOR | LR_DEFAULTSIZE);
-            if !icon_handle.is_null() {
-                SendMessageW(hwnd, WM_SETICON, 1, icon_handle as LPARAM);
-            }
-
-            if let Some(first_icon) = self.tray.first_icon() {
-                self.update_tray(NIM_ADD, first_icon, "");
-            }
 
             let tabs_hwnd = GetDlgItem(hwnd, IDC_TABS);
             for (index, page) in self.pages.iter_mut().enumerate() {
@@ -1657,6 +1650,20 @@ unsafe extern "system" fn main_window_proc(
         WM_INITMENU => application.on_init_menu(),
         WM_FINDPROC => application.on_find_process(wparam as u32, lparam as u32),
         PWM_INPOPUP => application.on_popup_state(wparam != 0),
+        PWM_DEFERREDINIT => {
+            application.tray.load_icons();
+            // SAFETY: main HWND is live; icon and tray setup after deferred icon loading.
+            unsafe {
+                let icon = load_icon_from_file("main.ico", 0, 0, LR_DEFAULTCOLOR | LR_DEFAULTSIZE);
+                if !icon.is_null() {
+                    SendMessageW(hwnd, WM_SETICON, 1, icon as LPARAM);
+                }
+                if let Some(first_icon) = application.tray.first_icon() {
+                    application.update_tray(NIM_ADD, first_icon, "");
+                }
+            }
+            0
+        }
         WM_GETMINMAXINFO => {
             if !application.options.no_title() {
                 let info = &mut *(lparam as *mut MINMAXINFO);

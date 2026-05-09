@@ -108,12 +108,12 @@ impl PageState {
             Self::Process(state) => unsafe {
                 state.apply_options(options, processor_count);
                 state.timer_event(options);
-            }
+            },
             Self::Performance(state) => state.timer_event(hwnd, main_hwnd),
             Self::Network(state) => unsafe {
                 state.apply_options(options);
                 state.timer_event();
-            }
+            },
             Self::Users(state) => {
                 state.apply_options(options);
                 state.timer_event();
@@ -123,7 +123,9 @@ impl PageState {
 
     fn deactivate(&mut self, options: &mut Options) {
         if let Self::Process(state) = self {
-            unsafe { state.deactivate(options); }
+            unsafe {
+                state.deactivate(options);
+            }
         }
     }
 
@@ -149,7 +151,7 @@ impl PageState {
             Self::Process(state) => unsafe {
                 state.handle_command(command_id, options);
                 true
-            }
+            },
             _ => false,
         }
     }
@@ -197,11 +199,11 @@ impl PageState {
             Self::Process(state) => unsafe {
                 let _ = state.initialize(hinstance, hwnd, main_hwnd);
                 1
-            }
+            },
             Self::Network(state) => unsafe {
                 state.initialize(hwnd, main_hwnd, hwnd_tabs);
                 1
-            }
+            },
             Self::Users(state) => {
                 state.initialize(hwnd);
                 1
@@ -219,7 +221,7 @@ impl PageState {
             Self::Process(state) => unsafe {
                 state.handle_command(command_id, None);
                 1
-            }
+            },
             Self::Users(state) => isize::from(state.handle_command(command_id)),
             _ => 0,
         }
@@ -945,7 +947,7 @@ unsafe extern "system" fn network_page_proc(
                     return 0;
                 }
 
-                let PageState::Network(net_state) = &(*page).state else {
+                let PageState::Network(net_state) = &mut (*page).state else {
                     return 0;
                 };
                 let draw_item = &*(lparam as *const DRAWITEMSTRUCT);

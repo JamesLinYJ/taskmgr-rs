@@ -10,9 +10,10 @@ use std::time::Instant;
 use windows_sys::Win32::Foundation::{HWND, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen, DeleteDC, DeleteObject,
-    DrawTextW, FillRect, GetStockObject, InvalidateRect, LineTo, MapWindowPoints, MoveToEx,
-    SelectObject, SetBkMode, SetTextColor, UpdateWindow, BLACK_BRUSH, DT_CALCRECT, DT_NOPREFIX,
-    DT_RIGHT, DT_SINGLELINE, DT_TOP, HBRUSH, HDC, PS_SOLID, SRCCOPY, TRANSPARENT,
+    DrawTextW, FillRect, GetDC, GetStockObject, InvalidateRect, LineTo, MapWindowPoints, MoveToEx,
+    ReleaseDC, SelectObject, SetBkMode, SetTextColor, UpdateWindow, BLACK_BRUSH, DT_CALCRECT,
+    DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, HBITMAP, HBRUSH, HDC, HGDIOBJ, PS_SOLID, SRCCOPY,
+    TRANSPARENT,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     FreeMibTable, GetIfTable2, IF_TYPE_SOFTWARE_LOOPBACK, IF_TYPE_TUNNEL, MIB_IF_ROW2,
@@ -114,6 +115,11 @@ pub struct NetworkPageState {
     first_visible_adapter: usize,
     scroll_offset: i32,
     last_sample_time: Option<Instant>,
+    cached_graph_dc: HDC,
+    cached_graph_bitmap: HBITMAP,
+    cached_graph_bitmap_old: HGDIOBJ,
+    cached_graph_width: i32,
+    cached_graph_height: i32,
 }
 
 impl NetworkPageState {
@@ -163,6 +169,46 @@ impl NetworkPageState {
         self.destroy_graphs();
     }
 
+    unsafe fn ensure_graph_surface(&mut self, width: i32, height: i32) -> bool {
+        if self.cached_graph_dc.is_null()
+            || width > self.cached_graph_width
+            || height > self.cached_graph_height
+        {
+            if !self.cached_graph_bitmap_old.is_null() {
+                SelectObject(self.cached_graph_dc, self.cached_graph_bitmap_old);
+            }
+            if !self.cached_graph_bitmap.is_null() {
+                DeleteObject(self.cached_graph_bitmap as _);
+            }
+            if !self.cached_graph_dc.is_null() {
+                DeleteDC(self.cached_graph_dc);
+            }
+            let screen_dc = GetDC(null_mut());
+            if screen_dc.is_null() {
+                return false;
+            }
+            self.cached_graph_dc = CreateCompatibleDC(screen_dc);
+            self.cached_graph_bitmap = CreateCompatibleBitmap(screen_dc, width, height);
+            ReleaseDC(null_mut(), screen_dc);
+            if self.cached_graph_dc.is_null() || self.cached_graph_bitmap.is_null() {
+                if !self.cached_graph_dc.is_null() {
+                    DeleteDC(self.cached_graph_dc);
+                    self.cached_graph_dc = null_mut();
+                }
+                if !self.cached_graph_bitmap.is_null() {
+                    DeleteObject(self.cached_graph_bitmap as _);
+                    self.cached_graph_bitmap = null_mut();
+                }
+                return false;
+            }
+            self.cached_graph_bitmap_old =
+                SelectObject(self.cached_graph_dc, self.cached_graph_bitmap as _);
+            self.cached_graph_width = width;
+            self.cached_graph_height = height;
+        }
+        true
+    }
+
     pub fn graph_pane_index(&self, control_id: i32) -> Option<usize> {
         let pane_index = control_id.saturating_sub(IDC_NICGRAPH) as usize;
         if control_id >= IDC_NICGRAPH && pane_index < self.graphs.len() {
@@ -172,9 +218,14 @@ impl NetworkPageState {
         }
     }
 
-    pub unsafe fn draw_graph(&self, hdc: HDC, rect: RECT, pane_index: usize) {
+    pub unsafe fn draw_graph(&mut self, hdc: HDC, rect: RECT, pane_index: usize) {
         // 每个图表面板都根据当前适配器的历史数据独立绘制，
         // 但缩放规则保持一致，便于横向比较。
+        let width = (rect.right - rect.left).max(1);
+        let height = (rect.bottom - rect.top).max(1);
+        if !self.ensure_graph_surface(width, height) {
+            return;
+        }
         let adapter_index = pane_index.saturating_add(self.first_visible_adapter());
         let Some(adapter) = self.adapters.get(adapter_index) else {
             return;
@@ -185,20 +236,7 @@ impl NetworkPageState {
             return;
         }
 
-        let width = (rect.right - rect.left).max(1);
-        let height = (rect.bottom - rect.top).max(1);
-        let mem_dc = CreateCompatibleDC(hdc);
-        if mem_dc.is_null() {
-            return;
-        }
-
-        let bitmap = CreateCompatibleBitmap(hdc, width, height);
-        if bitmap.is_null() {
-            DeleteDC(mem_dc);
-            return;
-        }
-
-        let old_bitmap = SelectObject(mem_dc, bitmap as _);
+        let old_bitmap = SelectObject(self.cached_graph_dc, self.cached_graph_bitmap as _);
         let local_rect = RECT {
             left: 0,
             top: 0,
@@ -216,8 +254,8 @@ impl NetworkPageState {
             .unwrap_or(0);
         let scale_top = graph_scale_top_value(scale_max);
         let zoom = graph_zoom(scale_max);
-        fill_black(mem_dc, &local_rect);
-        let plot_left = draw_scale(mem_dc, &local_rect, scale_top);
+        fill_black(self.cached_graph_dc, &local_rect);
+        let plot_left = draw_scale(self.cached_graph_dc, &local_rect, scale_top);
         let plot_rect = RECT {
             left: (local_rect.left + plot_left).min(local_rect.right),
             top: local_rect.top,
@@ -226,23 +264,23 @@ impl NetworkPageState {
         };
 
         if plot_rect.right > plot_rect.left {
-            draw_grid(mem_dc, &plot_rect, self.scroll_offset, zoom);
+            draw_grid(self.cached_graph_dc, &plot_rect, self.scroll_offset, zoom);
             draw_history(
-                mem_dc,
+                self.cached_graph_dc,
                 &plot_rect,
                 &adapter.total_history,
                 rgb(0, 255, 0),
                 zoom,
             );
             draw_history(
-                mem_dc,
+                self.cached_graph_dc,
                 &plot_rect,
                 &adapter.received_history,
                 rgb(255, 255, 0),
                 zoom,
             );
             draw_history(
-                mem_dc,
+                self.cached_graph_dc,
                 &plot_rect,
                 &adapter.sent_history,
                 rgb(255, 0, 0),
@@ -251,11 +289,17 @@ impl NetworkPageState {
         }
 
         BitBlt(
-            hdc, rect.left, rect.top, width, height, mem_dc, 0, 0, SRCCOPY,
+            hdc,
+            rect.left,
+            rect.top,
+            width,
+            height,
+            self.cached_graph_dc,
+            0,
+            0,
+            SRCCOPY,
         );
-        SelectObject(mem_dc, old_bitmap);
-        DeleteObject(bitmap as _);
-        DeleteDC(mem_dc);
+        SelectObject(self.cached_graph_dc, old_bitmap);
     }
 
     unsafe fn draw_graph_gpu(&self, hdc: HDC, rect: RECT, adapter: &NetworkAdapterEntry) -> bool {
@@ -894,6 +938,20 @@ impl NetworkPageState {
                 DestroyWindow(graph.frame_hwnd);
             }
         }
+        if !self.cached_graph_bitmap_old.is_null() {
+            SelectObject(self.cached_graph_dc, self.cached_graph_bitmap_old);
+        }
+        if !self.cached_graph_bitmap.is_null() {
+            DeleteObject(self.cached_graph_bitmap as _);
+        }
+        if !self.cached_graph_dc.is_null() {
+            DeleteDC(self.cached_graph_dc);
+        }
+        self.cached_graph_dc = null_mut();
+        self.cached_graph_bitmap = null_mut();
+        self.cached_graph_bitmap_old = null_mut();
+        self.cached_graph_width = 0;
+        self.cached_graph_height = 0;
         self.graphs_per_page = 0;
         self.first_visible_adapter = 0;
     }
@@ -1033,11 +1091,9 @@ fn scrollbar_width() -> i32 {
 }
 
 fn push_history(history: &mut [u8], value: u8) {
-    // 与性能页一致，网络历史按“最新样本在前”滚动。
     if history.is_empty() {
         return;
     }
-
     history.copy_within(..history.len() - 1, 1);
     history[0] = value;
 }
