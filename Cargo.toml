@@ -3,6 +3,7 @@
 [package]
 name = "taskmgr"
 version = "0.1.1"
+license = "GPL-2.0-only"
 edition = "2021"
 build = "build.rs"
 exclude = [".claude/**", ".tmp-pip/**", ".tmp-tests/**", ".vs/**"]
@@ -13,7 +14,7 @@ ProductName = "Windows NT Task Manager"
 InternalName = "taskmgr"
 OriginalFilename = "taskmgr.exe"
 CompanyName = "JamesLinYJ"
-LegalCopyright = "GPL v2"
+LegalCopyright = "GNU General Public License v2.0"
 
 # 发布配置偏向生成体积更小、更接近系统工具风格的可执行文件。
 [profile.release]

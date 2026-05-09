@@ -91,6 +91,7 @@ fn main() {
     generate_localization();
 
     // 资源和 manifest 变化后都需要触发重新构建。
+    println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=sysmon.manifest");
     println!("cargo:rerun-if-changed=main.ico");
 
