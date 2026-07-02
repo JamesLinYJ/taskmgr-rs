@@ -130,36 +130,44 @@ impl Direct2DRenderer {
             self.target.BindDC(WinHdc(hdc as _), &rect).ok()?;
             self.target.BeginDraw();
 
-            let black = self
-                .target
-                .CreateSolidColorBrush(&color(0, 0, 0), None)
-                .ok()?;
-            let green = self
-                .target
-                .CreateSolidColorBrush(&color(0, 255, 0), None)
-                .ok()?;
-            let yellow = self
-                .target
-                .CreateSolidColorBrush(&color(255, 255, 0), None)
-                .ok()?;
-            let red = self
-                .target
-                .CreateSolidColorBrush(&color(255, 0, 0), None)
-                .ok()?;
-            let grid = self
-                .target
-                .CreateSolidColorBrush(&color(0, 128, 64), None)
-                .ok()?;
+            let frame = (|| {
+                let black = self
+                    .target
+                    .CreateSolidColorBrush(&color(0, 0, 0), None)
+                    .ok()?;
+                let green = self
+                    .target
+                    .CreateSolidColorBrush(&color(0, 255, 0), None)
+                    .ok()?;
+                let yellow = self
+                    .target
+                    .CreateSolidColorBrush(&color(255, 255, 0), None)
+                    .ok()?;
+                let red = self
+                    .target
+                    .CreateSolidColorBrush(&color(255, 0, 0), None)
+                    .ok()?;
+                let grid = self
+                    .target
+                    .CreateSolidColorBrush(&color(0, 128, 64), None)
+                    .ok()?;
 
-            Some(ChartFrame {
-                renderer: self,
-                black,
-                green,
-                yellow,
-                red,
-                grid,
-                rect: local_rect,
-            })
+                Some(ChartFrame {
+                    renderer: self,
+                    black,
+                    green,
+                    yellow,
+                    red,
+                    grid,
+                    rect: local_rect,
+                })
+            })();
+
+            if frame.is_none() {
+                let _ = self.target.EndDraw(None, None);
+            }
+
+            frame
         }
     }
 }

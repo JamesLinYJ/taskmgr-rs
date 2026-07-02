@@ -33,6 +33,7 @@ use crate::resource::{
     IDC_CPUMETER, IDC_MEMGRAPH, IDC_MEMMETER, IDC_NICTOTALS, IDC_PROCLIST, IDC_TASKLIST,
     IDC_USERLIST, IDD_NETPAGE, IDD_PERFPAGE, IDD_PROCPAGE, IDD_TASKPAGE, IDD_USERSPAGE,
     IDR_MAINMENU_NET, IDR_MAINMENU_PERF, IDR_MAINMENU_PROC, IDR_MAINMENU_TASK, IDR_MAINMENU_USER,
+    PWM_PROC_REFRESH_COMPLETE, PWM_TASK_REFRESH_COMPLETE,
 };
 use crate::taskpage::TaskPageState;
 use crate::userpage::UserPageState;
@@ -47,7 +48,7 @@ enum PageFocusTarget {
 
 enum PageState {
     Task(TaskPageState),
-    Process(ProcessPageState),
+    Process(Box<ProcessPageState>),
     Performance(PerformancePageState),
     Network(NetworkPageState),
     Users(UserPageState),
@@ -236,6 +237,20 @@ impl PageState {
         }
     }
 
+    fn handle_task_refresh_complete(&mut self, seq: u64) -> isize {
+        match self {
+            Self::Task(state) => state.handle_refresh_complete(seq),
+            _ => 0,
+        }
+    }
+
+    unsafe fn handle_process_refresh_complete(&mut self, seq: u64) -> isize {
+        match self {
+            Self::Process(state) => state.handle_refresh_complete(seq),
+            _ => 0,
+        }
+    }
+
     fn handle_context_menu(&mut self, hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
         match self {
             Self::Task(state) if wparam as HWND == unsafe { GetDlgItem(hwnd, IDC_TASKLIST) } => {
@@ -324,7 +339,7 @@ impl DialogPage {
             menu_id: IDR_MAINMENU_PROC,
             title_key: TextKey::ProcessesPageTitle,
             initial_focus: PageFocusTarget::Tabs,
-            state: PageState::Process(ProcessPageState::new()),
+            state: PageState::Process(Box::new(ProcessPageState::new())),
         }
     }
 
@@ -708,6 +723,13 @@ unsafe extern "system" fn task_page_proc(
                     (*page).state.handle_notify(lparam)
                 }
             }
+            PWM_TASK_REFRESH_COMPLETE => {
+                if page.is_null() {
+                    0
+                } else {
+                    (*page).state.handle_task_refresh_complete(wparam as u64)
+                }
+            }
             WM_CONTEXTMENU => {
                 if page.is_null() {
                     0
@@ -780,6 +802,13 @@ unsafe extern "system" fn proc_page_proc(
                     (*page).state.handle_notify(lparam)
                 }
             }
+            PWM_PROC_REFRESH_COMPLETE => {
+                if page.is_null() {
+                    0
+                } else {
+                    (*page).state.handle_process_refresh_complete(wparam as u64)
+                }
+            }
             WM_CONTEXTMENU => {
                 if page.is_null() {
                     0
@@ -849,7 +878,7 @@ unsafe extern "system" fn performance_page_proc(
                 0
             }
             WM_DRAWITEM => {
-                if page.is_null() {
+                if page.is_null() || lparam == 0 {
                     return 0;
                 }
 

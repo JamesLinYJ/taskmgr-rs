@@ -1,4 +1,3 @@
-use std::cmp::Reverse;
 use std::collections::HashMap;
 
 // 用户页实现。
@@ -9,6 +8,7 @@ use std::ptr::null_mut;
 use std::slice;
 
 use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 
 use windows_sys::Win32::System::RemoteDesktop::{
     WTSActive, WTSClientName, WTSConnectQuery, WTSConnected, WTSDisconnectSession, WTSDisconnected,
@@ -44,20 +44,25 @@ use crate::resource::{
     IDM_SENDMESSAGE, IDM_SHOWDOMAINNAMES, IDR_USER_CONTEXT,
 };
 use crate::winutil::{
-    destroy_menu_handle, finish_list_view_update, get_window_userdata, loword, set_window_userdata,
-    subclass_list_view, to_wide_null, widestr_ptr_to_string, window_rect_relative_to_page,
-    OwnedWtsMemory,
+    destroy_menu_handle, finish_list_view_update_deferred, get_window_userdata, loword,
+    set_window_userdata, subclass_list_view, to_wide_null, widestr_ptr_to_string,
+    window_rect_relative_to_page, ListViewDirtyRange, OwnedWtsMemory,
 };
 const DEFSPACING_BASE: i32 = 3;
 const DLG_SCALE_X: i32 = 4;
 
+#[derive(Clone)]
 struct UserSessionEntry {
     // `UserSessionEntry` 保存一行用户/会话信息以及最小重绘所需的脏标志。
     session_id: u32,
     display_name: String,
+    display_name_lower: String,
     status: String,
+    status_lower: String,
     client_name: String,
+    client_name_lower: String,
     session_name: String,
+    session_name_lower: String,
     dirty: bool,
 }
 
@@ -344,16 +349,23 @@ impl UserPageState {
                     format!("{domain_name}\\{user_name}")
                 };
 
+                let status = session_state_text(session.State);
+                let client_name = if client_name.is_empty() {
+                    "-".to_string()
+                } else {
+                    client_name
+                };
+                let session_name = widestr_ptr_to_string(session.pWinStationName);
                 let mut entry = UserSessionEntry {
                     session_id: session.SessionId,
+                    display_name_lower: display_name.to_lowercase(),
+                    status_lower: status.to_lowercase(),
+                    client_name_lower: client_name.to_lowercase(),
+                    session_name_lower: session_name.to_lowercase(),
                     display_name,
-                    status: session_state_text(session.State),
-                    client_name: if client_name.is_empty() {
-                        "-".to_string()
-                    } else {
-                        client_name
-                    },
-                    session_name: widestr_ptr_to_string(session.pWinStationName),
+                    status,
+                    client_name,
+                    session_name,
                     dirty: true,
                 };
                 if let Some(previous) = previous_sessions.remove(&entry.session_id) {
@@ -365,42 +377,9 @@ impl UserPageState {
                 sessions.push(entry);
             }
 
-            match self.sort_column {
-                1 => sessions.sort_by(|left, right| {
-                    compare_user_sessions(left, right, self.sort_column, self.sort_ascending)
-                }),
-                2 => {
-                    if self.sort_ascending {
-                        sessions.sort_by_cached_key(|entry| entry.status.to_lowercase());
-                    } else {
-                        sessions.sort_by_cached_key(|entry| Reverse(entry.status.to_lowercase()));
-                    }
-                }
-                3 => {
-                    if self.sort_ascending {
-                        sessions.sort_by_cached_key(|entry| entry.client_name.to_lowercase());
-                    } else {
-                        sessions
-                            .sort_by_cached_key(|entry| Reverse(entry.client_name.to_lowercase()));
-                    }
-                }
-                4 => {
-                    if self.sort_ascending {
-                        sessions.sort_by_cached_key(|entry| entry.session_name.to_lowercase());
-                    } else {
-                        sessions
-                            .sort_by_cached_key(|entry| Reverse(entry.session_name.to_lowercase()));
-                    }
-                }
-                _ => {
-                    if self.sort_ascending {
-                        sessions.sort_by_cached_key(|entry| entry.display_name.to_lowercase());
-                    } else {
-                        sessions
-                            .sort_by_cached_key(|entry| Reverse(entry.display_name.to_lowercase()));
-                    }
-                }
-            }
+            sessions.sort_by(|left, right| {
+                compare_user_sessions(left, right, self.sort_column, self.sort_ascending)
+            });
             self.sessions = sessions;
             self.update_listview();
 
@@ -422,13 +401,12 @@ impl UserPageState {
                 return;
             }
 
-            SendMessageW(list, WM_SETREDRAW, 0, 0);
-
             let mut existing_count = SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) as usize;
             let common_count = existing_count.min(self.sessions.len());
+            let mut current_session_ids = Vec::with_capacity(common_count);
+            let mut structure_changed = existing_count != self.sessions.len();
 
             for index in 0..common_count {
-                let session = &self.sessions[index];
                 let mut current_item = LVITEMW {
                     mask: LVIF_PARAM,
                     iItem: index as i32,
@@ -442,11 +420,26 @@ impl UserPageState {
                     } else {
                         None
                     };
+                if current_session_id != Some(self.sessions[index].session_id) {
+                    structure_changed = true;
+                }
+                current_session_ids.push(current_session_id);
+            }
 
+            if structure_changed {
+                SendMessageW(list, WM_SETREDRAW, 0, 0);
+            }
+
+            let mut dirty_rows = ListViewDirtyRange::default();
+
+            for (index, current_session_id) in current_session_ids.iter().copied().enumerate() {
+                let session = &self.sessions[index];
                 if current_session_id != Some(session.session_id) {
                     self.replace_row(list, index, session);
+                    dirty_rows.mark(index);
                 } else if session.dirty {
                     self.update_row(list, index, session);
+                    dirty_rows.mark(index);
                 }
             }
 
@@ -457,9 +450,14 @@ impl UserPageState {
 
             for index in common_count..self.sessions.len() {
                 self.insert_row(list, index, &self.sessions[index]);
+                dirty_rows.mark(index);
             }
 
-            finish_list_view_update(list);
+            if structure_changed {
+                finish_list_view_update_deferred(list);
+                InvalidateRect(list, null_mut(), 0);
+            }
+            dirty_rows.redraw(list, self.sessions.len());
         }
     }
 
@@ -656,6 +654,19 @@ impl UserPageState {
         }
     }
 
+    fn selected_sessions(&self) -> Vec<UserSessionEntry> {
+        let selected = self.selected_session_ids();
+        selected
+            .iter()
+            .filter_map(|session_id| {
+                self.sessions
+                    .iter()
+                    .find(|entry| entry.session_id == *session_id)
+                    .cloned()
+            })
+            .collect()
+    }
+
     fn update_menu_state(&self, popup: HMENU, selected: &[u32]) {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
@@ -713,7 +724,7 @@ impl UserPageState {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 发送消息会先弹出输入对话框，再逐个会话调用 WTSSendMessageW。
-            let selected = self.selected_session_ids();
+            let selected = self.selected_sessions();
             if selected.is_empty() {
                 return;
             }
@@ -732,11 +743,15 @@ impl UserPageState {
 
             let title = to_wide_null(&result.title);
             let body = to_wide_null(&result.body);
-            for session_id in selected {
+            for session in selected {
+                if !session_matches_current_state(&session, self.show_domain_names) {
+                    self.show_command_failure(text(TextKey::MessageCouldNotBeSent));
+                    break;
+                }
                 let mut response = 0i32;
                 if WTSSendMessageW(
                     WTS_CURRENT_SERVER_HANDLE,
-                    session_id,
+                    session.session_id,
                     title.as_ptr(),
                     (result.title.encode_utf16().count() * 2) as u32,
                     body.as_ptr(),
@@ -758,7 +773,7 @@ impl UserPageState {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 断开/注销属于高影响操作，先确认，再逐个会话执行，失败时立即报错并停止。
-            let selected = self.selected_session_ids();
+            let selected = self.selected_sessions();
             if selected.is_empty() {
                 return;
             }
@@ -780,11 +795,19 @@ impl UserPageState {
                 return;
             }
 
-            for session_id in selected {
+            for session in selected {
+                if !session_matches_current_state(&session, self.show_domain_names) {
+                    self.show_command_failure(if command_id == IDM_LOGOFF {
+                        text(TextKey::SelectedUserCouldNotBeLoggedOff)
+                    } else {
+                        text(TextKey::SelectedUserCouldNotBeDisconnected)
+                    });
+                    break;
+                }
                 let succeeded = if command_id == IDM_LOGOFF {
-                    WTSLogoffSession(WTS_CURRENT_SERVER_HANDLE, session_id, 0) != 0
+                    WTSLogoffSession(WTS_CURRENT_SERVER_HANDLE, session.session_id, 0) != 0
                 } else {
-                    WTSDisconnectSession(WTS_CURRENT_SERVER_HANDLE, session_id, 0) != 0
+                    WTSDisconnectSession(WTS_CURRENT_SERVER_HANDLE, session.session_id, 0) != 0
                 };
                 if !succeeded {
                     self.show_command_failure(if command_id == IDM_LOGOFF {
@@ -858,28 +881,86 @@ fn query_session_string(session_id: u32, info_class: i32) -> String {
     }
 }
 
+fn query_session_entry(session_id: u32, show_domain_names: bool) -> Option<UserSessionEntry> {
+    unsafe {
+        let mut sessions_ptr = null_mut::<WTS_SESSION_INFOW>();
+        let mut session_count = 0u32;
+        if WTSEnumerateSessionsW(
+            WTS_CURRENT_SERVER_HANDLE,
+            0,
+            1,
+            &mut sessions_ptr,
+            &mut session_count,
+        ) == 0
+            || sessions_ptr.is_null()
+        {
+            return None;
+        }
+
+        let sessions_memory = OwnedWtsMemory::new(sessions_ptr)?;
+        let session = slice::from_raw_parts(sessions_memory.as_ptr(), session_count as usize)
+            .iter()
+            .find(|session| session.SessionId == session_id)?;
+        let user_name = query_session_string(session.SessionId, WTSUserName);
+        if user_name.is_empty() {
+            return None;
+        }
+
+        let domain_name = query_session_string(session.SessionId, WTSDomainName);
+        let client_name = query_session_string(session.SessionId, WTSClientName);
+        let display_name = if domain_name.is_empty() || !show_domain_names {
+            user_name
+        } else {
+            format!("{domain_name}\\{user_name}")
+        };
+
+        let display_name_lower = display_name.to_lowercase();
+        let status = session_state_text(session.State);
+        let status_lower = status.to_lowercase();
+        let client_name = if client_name.is_empty() {
+            "-".to_string()
+        } else {
+            client_name
+        };
+        let client_name_lower = client_name.to_lowercase();
+        let session_name = widestr_ptr_to_string(session.pWinStationName);
+        let session_name_lower = session_name.to_lowercase();
+        Some(UserSessionEntry {
+            session_id: session.SessionId,
+            display_name_lower,
+            status_lower,
+            client_name_lower,
+            session_name_lower,
+            display_name,
+            status,
+            client_name,
+            session_name,
+            dirty: false,
+        })
+    }
+}
+
+fn session_matches_current_state(expected: &UserSessionEntry, show_domain_names: bool) -> bool {
+    query_session_entry(expected.session_id, show_domain_names).is_some_and(|current| {
+        current.display_name == expected.display_name
+            && current.status == expected.status
+            && current.session_name == expected.session_name
+    })
+}
+
 fn compare_user_sessions(
     left: &UserSessionEntry,
     right: &UserSessionEntry,
     sort_column: usize,
     sort_ascending: bool,
 ) -> std::cmp::Ordering {
-    // 用户页排序按当前列切换；字符串列统一转小写比较，保证大小写不影响顺序。
+    // 用户页排序按当前列切换；字符串列使用缓存小写键，避免每轮刷新重复分配。
     let ordering = match sort_column {
         1 => left.session_id.cmp(&right.session_id),
-        2 => left.status.to_lowercase().cmp(&right.status.to_lowercase()),
-        3 => left
-            .client_name
-            .to_lowercase()
-            .cmp(&right.client_name.to_lowercase()),
-        4 => left
-            .session_name
-            .to_lowercase()
-            .cmp(&right.session_name.to_lowercase()),
-        _ => left
-            .display_name
-            .to_lowercase()
-            .cmp(&right.display_name.to_lowercase()),
+        2 => left.status_lower.cmp(&right.status_lower),
+        3 => left.client_name_lower.cmp(&right.client_name_lower),
+        4 => left.session_name_lower.cmp(&right.session_name_lower),
+        _ => left.display_name_lower.cmp(&right.display_name_lower),
     };
 
     if sort_ascending {

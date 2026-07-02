@@ -1,4 +1,4 @@
-use std::cmp::{Ordering, Reverse};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 // 应用页实现。
@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 //
 // 线程模型：
 //   WorkerCommand 工作线程在后台执行 collect_tasks_worker()（枚举窗口 + 抓取图标）。
-//   UI 线程通过 mpsc channel 发送命令并同步等待采集结果。
+//   UI 线程发起采集后继续处理窗口消息，完成消息到达后只消费最新结果。
 //   线程退出时发送 Shutdown 命令并 join。
 //
 // 缓存失效策略：
@@ -23,10 +23,11 @@ use std::collections::{HashMap, HashSet};
 //   DirtyTaskColumns 作为列级脏标记，避免 ListView 全量重绘。
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use windows_sys::Win32::Foundation::{BOOL, HANDLE, HINSTANCE, HWND, LPARAM, RECT};
+use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 use windows_sys::Win32::System::StationsAndDesktops::{
     CloseDesktop, EnumDesktopWindows, EnumDesktopsW, GetProcessWindowStation, GetThreadDesktop,
     GetUserObjectInformationW, OpenDesktopW, DESKTOP_ENUMERATE, DESKTOP_READOBJECTS, UOI_NAME,
@@ -37,10 +38,10 @@ use windows_sys::Win32::UI::Controls::{
     LVCFMT_LEFT, LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_IMAGE, LVIF_PARAM,
     LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS,
     LVM_DELETECOLUMN, LVM_DELETEITEM, LVM_GETITEMCOUNT, LVM_GETITEMW, LVM_GETNEXTITEM,
-    LVM_GETSELECTEDCOUNT, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_REDRAWITEMS, LVM_SETIMAGELIST,
-    LVM_SETITEMW, LVNI_SELECTED, LVN_COLUMNCLICK, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVSIL_NORMAL,
-    LVSIL_SMALL, LVS_AUTOARRANGE, LVS_ICON, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SMALLICON,
-    LVS_TYPEMASK, NMHDR, NMLISTVIEW, NMLVDISPINFOW, NM_DBLCLK,
+    LVM_GETSELECTEDCOUNT, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETIMAGELIST, LVM_SETITEMW,
+    LVNI_SELECTED, LVN_COLUMNCLICK, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVSIL_NORMAL, LVSIL_SMALL,
+    LVS_AUTOARRANGE, LVS_ICON, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SMALLICON, LVS_TYPEMASK, NMHDR,
+    NMLISTVIEW, NMLVDISPINFOW, NM_DBLCLK,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetKeyState, SetFocus, VK_CONTROL,
@@ -66,11 +67,12 @@ use crate::resource::{
     IDC_TILEVERT, IDM_DETAILS, IDM_LARGEICONS, IDM_RUN, IDM_SMALLICONS, IDM_TASK_BRINGTOFRONT,
     IDM_TASK_CASCADE, IDM_TASK_ENDTASK, IDM_TASK_FINDPROCESS, IDM_TASK_MAXIMIZE, IDM_TASK_MINIMIZE,
     IDM_TASK_SWITCHTO, IDM_TASK_TILEHORZ, IDM_TASK_TILEVERT, IDR_TASKVIEW, IDR_TASK_CONTEXT,
+    PWM_TASK_REFRESH_COMPLETE,
 };
 use crate::winutil::{
     append_32_bit_suffix, copy_text_to_callback_buffer, destroy_icon_handle, destroy_menu_handle,
-    finish_list_view_update, is_32_bit_process_pid, subclass_list_view, to_wide_null,
-    widestr_ptr_to_string, window_rect_relative_to_page,
+    finish_list_view_update_deferred, is_32_bit_process_pid, subclass_list_view, to_wide_null,
+    widestr_ptr_to_string, window_rect_relative_to_page, ListViewDirtyRange,
 };
 const TASK_COLUMNS: [TaskColumn; 4] = [
     // 应用程序页默认只展示经典任务管理器里的四列。
@@ -121,9 +123,12 @@ pub struct TaskEntry {
     // `TaskEntry` 代表一个顶层窗口/任务，并附带图标索引和脏列状态。
     pub hwnd: HWND,
     pub title: String,
+    title_lower: String,
     pub is_32_bit: bool,
     pub winstation: String,
+    winstation_lower: String,
     pub desktop: String,
+    desktop_lower: String,
     pub is_hung: bool,
     pub small_icon: usize,
     pub large_icon: usize,
@@ -146,21 +151,19 @@ struct WorkerTaskEntry {
     large_icon: isize,
 }
 
-// 工作线程命令枚举。
-// Collect: 在后台线程枚举窗口 + 抓取图标，结果通过 reply channel 返回。
-// Shutdown: 通知线程退出主循环。
-//
-// 线程生命周期：
-//   1. prepare_initialize() 中 start_worker_thread() 创建线程。
-//   2. 每轮 refresh_tasks() -> collect_tasks() 发送 Collect 命令，同步等待。
-//   3. destroy() 中 stop_worker_thread() 发送 Shutdown + join。
 enum WorkerCommand {
     // 后台线程当前只负责枚举任务窗口和有序退出。
     Collect {
+        seq: u64,
         main_hwnd: isize,
-        reply: Sender<Vec<WorkerTaskEntry>>,
+        notify_hwnd: isize,
     },
     Shutdown,
+}
+
+struct WorkerResult {
+    seq: u64,
+    tasks: Vec<WorkerTaskEntry>,
 }
 
 impl TaskEntry {
@@ -212,7 +215,12 @@ pub struct TaskPageState {
     sort_direction: i32,
     pass_count: u64,
     worker_sender: Option<Sender<WorkerCommand>>,
+    worker_result_receiver: Option<Receiver<WorkerResult>>,
     worker_thread: Option<JoinHandle<()>>,
+    refresh_inflight: bool,
+    refresh_pending: bool,
+    refresh_seq: u64,
+    last_applied_refresh_seq: u64,
 }
 
 impl Default for TaskPageState {
@@ -236,7 +244,12 @@ impl Default for TaskPageState {
             sort_direction: 1,
             pass_count: 0,
             worker_sender: None,
+            worker_result_receiver: None,
             worker_thread: None,
+            refresh_inflight: false,
+            refresh_pending: false,
+            refresh_seq: 0,
+            last_applied_refresh_seq: 0,
         }
     }
 }
@@ -368,9 +381,19 @@ impl TaskPageState {
     pub fn timer_event(&mut self, options: &Options) {
         // 刷新任务列表时会先取后台采集结果，再做排序和最小重绘提交。
         self.apply_options(options);
+        self.consume_refresh_results();
         if !self.paused {
             self.refresh_tasks();
         }
+    }
+
+    pub fn handle_refresh_complete(&mut self, _seq: u64) -> isize {
+        self.consume_refresh_results();
+        if self.refresh_pending && !self.paused {
+            self.refresh_pending = false;
+            self.refresh_tasks();
+        }
+        1
     }
 
     pub fn destroy(&mut self) {
@@ -736,6 +759,53 @@ impl TaskPageState {
     }
 
     fn refresh_tasks(&mut self) {
+        // 正常刷新只投递后台采集请求，不再同步等待跨桌面枚举和图标抓取。
+        self.consume_refresh_results();
+        if self.refresh_inflight {
+            self.refresh_pending = true;
+            return;
+        }
+
+        if let Some(sender) = self.worker_sender.as_ref() {
+            self.refresh_seq = self.refresh_seq.wrapping_add(1);
+            let seq = self.refresh_seq;
+            if sender
+                .send(WorkerCommand::Collect {
+                    seq,
+                    main_hwnd: self.main_hwnd as isize,
+                    notify_hwnd: self.hwnd_page as isize,
+                })
+                .is_ok()
+            {
+                self.refresh_inflight = true;
+                return;
+            }
+        }
+
+        self.refresh_seq = self.refresh_seq.wrapping_add(1);
+        self.apply_refresh_result(WorkerResult {
+            seq: self.refresh_seq,
+            tasks: collect_tasks_current_winsta(self.main_hwnd),
+        });
+    }
+
+    fn consume_refresh_results(&mut self) {
+        let mut latest = None;
+        if let Some(receiver) = self.worker_result_receiver.as_ref() {
+            while let Ok(result) = receiver.try_recv() {
+                latest = Some(result);
+            }
+        }
+
+        if let Some(result) = latest {
+            self.refresh_inflight = false;
+            if result.seq > self.last_applied_refresh_seq {
+                self.apply_refresh_result(result);
+            }
+        }
+    }
+
+    fn apply_refresh_result(&mut self, result: WorkerResult) {
         // 任务刷新采用“枚举窗口 -> 合并已有条目 -> 删除过期条目 -> 刷新 ListView”。
         // 这样可以尽量复用已有行，减少窗口切换时的闪烁。
         let current_pass = self.pass_count;
@@ -744,7 +814,7 @@ impl TaskPageState {
             task_index_by_hwnd.insert(task.hwnd as isize, index);
         }
 
-        for worker_task in self.collect_tasks() {
+        for worker_task in result.tasks {
             let hwnd = worker_task.hwnd as HWND;
             if let Some(&index) = task_index_by_hwnd.get(&worker_task.hwnd) {
                 update_task_entry(&mut self.tasks[index], &worker_task, current_pass);
@@ -772,49 +842,14 @@ impl TaskPageState {
         self.remove_stale_tasks(current_pass);
         self.rebuild_hwnd_index_map();
         self.update_task_listview();
+        self.last_applied_refresh_seq = result.seq;
         self.pass_count = self.pass_count.wrapping_add(1);
     }
 
     fn resort_tasks(&mut self) {
-        match self.sort_column {
-            TaskColumnId::Name => {
-                if self.sort_direction < 0 {
-                    self.tasks.sort_by_cached_key(|task| {
-                        Reverse((task.title.to_lowercase(), task.hwnd as usize))
-                    });
-                } else {
-                    self.tasks
-                        .sort_by_cached_key(|task| (task.title.to_lowercase(), task.hwnd as usize));
-                }
-            }
-            TaskColumnId::Winstation => {
-                if self.sort_direction < 0 {
-                    self.tasks.sort_by_cached_key(|task| {
-                        Reverse((task.winstation.to_lowercase(), task.hwnd as usize))
-                    });
-                } else {
-                    self.tasks.sort_by_cached_key(|task| {
-                        (task.winstation.to_lowercase(), task.hwnd as usize)
-                    });
-                }
-            }
-            TaskColumnId::Desktop => {
-                if self.sort_direction < 0 {
-                    self.tasks.sort_by_cached_key(|task| {
-                        Reverse((task.desktop.to_lowercase(), task.hwnd as usize))
-                    });
-                } else {
-                    self.tasks.sort_by_cached_key(|task| {
-                        (task.desktop.to_lowercase(), task.hwnd as usize)
-                    });
-                }
-            }
-            TaskColumnId::Status => {
-                self.tasks.sort_by(|left, right| {
-                    compare_tasks(left, right, self.sort_column, self.sort_direction)
-                });
-            }
-        }
+        self.tasks.sort_by(|left, right| {
+            compare_tasks(left, right, self.sort_column, self.sort_direction)
+        });
         self.rebuild_hwnd_index_map();
     }
 
@@ -833,12 +868,26 @@ impl TaskPageState {
         }
 
         let (command_tx, command_rx) = channel::<WorkerCommand>();
+        let (result_tx, result_rx) = channel::<WorkerResult>();
         let worker = thread::spawn(move || {
             while let Ok(command) = command_rx.recv() {
                 match command {
-                    WorkerCommand::Collect { main_hwnd, reply } => {
+                    WorkerCommand::Collect {
+                        seq,
+                        main_hwnd,
+                        notify_hwnd,
+                    } => {
                         let tasks = collect_tasks_worker(main_hwnd);
-                        let _ = reply.send(tasks);
+                        if result_tx.send(WorkerResult { seq, tasks }).is_ok() {
+                            unsafe {
+                                PostMessageW(
+                                    notify_hwnd as HWND,
+                                    PWM_TASK_REFRESH_COMPLETE,
+                                    seq as usize,
+                                    0,
+                                );
+                            }
+                        }
                     }
                     WorkerCommand::Shutdown => break,
                 }
@@ -846,6 +895,7 @@ impl TaskPageState {
         });
 
         self.worker_sender = Some(command_tx);
+        self.worker_result_receiver = Some(result_rx);
         self.worker_thread = Some(worker);
     }
 
@@ -858,28 +908,9 @@ impl TaskPageState {
         if let Some(worker) = self.worker_thread.take() {
             let _ = worker.join();
         }
-    }
-
-    fn collect_tasks(&self) -> Vec<WorkerTaskEntry> {
-        // 优先使用后台线程采样；如果线程不可用，再回退到当前窗口站的同步枚举。
-        let Some(sender) = self.worker_sender.as_ref() else {
-            return collect_tasks_current_winsta(self.main_hwnd);
-        };
-
-        let (reply_tx, reply_rx) = channel();
-        if sender
-            .send(WorkerCommand::Collect {
-                main_hwnd: self.main_hwnd as isize,
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            return collect_tasks_current_winsta(self.main_hwnd);
-        }
-
-        reply_rx
-            .recv()
-            .unwrap_or_else(|_| collect_tasks_current_winsta(self.main_hwnd))
+        self.worker_result_receiver = None;
+        self.refresh_inflight = false;
+        self.refresh_pending = false;
     }
 
     fn remove_stale_tasks(&mut self, current_pass: u64) {
@@ -915,15 +946,15 @@ impl TaskPageState {
     fn update_task_listview(&mut self) {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
-            // 更新 ListView 时先暂停重绘，批量完成替换/删除/插入后再统一恢复。
+            // 只有行身份/数量变化时才暂停整表重绘；普通状态变化只重绘脏行。
             let list_hwnd = self.list_hwnd();
-            SendMessageW(list_hwnd, WM_SETREDRAW, 0, 0);
 
             let mut existing_count = SendMessageW(list_hwnd, LVM_GETITEMCOUNT, 0, 0) as usize;
             let common_count = existing_count.min(self.tasks.len());
+            let mut current_hwnds = Vec::with_capacity(common_count);
+            let mut order_changed = existing_count != self.tasks.len();
 
             for index in 0..common_count {
-                let task = &self.tasks[index];
                 let mut current_item = LVITEMW {
                     mask: LVIF_PARAM,
                     iItem: index as i32,
@@ -940,13 +971,27 @@ impl TaskPageState {
                 } else {
                     None
                 };
+                if current_hwnd != Some(self.tasks[index].hwnd) {
+                    order_changed = true;
+                }
+                current_hwnds.push(current_hwnd);
+            }
 
+            if order_changed {
+                SendMessageW(list_hwnd, WM_SETREDRAW, 0, 0);
+            }
+
+            let mut dirty_rows = ListViewDirtyRange::default();
+
+            for (index, current_hwnd) in current_hwnds.iter().copied().enumerate() {
+                let task = &self.tasks[index];
                 if current_hwnd != Some(task.hwnd) {
                     self.replace_row(list_hwnd, index, task);
                     self.tasks[index].dirty_columns = DirtyTaskColumns::default();
+                    dirty_rows.mark(index);
                 } else if task.dirty_columns.any() {
-                    SendMessageW(list_hwnd, LVM_REDRAWITEMS, index, index as LPARAM);
                     self.tasks[index].dirty_columns = DirtyTaskColumns::default();
+                    dirty_rows.mark(index);
                 }
             }
 
@@ -959,9 +1004,14 @@ impl TaskPageState {
                 let task = &self.tasks[index];
                 self.insert_row(list_hwnd, index, task);
                 self.tasks[index].dirty_columns = DirtyTaskColumns::default();
+                dirty_rows.mark(index);
             }
 
-            finish_list_view_update(list_hwnd);
+            if order_changed {
+                finish_list_view_update_deferred(list_hwnd);
+                InvalidateRect(list_hwnd, null_mut(), 0);
+            }
+            dirty_rows.redraw(list_hwnd, self.tasks.len());
 
             self.selected_count = self.selected_count();
             self.update_ui_state();
@@ -1014,7 +1064,6 @@ impl TaskPageState {
                 ..zeroed()
             };
             SendMessageW(list_hwnd, LVM_SETITEMW, 0, &mut item as *mut _ as LPARAM);
-            SendMessageW(list_hwnd, LVM_REDRAWITEMS, index, index as LPARAM);
         }
     }
 
@@ -1031,7 +1080,7 @@ impl TaskPageState {
 
             let task = if item.lParam != 0 {
                 self.hwnd_to_index
-                    .get(&(item.lParam as isize))
+                    .get(&item.lParam)
                     .and_then(|&idx| self.tasks.get(idx))
             } else {
                 self.tasks.get(item.iItem as usize)
@@ -1466,16 +1515,10 @@ fn compare_tasks(
 ) -> Ordering {
     // 排序的最后兜底键是窗口句柄，保证同值情况下结果稳定，不会每轮刷新都乱跳。
     let ordering = match sort_column {
-        TaskColumnId::Name => left.title.to_lowercase().cmp(&right.title.to_lowercase()),
+        TaskColumnId::Name => left.title_lower.cmp(&right.title_lower),
         TaskColumnId::Status => left.is_hung.cmp(&right.is_hung),
-        TaskColumnId::Winstation => left
-            .winstation
-            .to_lowercase()
-            .cmp(&right.winstation.to_lowercase()),
-        TaskColumnId::Desktop => left
-            .desktop
-            .to_lowercase()
-            .cmp(&right.desktop.to_lowercase()),
+        TaskColumnId::Winstation => left.winstation_lower.cmp(&right.winstation_lower),
+        TaskColumnId::Desktop => left.desktop_lower.cmp(&right.desktop_lower),
     };
 
     let ordering = if ordering == Ordering::Equal {
@@ -1550,12 +1593,18 @@ impl TaskEntry {
         large_icon: usize,
         pass_count: u64,
     ) -> Self {
+        let title_lower = worker.title.to_lowercase();
+        let winstation_lower = worker.winstation.to_lowercase();
+        let desktop_lower = worker.desktop.to_lowercase();
         Self {
             hwnd: worker.hwnd as HWND,
             title: worker.title,
+            title_lower,
             is_32_bit: worker.is_32_bit,
             winstation: worker.winstation,
+            winstation_lower,
             desktop: worker.desktop,
+            desktop_lower,
             is_hung: worker.is_hung,
             small_icon,
             large_icon,
@@ -1571,14 +1620,17 @@ fn update_task_entry(task: &mut TaskEntry, worker: &WorkerTaskEntry, pass_count:
 
     if task.winstation != worker.winstation {
         task.winstation.clone_from(&worker.winstation);
+        task.winstation_lower = worker.winstation.to_lowercase();
         task.dirty_columns.mark(TaskColumnId::Winstation);
     }
     if task.desktop != worker.desktop {
         task.desktop.clone_from(&worker.desktop);
+        task.desktop_lower = worker.desktop.to_lowercase();
         task.dirty_columns.mark(TaskColumnId::Desktop);
     }
     if task.title != worker.title {
         task.title.clone_from(&worker.title);
+        task.title_lower = worker.title.to_lowercase();
         task.dirty_columns.mark(TaskColumnId::Name);
     }
     if task.is_32_bit != worker.is_32_bit {

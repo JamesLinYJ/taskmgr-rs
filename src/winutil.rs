@@ -21,7 +21,9 @@ use windows_sys::Win32::System::RemoteDesktop::WTSFreeMemory;
 use windows_sys::Win32::System::Threading::{
     IsWow64Process, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows_sys::Win32::UI::Controls::{LVIR_BOUNDS, LVM_GETITEMCOUNT, LVM_GETITEMRECT};
+use windows_sys::Win32::UI::Controls::{
+    LVIR_BOUNDS, LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_REDRAWITEMS,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, DeleteMenu, DestroyIcon, DestroyMenu, GetClientRect, GetSystemMetrics,
     GetWindowLongPtrW, GetWindowRect, SendMessageW, SetWindowLongPtrW, DWLP_MSGRESULT,
@@ -35,6 +37,33 @@ use crate::resource::{IDM_ALLCPUS, IDM_RUN};
 const REST_NORUN: u32 = 0x0000_0001;
 const LVM_SETEXTENDEDLISTVIEWSTYLE: u32 = 0x1036;
 const LVS_EX_DOUBLEBUFFER: usize = 0x0001_0000;
+
+#[derive(Clone, Copy, Default)]
+pub struct ListViewDirtyRange {
+    start: Option<usize>,
+    end: usize,
+}
+
+impl ListViewDirtyRange {
+    pub fn mark(&mut self, index: usize) {
+        self.start = Some(self.start.map_or(index, |current| current.min(index)));
+        self.end = self.end.max(index);
+    }
+
+    pub unsafe fn redraw(self, hwnd: HWND, item_count: usize) {
+        let Some(start) = self.start else {
+            return;
+        };
+        if item_count == 0 {
+            return;
+        }
+
+        let end = self.end.min(item_count - 1);
+        if start <= end {
+            SendMessageW(hwnd, LVM_REDRAWITEMS, start, end as LPARAM);
+        }
+    }
+}
 
 pub struct OwnedHandle {
     handle: HANDLE,
@@ -312,11 +341,6 @@ fn finish_list_view_update_internal(hwnd: HWND, invalidate: bool, immediate: boo
             UpdateWindow(hwnd);
         }
     }
-}
-
-pub fn finish_list_view_update(hwnd: HWND) {
-    // 适合需要立刻看到完整结果的页面：恢复重绘后马上同步刷新。
-    finish_list_view_update_internal(hwnd, true, true);
 }
 
 pub fn finish_list_view_update_deferred(hwnd: HWND) {

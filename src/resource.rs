@@ -19,6 +19,8 @@ pub const PWM_TRAYICON: u32 = 0x0400 + 10;
 pub const PWM_ACTIVATE: u32 = 0x0400 + 11;
 pub const PWM_INPOPUP: u32 = 0x0400 + 12;
 pub const PWM_DEFERREDINIT: u32 = 0x0400 + 13;
+pub const PWM_TASK_REFRESH_COMPLETE: u32 = 0x0400 + 14;
+pub const PWM_PROC_REFRESH_COMPLETE: u32 = 0x0400 + 15;
 
 // 顶层窗口、菜单和对话框模板 ID。
 pub const IDD_MAINWND: u16 = 105;

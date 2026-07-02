@@ -16,7 +16,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::chart_renderer::{ChartColor, ChartFrame};
-use crate::drawing::{fill_black, fill_rect_color, rgb};
+use crate::drawing::{fill_black, fill_rect_color, rgb, HistoryBuffer, HistoryView};
 use crate::winutil::to_wide_null;
 
 pub const HIST_SIZE: usize = 2000;
@@ -102,7 +102,7 @@ pub fn format_mem_meter_text(mem_usage_kb: u32) -> String {
 pub fn draw_grid_width(hdc: HDC, rect: &RECT, width: i32, scroll_offset: i32) {
     // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
-        let old_pen = SelectObject(hdc, GetStockObject(DC_PEN as i32) as _);
+        let old_pen = SelectObject(hdc, GetStockObject(DC_PEN) as _);
         SetDCPenColor(hdc, rgb(0, 128, 64));
         let left = rect.right - width.max(0);
         let right = rect.right;
@@ -136,7 +136,7 @@ pub struct HistoryPlotLayout {
 
 #[derive(Clone, Copy)]
 pub struct HistorySeries<'a> {
-    pub history: &'a [u8],
+    pub history: HistoryView<'a>,
     pub color: ChartColor,
     pub stop_on_zero: bool,
 }
@@ -161,12 +161,13 @@ pub fn draw_history_series(
             ChartColor::Grid => rgb(0, 128, 64),
         };
 
-        let old_pen = SelectObject(hdc, GetStockObject(DC_PEN as i32) as _);
+        let old_pen = SelectObject(hdc, GetStockObject(DC_PEN) as _);
         SetDCPenColor(hdc, color_rgb);
 
         let max_points = (layout.width as usize / layout.scale).min(series.history.len());
         let start_x = rect.right;
-        let start_y = rect.bottom - (i32::from(series.history[0]) * layout.graph_height) / 100;
+        let start_y = rect.bottom
+            - (i32::from(series.history.first().unwrap_or_default()) * layout.graph_height) / 100;
         let mut points = Vec::with_capacity(max_points + 1);
         points.push(POINT {
             x: start_x,
@@ -174,12 +175,12 @@ pub fn draw_history_series(
         });
 
         for (index, value) in series.history.iter().enumerate().take(max_points) {
-            if series.stop_on_zero && *value == 0 {
+            if series.stop_on_zero && value == 0 {
                 break;
             }
             points.push(POINT {
                 x: rect.right - (layout.scale * index) as i32,
-                y: rect.bottom - (i32::from(*value) * layout.graph_height) / 100,
+                y: rect.bottom - (i32::from(value) * layout.graph_height) / 100,
             });
         }
 
@@ -233,19 +234,20 @@ pub fn draw_history_series_gpu(
     }
 
     let mut previous_x = rect.right as f32;
-    let mut previous_y =
-        (rect.bottom - (i32::from(series.history[0]) * layout.graph_height) / 100) as f32;
+    let mut previous_y = (rect.bottom
+        - (i32::from(series.history.first().unwrap_or_default()) * layout.graph_height) / 100)
+        as f32;
 
     for (index, value) in series.history.iter().enumerate() {
         if index * layout.scale >= layout.width as usize {
             break;
         }
-        if series.stop_on_zero && *value == 0 {
+        if series.stop_on_zero && value == 0 {
             break;
         }
 
         let x = (rect.right - (layout.scale * index) as i32) as f32;
-        let y = (rect.bottom - (i32::from(*value) * layout.graph_height) / 100) as f32;
+        let y = (rect.bottom - (i32::from(value) * layout.graph_height) / 100) as f32;
         frame.draw_series_line(previous_x, previous_y, x, y, series.color);
         previous_x = x;
         previous_y = y;
@@ -321,16 +323,16 @@ pub fn draw_meter(
     }
 }
 
-pub fn average_history_into(history_sets: &[Vec<u8>], out: &mut Vec<u8>) {
+pub fn average_history_into(history_sets: &[HistoryBuffer], out: &mut Vec<u8>) {
     let Some(first_history) = history_sets.first() else {
         out.clear();
         return;
     };
-    out.resize(first_history.len(), 0u8);
+    out.resize(first_history.view().len(), 0u8);
     for (index, value) in out.iter_mut().enumerate() {
         let sum = history_sets
             .iter()
-            .map(|history| u32::from(history.get(index).copied().unwrap_or_default()))
+            .map(|history| u32::from(history.view().get(index).unwrap_or_default()))
             .sum::<u32>();
         *value = (sum / history_sets.len() as u32).min(100) as u8;
     }

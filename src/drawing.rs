@@ -5,13 +5,92 @@ use windows_sys::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, FillRect, GetStockObject, BLACK_BRUSH, HBRUSH, HDC,
 };
 
-pub fn push_history(history: &mut [u8], value: u8) {
-    // 历史值按"最新在前"滚动，绘图时就可以直接从右向左连接。
-    if history.is_empty() {
-        return;
+#[derive(Clone, Default)]
+pub struct HistoryBuffer {
+    values: Vec<u8>,
+    head: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct HistoryView<'a> {
+    values: &'a [u8],
+    head: usize,
+}
+
+impl HistoryBuffer {
+    pub fn with_len(len: usize) -> Self {
+        Self {
+            values: vec![0; len],
+            head: 0,
+        }
     }
-    history.copy_within(..history.len() - 1, 1);
-    history[0] = value;
+
+    pub fn push(&mut self, value: u8) {
+        if self.values.is_empty() {
+            return;
+        }
+
+        self.head = if self.head == 0 {
+            self.values.len() - 1
+        } else {
+            self.head - 1
+        };
+        self.values[self.head] = value;
+    }
+
+    pub fn view(&self) -> HistoryView<'_> {
+        HistoryView {
+            values: &self.values,
+            head: self.head,
+        }
+    }
+}
+
+impl<'a> HistoryView<'a> {
+    pub fn from_slice(values: &'a [u8]) -> Self {
+        Self { values, head: 0 }
+    }
+
+    pub fn len(self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fn first(self) -> Option<u8> {
+        self.get(0)
+    }
+
+    pub fn get(self, index: usize) -> Option<u8> {
+        if self.values.is_empty() || index >= self.values.len() {
+            return None;
+        }
+        Some(self.values[(self.head + index) % self.values.len()])
+    }
+
+    pub fn iter(self) -> HistoryIter<'a> {
+        HistoryIter {
+            view: self,
+            index: 0,
+        }
+    }
+}
+
+pub struct HistoryIter<'a> {
+    view: HistoryView<'a>,
+    index: usize,
+}
+
+impl<'a> Iterator for HistoryIter<'a> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let value = self.view.get(self.index)?;
+        self.index += 1;
+        Some(value)
+    }
 }
 
 pub fn fill_black(hdc: HDC, rect: &RECT) {

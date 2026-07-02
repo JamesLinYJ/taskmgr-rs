@@ -24,7 +24,7 @@ use crate::assets::{
     STRIP_UNLIT_BITMAP_RESOURCE,
 };
 use crate::chart_renderer::{ChartColor, ChartRenderer};
-use crate::drawing::{fill_black, push_history, rgb};
+use crate::drawing::{fill_black, rgb, HistoryBuffer, HistoryView};
 use crate::options::{CpuHistoryMode, Options};
 use crate::perf_drawing::{
     average_history_into, current_font_height, defer_resize, draw_grid_width, draw_grid_width_gpu,
@@ -164,9 +164,9 @@ pub struct PerformancePageState {
     previous_idle_times: Vec<i64>,
     previous_total_times: Vec<i64>,
     previous_kernel_times: Vec<i64>,
-    cpu_history: Vec<Vec<u8>>,
-    kernel_history: Vec<Vec<u8>>,
-    mem_history: Vec<u8>,
+    cpu_history: Vec<HistoryBuffer>,
+    kernel_history: Vec<HistoryBuffer>,
+    mem_history: HistoryBuffer,
     processor_info: Vec<SystemProcessorPerformanceInformation>,
     cached_averaged_cpu: Vec<u8>,
     cached_averaged_kernel: Vec<u8>,
@@ -349,7 +349,7 @@ impl PerformancePageState {
                         &target_rect,
                         plot_layout,
                         HistorySeries {
-                            history: &self.kernel_history[pane_index],
+                            history: self.kernel_history[pane_index].view(),
                             color: ChartColor::Red,
                             stop_on_zero: false,
                         },
@@ -360,7 +360,7 @@ impl PerformancePageState {
                         &target_rect,
                         plot_layout,
                         HistorySeries {
-                            history: &self.cached_averaged_kernel,
+                            history: HistoryView::from_slice(&self.cached_averaged_kernel),
                             color: ChartColor::Red,
                             stop_on_zero: false,
                         },
@@ -374,7 +374,7 @@ impl PerformancePageState {
                     &target_rect,
                     plot_layout,
                     HistorySeries {
-                        history: &self.cpu_history[pane_index],
+                        history: self.cpu_history[pane_index].view(),
                         color: ChartColor::Green,
                         stop_on_zero: false,
                     },
@@ -385,7 +385,7 @@ impl PerformancePageState {
                     &target_rect,
                     plot_layout,
                     HistorySeries {
-                        history: &self.cached_averaged_cpu,
+                        history: HistoryView::from_slice(&self.cached_averaged_cpu),
                         color: ChartColor::Green,
                         stop_on_zero: false,
                     },
@@ -447,7 +447,7 @@ impl PerformancePageState {
                     scale,
                 },
                 HistorySeries {
-                    history: &self.mem_history,
+                    history: self.mem_history.view(),
                     color: ChartColor::Yellow,
                     stop_on_zero: true,
                 },
@@ -496,7 +496,7 @@ impl PerformancePageState {
                     &target_rect,
                     plot_layout,
                     HistorySeries {
-                        history: &self.kernel_history[pane_index],
+                        history: self.kernel_history[pane_index].view(),
                         color: ChartColor::Red,
                         stop_on_zero: false,
                     },
@@ -507,7 +507,7 @@ impl PerformancePageState {
                     &target_rect,
                     plot_layout,
                     HistorySeries {
-                        history: &self.cached_averaged_kernel,
+                        history: HistoryView::from_slice(&self.cached_averaged_kernel),
                         color: ChartColor::Red,
                         stop_on_zero: false,
                     },
@@ -521,7 +521,7 @@ impl PerformancePageState {
                 &target_rect,
                 plot_layout,
                 HistorySeries {
-                    history: &self.cpu_history[pane_index],
+                    history: self.cpu_history[pane_index].view(),
                     color: ChartColor::Green,
                     stop_on_zero: false,
                 },
@@ -532,7 +532,7 @@ impl PerformancePageState {
                 &target_rect,
                 plot_layout,
                 HistorySeries {
-                    history: &self.cached_averaged_cpu,
+                    history: HistoryView::from_slice(&self.cached_averaged_cpu),
                     color: ChartColor::Green,
                     stop_on_zero: false,
                 },
@@ -562,7 +562,7 @@ impl PerformancePageState {
                 scale,
             },
             HistorySeries {
-                history: &self.mem_history,
+                history: self.mem_history.view(),
                 color: ChartColor::Yellow,
                 stop_on_zero: true,
             },
@@ -836,7 +836,7 @@ impl PerformancePageState {
         // 否则“每核图”和“汇总图”会看到不一致的采样长度。
         if self.processor_count == processor_count
             && self.cpu_history.len() == processor_count
-            && self.mem_history.len() == HIST_SIZE
+            && self.mem_history.view().len() == HIST_SIZE
         {
             return;
         }
@@ -845,9 +845,9 @@ impl PerformancePageState {
         self.previous_idle_times.resize(processor_count, 0);
         self.previous_total_times.resize(processor_count, 0);
         self.previous_kernel_times.resize(processor_count, 0);
-        self.cpu_history = vec![vec![0; HIST_SIZE]; processor_count];
-        self.kernel_history = vec![vec![0; HIST_SIZE]; processor_count];
-        self.mem_history = vec![0; HIST_SIZE];
+        self.cpu_history = vec![HistoryBuffer::with_len(HIST_SIZE); processor_count];
+        self.kernel_history = vec![HistoryBuffer::with_len(HIST_SIZE); processor_count];
+        self.mem_history = HistoryBuffer::with_len(HIST_SIZE);
     }
 
     fn refresh_measurements(&mut self, hwnd_page: HWND) {
@@ -908,8 +908,8 @@ impl PerformancePageState {
                     0
                 };
 
-                push_history(&mut self.cpu_history[index], cpu_percent);
-                push_history(&mut self.kernel_history[index], kernel_percent);
+                self.cpu_history[index].push(cpu_percent);
+                self.kernel_history[index].push(kernel_percent);
 
                 self.previous_idle_times[index] = idle_time;
                 self.previous_total_times[index] = total_time;
@@ -971,7 +971,7 @@ impl PerformancePageState {
                 ((self.physical_mem_usage_kb.saturating_mul(100)) / self.physical_mem_limit_kb)
                     .min(100) as u8
             };
-            push_history(&mut self.mem_history, mem_percent);
+            self.mem_history.push(mem_percent);
 
             if !self.no_title {
                 self.update_detail_texts(hwnd_page);

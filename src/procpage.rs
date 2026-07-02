@@ -1,4 +1,4 @@
-use std::cmp::{Ordering, Reverse};
+use std::cmp::Ordering;
 
 // 进程页实现。
 // 这里负责采集进程列表、计算每轮刷新之间的增量数据、维护排序状态，
@@ -6,7 +6,7 @@ use std::cmp::{Ordering, Reverse};
 //
 // 线程模型：
 //   ProcWorkerCommand 工作线程在后台执行 collect_process_entries() 采样，
-//   UI 线程通过 mpsc channel 发送命令并同步等待结果。页面销毁时发送 Shutdown 并 join 线程。
+//   UI 线程发送命令后继续处理消息，采样完成后通过页面消息消费最新结果。
 //
 // 缓存失效策略：
 //   pid_to_index (HashMap) 在每次 resort_entries 后从头重建，以匹配排序后的 entries 顺序。
@@ -18,15 +18,15 @@ use std::mem::{size_of, zeroed};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::slice;
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, FILETIME, HANDLE, HINSTANCE, HWND, INVALID_HANDLE_VALUE, LPARAM, POINT, RECT,
-    WPARAM,
+    CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, HINSTANCE, HWND, INVALID_HANDLE_VALUE,
+    LPARAM, POINT, RECT, WPARAM,
 };
-use windows_sys::Win32::Graphics::Gdi::MapWindowPoints;
+use windows_sys::Win32::Graphics::Gdi::{InvalidateRect, MapWindowPoints};
 use windows_sys::Win32::Security::{
     GetTokenInformation, IsWellKnownSid, LookupAccountSidW, TokenSessionId, TokenUser,
     WinLocalServiceSid, WinLocalSystemSid, WinNetworkServiceSid, SID_NAME_USE, TOKEN_QUERY,
@@ -61,17 +61,17 @@ use windows_sys::Win32::UI::Controls::{
     LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_PARAM, LVIF_STATE, LVIF_TEXT,
     LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_DELETECOLUMN, LVM_DELETEITEM,
     LVM_ENSUREVISIBLE, LVM_GETCOLUMNWIDTH, LVM_GETITEMCOUNT, LVM_GETITEMW, LVM_GETNEXTITEM,
-    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_REDRAWITEMS, LVM_SETITEMSTATE, LVM_SETITEMW,
-    LVNI_SELECTED, LVN_COLUMNCLICK, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVS_SHOWSELALWAYS, NMHDR,
-    NMLISTVIEW, NMLVDISPINFOW,
+    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETITEMSTATE, LVM_SETITEMW, LVNI_SELECTED,
+    LVN_COLUMNCLICK, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVS_SHOWSELALWAYS, NMHDR, NMLISTVIEW,
+    NMLVDISPINFOW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EndDialog, GetClientRect, GetCursorPos,
-    GetDlgItem, GetWindowLongW, MessageBoxW, SendMessageW, SetWindowLongW, TrackPopupMenuEx,
-    GWL_STYLE, IDCANCEL, IDOK, IDYES, MB_ICONERROR, MB_ICONEXCLAMATION, MB_OK, MB_YESNO,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, TPM_RETURNCMD, WM_COMMAND, WM_INITDIALOG,
-    WM_SETREDRAW,
+    GetDlgItem, GetWindowLongW, MessageBoxW, PostMessageW, SendMessageW, SetWindowLongW,
+    TrackPopupMenuEx, GWL_STYLE, IDCANCEL, IDOK, IDYES, MB_ICONERROR, MB_ICONEXCLAMATION, MB_OK,
+    MB_YESNO, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, TPM_RETURNCMD, WM_COMMAND,
+    WM_INITDIALOG, WM_SETREDRAW,
 };
 
 use crate::dialog_templates::dialog_box;
@@ -83,6 +83,7 @@ use crate::runtime_menu::{MenuItemState, PopupMenu};
 use crate::winutil::{
     append_32_bit_suffix, finish_list_view_update_deferred, get_window_userdata,
     is_32_bit_process_handle, loword, set_window_userdata, subclass_list_view, to_wide_null,
+    ListViewDirtyRange,
 };
 
 const PROCESS_COLUMNS: [ProcessColumn; NUM_COLUMN] = [
@@ -176,40 +177,17 @@ impl DirtyColumns {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct DirtyRowRange {
-    // 列表刷新时只记录真正变更的行范围，避免整表重绘。
-    start: Option<usize>,
-    end: usize,
-}
-
-impl DirtyRowRange {
-    fn mark(&mut self, index: usize) {
-        self.start = Some(self.start.map_or(index, |current| current.min(index)));
-        self.end = self.end.max(index);
-    }
-
-    unsafe fn redraw(self, list_hwnd: HWND, item_count: usize) {
-        let Some(start) = self.start else {
-            return;
-        };
-        if item_count == 0 {
-            return;
-        }
-
-        let end = self.end.min(item_count - 1);
-        if start > end {
-            return;
-        }
-
-        SendMessageW(list_hwnd, LVM_REDRAWITEMS, start, end as LPARAM);
-    }
+#[derive(Clone, Copy)]
+struct ProcessIdentity {
+    pid: u32,
+    creation_time_100ns: u64,
 }
 
 #[derive(Clone)]
 pub struct ProcEntry {
     // `ProcEntry` 同时承载原始采样值、展示值和刷新期的脏信息。
     pid: u32,
+    creation_time_100ns: u64,
     image_name: String,
     image_name_lower: String,
     is_32_bit: bool,
@@ -351,21 +329,24 @@ impl ProcCommand {
 }
 
 // 工作线程命令枚举。
-// Collect:  在后台线程执行 collect_process_entries()，结果通过 reply channel 返回。
+// Collect:  在后台线程执行 collect_process_entries()，结果写入共享结果 channel。
 // Shutdown: 通知线程退出主循环，配合 join 保证安全回收。
-//
-// 线程生命周期：
-//   1. initialize() -> start_worker_thread() 创建线程 + channel。
-//   2. 每轮 timer_event() -> refresh_processes() 发送 Collect 命令，同步等待结果。
-//   3. destroy() -> stop_worker_thread() 发送 Shutdown -> join 线程。
-//   线程内无限循环 recv()，遇到 Shutdown 才 break。
 enum ProcWorkerCommand {
     Collect {
+        seq: u64,
+        notify_hwnd: isize,
         previous_samples: Arc<HashMap<u32, PreviousProcSample>>,
+        system_total: u64,
         total_delta: u64,
-        reply: Sender<(Vec<ProcEntry>, HashMap<u32, PreviousProcSample>)>,
     },
     Shutdown,
+}
+
+struct ProcWorkerResult {
+    seq: u64,
+    system_total: u64,
+    entries: Vec<ProcEntry>,
+    next_samples: HashMap<u32, PreviousProcSample>,
 }
 
 pub struct ProcessPageState {
@@ -375,7 +356,7 @@ pub struct ProcessPageState {
     main_hwnd: HWND,
     entries: Vec<ProcEntry>,
     pid_to_index: HashMap<u32, usize>,
-    previous_samples: HashMap<u32, PreviousProcSample>,
+    previous_samples: Arc<HashMap<u32, PreviousProcSample>>,
     previous_system_time: u64,
     active_columns: Vec<ColumnId>,
     selected_pid: Option<u32>,
@@ -389,7 +370,12 @@ pub struct ProcessPageState {
     strings: ProcessStrings,
     pass_count: u64,
     worker_sender: Option<Sender<ProcWorkerCommand>>,
+    worker_result_receiver: Option<Receiver<ProcWorkerResult>>,
     worker_thread: Option<JoinHandle<()>>,
+    refresh_inflight: bool,
+    refresh_pending: bool,
+    refresh_seq: u64,
+    last_applied_refresh_seq: u64,
 }
 
 impl Default for ProcessPageState {
@@ -400,7 +386,7 @@ impl Default for ProcessPageState {
             main_hwnd: null_mut(),
             entries: Vec::with_capacity(128),
             pid_to_index: HashMap::new(),
-            previous_samples: HashMap::new(),
+            previous_samples: Arc::new(HashMap::new()),
             previous_system_time: 0,
             active_columns: Vec::with_capacity(NUM_COLUMN),
             selected_pid: None,
@@ -414,7 +400,12 @@ impl Default for ProcessPageState {
             strings: ProcessStrings::default(),
             pass_count: 0,
             worker_sender: None,
+            worker_result_receiver: None,
             worker_thread: None,
+            refresh_inflight: false,
+            refresh_pending: false,
+            refresh_seq: 0,
+            last_applied_refresh_seq: 0,
         }
     }
 }
@@ -427,23 +418,45 @@ impl ProcessPageState {
             return;
         }
         let (tx, rx) = channel::<ProcWorkerCommand>();
+        let (result_tx, result_rx) = channel::<ProcWorkerResult>();
         let worker = thread::spawn(move || {
             while let Ok(command) = rx.recv() {
                 match command {
                     ProcWorkerCommand::Collect {
+                        seq,
+                        notify_hwnd,
                         previous_samples,
+                        system_total,
                         total_delta,
-                        reply,
                     } => {
-                        let result =
-                            unsafe { collect_process_entries(&previous_samples, total_delta) };
-                        let _ = reply.send(result);
+                        let (entries, next_samples) = unsafe {
+                            collect_process_entries(previous_samples.as_ref(), total_delta)
+                        };
+                        if result_tx
+                            .send(ProcWorkerResult {
+                                seq,
+                                system_total,
+                                entries,
+                                next_samples,
+                            })
+                            .is_ok()
+                        {
+                            unsafe {
+                                PostMessageW(
+                                    notify_hwnd as HWND,
+                                    PWM_PROC_REFRESH_COMPLETE,
+                                    seq as usize,
+                                    0,
+                                );
+                            }
+                        }
                     }
                     ProcWorkerCommand::Shutdown => break,
                 }
             }
         });
         self.worker_sender = Some(tx);
+        self.worker_result_receiver = Some(result_rx);
         self.worker_thread = Some(worker);
     }
 
@@ -455,6 +468,9 @@ impl ProcessPageState {
         if let Some(worker) = self.worker_thread.take() {
             let _ = worker.join();
         }
+        self.worker_result_receiver = None;
+        self.refresh_inflight = false;
+        self.refresh_pending = false;
     }
 
     pub fn new() -> Self {
@@ -503,6 +519,7 @@ impl ProcessPageState {
         if desired_columns != self.active_columns {
             self.active_columns = desired_columns;
             self.setup_columns(options);
+            self.rebuild_listview();
             self.refresh_processes();
         }
     }
@@ -510,9 +527,19 @@ impl ProcessPageState {
     pub unsafe fn timer_event(&mut self, options: &Options) {
         // 每一轮刷新都走“采样 -> 合并旧状态 -> 排序/重绘”这条统一链路。
         self.paused = options.update_speed == UpdateSpeed::Paused as i32;
+        self.consume_refresh_results();
         if !self.paused {
             self.refresh_processes();
         }
+    }
+
+    pub unsafe fn handle_refresh_complete(&mut self, _seq: u64) -> isize {
+        self.consume_refresh_results();
+        if self.refresh_pending && !self.paused {
+            self.refresh_pending = false;
+            self.refresh_processes();
+        }
+        1
     }
 
     pub unsafe fn deactivate(&mut self, options: &mut Options) {
@@ -522,7 +549,7 @@ impl ProcessPageState {
     pub unsafe fn destroy(&mut self) {
         self.stop_worker_thread();
         self.entries.clear();
-        self.previous_samples.clear();
+        self.previous_samples = Arc::new(HashMap::new());
     }
 
     pub unsafe fn handle_notify(&mut self, lparam: LPARAM) -> isize {
@@ -555,6 +582,8 @@ impl ProcessPageState {
                     self.sort_column = clicked;
                     self.sort_direction = -1;
                 }
+                self.resort_entries();
+                self.rebuild_listview();
                 self.refresh_processes();
                 1
             }
@@ -575,33 +604,33 @@ impl ProcessPageState {
                 }
             }
             ProcCommand::Terminate => {
-                if let Some(pid) = self.current_selected_pid() {
-                    self.kill_process(pid);
+                if let Some(identity) = self.current_selected_process_identity() {
+                    self.kill_process(&identity);
                 }
             }
             ProcCommand::TerminateTree => {
-                if let Some(pid) = self.current_selected_pid() {
-                    self.kill_process_tree(pid);
+                if let Some(identity) = self.current_selected_process_identity() {
+                    self.kill_process_tree(&identity);
                 }
             }
             ProcCommand::Debug => {
-                if let Some(pid) = self.current_selected_pid() {
-                    self.attach_debugger(pid);
+                if let Some(identity) = self.current_selected_process_identity() {
+                    self.attach_debugger(&identity);
                 }
             }
             ProcCommand::OpenFileLocation => {
-                if let Some(pid) = self.current_selected_pid() {
-                    self.open_file_location(pid);
+                if let Some(identity) = self.current_selected_process_identity() {
+                    self.open_file_location(&identity);
                 }
             }
             ProcCommand::Affinity => {
-                if let Some(pid) = self.current_selected_pid() {
-                    self.set_affinity(pid);
+                if let Some(identity) = self.current_selected_process_identity() {
+                    self.set_affinity(&identity);
                 }
             }
             ProcCommand::SetPriority(priority) => {
-                if let Some(pid) = self.current_selected_pid() {
-                    self.set_priority(pid, priority);
+                if let Some(identity) = self.current_selected_process_identity() {
+                    self.set_priority(&identity, priority);
                 }
             }
         }
@@ -848,36 +877,77 @@ impl ProcessPageState {
     }
 
     unsafe fn refresh_processes(&mut self) {
-        // 刷新过程分为”采样 -> 合并历史 -> 排序 -> 重建 ListView”四步。
-        // 采样阶段通过工作线程完成，避免 UI 线程因大量 syscall 阻塞。
-        let previous_selection = self.current_selected_pid().or(self.selected_pid);
+        // 刷新过程分为“发起采样 -> 后台采集 -> 消费结果 -> 重建 ListView”四步。
+        // 正常路径不再同步等待 worker，避免进程枚举 syscall 堵住 UI 线程。
+        self.consume_refresh_results();
+        if self.refresh_inflight {
+            self.refresh_pending = true;
+            return;
+        }
+
         let system_total = current_system_time();
         let total_delta = system_total.saturating_sub(self.previous_system_time);
-        let previous_samples = Arc::new(std::mem::take(&mut self.previous_samples));
-        let (entries, next_samples) = if let Some(sender) = self.worker_sender.as_ref() {
-            let (reply_tx, reply_rx) = channel();
+        let previous_samples = Arc::clone(&self.previous_samples);
+        if let Some(sender) = self.worker_sender.as_ref() {
+            self.refresh_seq = self.refresh_seq.wrapping_add(1);
+            let seq = self.refresh_seq;
             let command = ProcWorkerCommand::Collect {
-                previous_samples: Arc::clone(&previous_samples),
+                seq,
+                notify_hwnd: self.hwnd_page as isize,
+                previous_samples,
+                system_total,
                 total_delta,
-                reply: reply_tx,
             };
             if sender.send(command).is_err() {
-                collect_process_entries(&previous_samples, total_delta)
-            } else {
-                reply_rx
-                    .recv()
-                    .unwrap_or_else(|_| collect_process_entries(&previous_samples, total_delta))
+                let (entries, next_samples) =
+                    collect_process_entries(self.previous_samples.as_ref(), total_delta);
+                self.apply_refresh_result(ProcWorkerResult {
+                    seq,
+                    system_total,
+                    entries,
+                    next_samples,
+                });
+                return;
             }
+            self.refresh_inflight = true;
         } else {
-            collect_process_entries(&previous_samples, total_delta)
-        };
+            let (entries, next_samples) =
+                collect_process_entries(self.previous_samples.as_ref(), total_delta);
+            self.refresh_seq = self.refresh_seq.wrapping_add(1);
+            self.apply_refresh_result(ProcWorkerResult {
+                seq: self.refresh_seq,
+                system_total,
+                entries,
+                next_samples,
+            });
+        }
+    }
+
+    unsafe fn consume_refresh_results(&mut self) {
+        let mut latest = None;
+        if let Some(receiver) = self.worker_result_receiver.as_ref() {
+            while let Ok(result) = receiver.try_recv() {
+                latest = Some(result);
+            }
+        }
+
+        if let Some(result) = latest {
+            self.refresh_inflight = false;
+            if result.seq > self.last_applied_refresh_seq {
+                self.apply_refresh_result(result);
+            }
+        }
+    }
+
+    unsafe fn apply_refresh_result(&mut self, result: ProcWorkerResult) {
+        let previous_selection = self.current_selected_pid().or(self.selected_pid);
         let current_pass = self.pass_count;
         let mut existing_by_pid = HashMap::with_capacity(self.entries.len());
         for (index, entry) in self.entries.iter_mut().enumerate() {
             existing_by_pid.insert(entry.pid, index);
         }
 
-        for snapshot in entries {
+        for snapshot in result.entries {
             if let Some(&index) = existing_by_pid.get(&snapshot.pid) {
                 let existing = &mut self.entries[index];
                 update_process_entry(existing, &snapshot, current_pass);
@@ -888,8 +958,9 @@ impl ProcessPageState {
 
         self.remove_stale_entries(current_pass);
         self.resort_entries();
-        self.previous_samples = next_samples;
-        self.previous_system_time = system_total;
+        self.previous_samples = Arc::new(result.next_samples);
+        self.previous_system_time = result.system_total;
+        self.last_applied_refresh_seq = result.seq;
         self.selected_pid = previous_selection;
         self.rebuild_listview();
         self.pass_count = self.pass_count.wrapping_add(1);
@@ -897,33 +968,9 @@ impl ProcessPageState {
 
     // 按当前排序列和方向重排 entries。排序后 pid_to_index 索引从头重建以保证一致性。
     fn resort_entries(&mut self) {
-        match self.sort_column {
-            ColumnId::ImageName => {
-                if self.sort_direction < 0 {
-                    self.entries.sort_by_cached_key(|entry| {
-                        Reverse((entry.image_name.to_lowercase(), entry.pid))
-                    });
-                } else {
-                    self.entries
-                        .sort_by_cached_key(|entry| (entry.image_name.to_lowercase(), entry.pid));
-                }
-            }
-            ColumnId::Username => {
-                if self.sort_direction < 0 {
-                    self.entries.sort_by_cached_key(|entry| {
-                        Reverse((entry.user_name.to_lowercase(), entry.pid))
-                    });
-                } else {
-                    self.entries
-                        .sort_by_cached_key(|entry| (entry.user_name.to_lowercase(), entry.pid));
-                }
-            }
-            _ => {
-                self.entries.sort_by(|left, right| {
-                    compare_entries(left, right, self.sort_column, self.sort_direction)
-                });
-            }
-        }
+        self.entries.sort_by(|left, right| {
+            compare_entries(left, right, self.sort_column, self.sort_direction)
+        });
         self.pid_to_index.clear();
         for (index, entry) in self.entries.iter().enumerate() {
             self.pid_to_index.insert(entry.pid, index);
@@ -969,7 +1016,7 @@ impl ProcessPageState {
             SendMessageW(list_hwnd, WM_SETREDRAW, 0, 0);
         }
 
-        let mut dirty_rows = DirtyRowRange::default();
+        let mut dirty_rows = ListViewDirtyRange::default();
 
         for (index, current_pid) in current_pids.iter().copied().enumerate() {
             let entry = &self.entries[index];
@@ -1012,6 +1059,7 @@ impl ProcessPageState {
             }
 
             finish_list_view_update_deferred(list_hwnd);
+            InvalidateRect(list_hwnd, null_mut(), 0);
         }
         dirty_rows.redraw(list_hwnd, self.entries.len());
 
@@ -1160,6 +1208,14 @@ impl ProcessPageState {
         }
     }
 
+    unsafe fn current_selected_process_identity(&self) -> Option<ProcessIdentity> {
+        let pid = self.current_selected_pid()?;
+        self.entries
+            .iter()
+            .find(|entry| entry.pid == pid)
+            .map(ProcEntry::identity)
+    }
+
     fn selected_entry(&self) -> Option<&ProcEntry> {
         let pid = self.selected_pid?;
         self.entries.iter().find(|entry| entry.pid == pid)
@@ -1199,19 +1255,18 @@ impl ProcessPageState {
     }
 
     // 结束指定 PID 的进程。先弹确认框，再通过 TerminateProcess 终止。
-    unsafe fn kill_process(&mut self, pid: u32) -> bool {
+    unsafe fn kill_process(&mut self, identity: &ProcessIdentity) -> bool {
         if !self.quick_confirm(&self.strings.warning, &self.strings.kill) {
             return false;
         }
 
-        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if handle.is_null() {
-            self.show_failure_message(
-                &self.strings.cant_kill,
-                windows_sys::Win32::Foundation::GetLastError(),
-            );
-            return false;
-        }
+        let handle = match open_revalidated_process(identity, PROCESS_TERMINATE) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_kill, error);
+                return false;
+            }
+        };
 
         let result = TerminateProcess(handle, 1);
         let error = windows_sys::Win32::Foundation::GetLastError();
@@ -1228,33 +1283,42 @@ impl ProcessPageState {
     }
 
     // 结束进程以及所有子进程。按叶子优先的顺序遍历进程树，逐进程 TerminateProcess。
-    unsafe fn kill_process_tree(&mut self, pid: u32) -> bool {
+    unsafe fn kill_process_tree(&mut self, identity: &ProcessIdentity) -> bool {
         if !self.quick_confirm(&self.strings.warning, &self.strings.kill_tree) {
             return false;
         }
 
-        let termination_order = collect_process_tree_termination_order(pid);
+        let termination_order = collect_process_tree_termination_order(identity.pid);
         if termination_order.is_empty() {
-            return self.kill_process(pid);
+            return self.kill_process(identity);
         }
 
         let mut any_success = false;
         let mut any_failure = false;
         let mut root_error = 0u32;
 
-        for target_pid in termination_order {
-            let handle = OpenProcess(PROCESS_TERMINATE, 0, target_pid);
-            if handle.is_null() {
+        for mut target in termination_order {
+            if target.pid == identity.pid {
+                target.creation_time_100ns = identity.creation_time_100ns;
+            } else if target.creation_time_100ns == 0 {
                 any_failure = true;
-                if target_pid == pid {
-                    root_error = windows_sys::Win32::Foundation::GetLastError();
-                }
                 continue;
             }
 
+            let handle = match open_revalidated_process(&target, PROCESS_TERMINATE) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    any_failure = true;
+                    if target.pid == identity.pid {
+                        root_error = error;
+                    }
+                    continue;
+                }
+            };
+
             if TerminateProcess(handle, 1) == 0 {
                 any_failure = true;
-                if target_pid == pid {
+                if target.pid == identity.pid {
                     root_error = windows_sys::Win32::Foundation::GetLastError();
                 }
             } else {
@@ -1289,7 +1353,7 @@ impl ProcessPageState {
     }
 
     // 以 AeDebug 注册表配置的调试器启动并附加到目标进程。命令行传 -p <pid>。
-    unsafe fn attach_debugger(&mut self, pid: u32) -> bool {
+    unsafe fn attach_debugger(&mut self, identity: &ProcessIdentity) -> bool {
         let Some(debugger_path) = self.debugger_path.as_ref() else {
             self.show_failure_message(&self.strings.cant_debug, 2);
             return false;
@@ -1299,7 +1363,20 @@ impl ProcessPageState {
             return false;
         }
 
-        let command_line = format!("{} -p {pid}", quote_command_line_arg(debugger_path));
+        let process_handle = match open_revalidated_process(identity, 0) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_debug, error);
+                return false;
+            }
+        };
+        CloseHandle(process_handle);
+
+        let command_line = format!(
+            "{} -p {}",
+            quote_command_line_arg(debugger_path),
+            identity.pid
+        );
         let mut command_line_wide = to_wide_null(&command_line);
         let application_name = to_wide_null(debugger_path);
         let startup_info = STARTUPINFOW {
@@ -1335,14 +1412,24 @@ impl ProcessPageState {
     }
 
     // 通过 explorer.exe /select 命令在资源管理器中定位进程的可执行文件。
-    unsafe fn open_file_location(&mut self, pid: u32) -> bool {
-        let Some(image_path) = query_process_image_path(pid) else {
-            self.show_failure_message(
-                &self.strings.cant_open_file_location,
-                windows_sys::Win32::Foundation::GetLastError(),
-            );
-            return false;
+    unsafe fn open_file_location(&mut self, identity: &ProcessIdentity) -> bool {
+        let handle = match open_revalidated_process(identity, 0) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_open_file_location, error);
+                return false;
+            }
         };
+        let image_path = match query_process_image_path_from_handle(handle) {
+            Some(path) => path,
+            None => {
+                let error = windows_sys::Win32::Foundation::GetLastError();
+                CloseHandle(handle);
+                self.show_failure_message(&self.strings.cant_open_file_location, error);
+                return false;
+            }
+        };
+        CloseHandle(handle);
 
         if !Path::new(&image_path).exists() {
             self.show_failure_message(&self.strings.cant_open_file_location, 2);
@@ -1365,6 +1452,7 @@ impl ProcessPageState {
             "{explorer_path} /select,{}",
             quote_command_line_arg(&image_path)
         );
+        let application_name = to_wide_null(&explorer_path);
         let mut command_line_wide = to_wide_null(&command_line);
         let startup_info = STARTUPINFOW {
             cb: size_of::<STARTUPINFOW>() as u32,
@@ -1372,7 +1460,7 @@ impl ProcessPageState {
         };
         let mut process_info = zeroed::<PROCESS_INFORMATION>();
         let created = CreateProcessW(
-            null(),
+            application_name.as_ptr(),
             command_line_wide.as_mut_ptr(),
             null_mut(),
             null_mut(),
@@ -1397,7 +1485,7 @@ impl ProcessPageState {
     }
 
     // 通过 SetPriorityClass 修改进程优先级类。先弹确认框，操作成功后刷新列表。
-    unsafe fn set_priority(&mut self, pid: u32, priority: ProcPriority) -> bool {
+    unsafe fn set_priority(&mut self, identity: &ProcessIdentity, priority: ProcPriority) -> bool {
         let priority_class = match priority {
             ProcPriority::Low => IDLE_PRIORITY_CLASS,
             ProcPriority::BelowNormal => BELOW_NORMAL_PRIORITY_CLASS,
@@ -1411,14 +1499,13 @@ impl ProcessPageState {
             return false;
         }
 
-        let handle = OpenProcess(PROCESS_SET_INFORMATION, 0, pid);
-        if handle.is_null() {
-            self.show_failure_message(
-                &self.strings.cant_change_priority,
-                windows_sys::Win32::Foundation::GetLastError(),
-            );
-            return false;
-        }
+        let handle = match open_revalidated_process(identity, PROCESS_SET_INFORMATION) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_change_priority, error);
+                return false;
+            }
+        };
 
         let result = SetPriorityClass(handle, priority_class);
         let error = windows_sys::Win32::Foundation::GetLastError();
@@ -1435,15 +1522,17 @@ impl ProcessPageState {
     }
 
     // 通过 SetProcessAffinityMask 设置进程 CPU 亲和性。用户通过对话框选择 CPU。
-    unsafe fn set_affinity(&mut self, pid: u32) -> bool {
-        let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION, 0, pid);
-        if handle.is_null() {
-            self.show_failure_message(
-                &self.strings.cant_set_affinity,
-                windows_sys::Win32::Foundation::GetLastError(),
-            );
-            return false;
-        }
+    unsafe fn set_affinity(&mut self, identity: &ProcessIdentity) -> bool {
+        let handle = match open_revalidated_process(
+            identity,
+            PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_set_affinity, error);
+                return false;
+            }
+        };
 
         let mut process_mask = 0usize;
         let mut system_mask = 0usize;
@@ -2106,11 +2195,14 @@ fn copy_text_to_callback_buffer(buffer: *mut u16, capacity: usize, text: &str) {
 
 // 遍历进程树，按“子进程先于父进程”的顺序返回终止列表（后序遍历）。
 // 使用 Toolhelp 快照建立父子关系表，递归收集子进程。
-fn collect_process_tree_termination_order(root_pid: u32) -> Vec<u32> {
+fn collect_process_tree_termination_order(root_pid: u32) -> Vec<ProcessIdentity> {
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot == INVALID_HANDLE_VALUE {
-            return vec![root_pid];
+            return vec![ProcessIdentity {
+                pid: root_pid,
+                creation_time_100ns: query_process_creation_time_for_pid(root_pid).unwrap_or(0),
+            }];
         }
 
         let mut child_map = HashMap::<u32, Vec<u32>>::new();
@@ -2135,6 +2227,12 @@ fn collect_process_tree_termination_order(root_pid: u32) -> Vec<u32> {
         let mut visited = HashMap::<u32, ()>::new();
         collect_process_tree_children(root_pid, &child_map, &mut visited, &mut order);
         order
+            .into_iter()
+            .map(|pid| ProcessIdentity {
+                pid,
+                creation_time_100ns: query_process_creation_time_for_pid(pid).unwrap_or(0),
+            })
+            .collect()
     }
 }
 
@@ -2158,25 +2256,60 @@ fn collect_process_tree_children(
     order.push(pid);
 }
 
-// 通过 QueryFullProcessImageNameW 查询进程可执行文件的全路径。
-unsafe fn query_process_image_path(pid: u32) -> Option<String> {
-    let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-    if handle.is_null() {
-        return None;
-    }
-
+unsafe fn query_process_image_path_from_handle(handle: HANDLE) -> Option<String> {
     let mut capacity = 32768u32;
     let mut buffer = vec![0u16; capacity as usize];
     let success = QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut capacity);
-    let error = windows_sys::Win32::Foundation::GetLastError();
-    CloseHandle(handle);
-
     if success == 0 {
-        windows_sys::Win32::Foundation::SetLastError(error);
         return None;
     }
 
     Some(String::from_utf16_lossy(&buffer[..capacity as usize]))
+}
+
+unsafe fn query_process_creation_time(handle: HANDLE) -> Option<u64> {
+    let mut creation = zeroed::<FILETIME>();
+    let mut exit = zeroed::<FILETIME>();
+    let mut kernel = zeroed::<FILETIME>();
+    let mut user = zeroed::<FILETIME>();
+    (GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) != 0)
+        .then_some(filetime_to_u64(creation))
+}
+
+unsafe fn query_process_creation_time_for_pid(pid: u32) -> Option<u64> {
+    let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+    if handle.is_null() {
+        return None;
+    }
+    let creation_time = query_process_creation_time(handle);
+    CloseHandle(handle);
+    creation_time
+}
+
+unsafe fn open_revalidated_process(
+    identity: &ProcessIdentity,
+    desired_access: u32,
+) -> Result<HANDLE, u32> {
+    let handle = OpenProcess(
+        desired_access | PROCESS_QUERY_LIMITED_INFORMATION,
+        0,
+        identity.pid,
+    );
+    if handle.is_null() {
+        return Err(windows_sys::Win32::Foundation::GetLastError());
+    }
+
+    if identity.creation_time_100ns != 0 {
+        match query_process_creation_time(handle) {
+            Some(creation_time) if creation_time == identity.creation_time_100ns => {}
+            _ => {
+                CloseHandle(handle);
+                return Err(ERROR_INVALID_PARAMETER);
+            }
+        }
+    }
+
+    Ok(handle)
 }
 
 unsafe fn collect_process_entries(
@@ -2202,6 +2335,7 @@ unsafe fn collect_process_entries(
             let image_name = utf16_buffer_to_string(&process_entry.szExeFile);
             let mut entry = ProcEntry {
                 pid,
+                creation_time_100ns: 0,
                 image_name: image_name.clone(),
                 image_name_lower: image_name.to_lowercase(),
                 is_32_bit: false,
@@ -2256,6 +2390,7 @@ unsafe fn collect_process_entries(
                     &mut user,
                 ) != 0
                 {
+                    entry.creation_time_100ns = filetime_to_u64(creation);
                     let cpu_time_100ns =
                         filetime_to_u64(kernel).saturating_add(filetime_to_u64(user));
                     let previous = previous_samples.get(&pid).cloned().unwrap_or_default();
@@ -2375,6 +2510,13 @@ unsafe fn window_rect_relative_to_page(hwnd: HWND, page_hwnd: HWND) -> RECT {
 }
 
 impl ProcEntry {
+    fn identity(&self) -> ProcessIdentity {
+        ProcessIdentity {
+            pid: self.pid,
+            creation_time_100ns: self.creation_time_100ns,
+        }
+    }
+
     fn with_pass_count(mut self, pass_count: u64) -> Self {
         self.pass_count = pass_count;
         self.dirty_columns = DirtyColumns::all();
@@ -2400,6 +2542,7 @@ fn update_process_entry(entry: &mut ProcEntry, snapshot: &ProcEntry, pass_count:
         entry.pid = snapshot.pid;
         entry.dirty_columns.mark(ColumnId::Pid);
     }
+    entry.creation_time_100ns = snapshot.creation_time_100ns;
     if entry.user_name != snapshot.user_name {
         entry.user_name.clone_from(&snapshot.user_name);
         entry.user_name_lower = snapshot.user_name_lower.clone();
