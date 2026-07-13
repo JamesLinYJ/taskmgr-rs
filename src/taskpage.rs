@@ -205,17 +205,11 @@ type TaskWorkerResult = Result<Vec<WorkerTaskEntry>, u32>;
 enum WorkerCommand {
     // 后台线程当前只负责枚举任务窗口和有序退出。
     Collect {
-        seq: u64,
         main_hwnd: isize,
         notify_hwnd: isize,
         known_tasks: HashSet<TaskIdentity>,
     },
     Shutdown,
-}
-
-struct WorkerResult {
-    seq: u64,
-    tasks: Vec<WorkerTaskEntry>,
 }
 
 impl TaskEntry {
@@ -442,15 +436,6 @@ impl TaskPageState {
         if force || !self.paused {
             self.refresh_tasks();
         }
-    }
-
-    pub fn handle_refresh_complete(&mut self, _seq: u64) -> isize {
-        self.consume_refresh_results();
-        if self.refresh_pending && !self.paused {
-            self.refresh_pending = false;
-            self.refresh_tasks();
-        }
-        1
     }
 
     pub fn destroy(&mut self) {
@@ -1060,8 +1045,9 @@ impl TaskPageState {
     fn update_task_listview(&mut self, selected_identities: &HashSet<TaskIdentity>) {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
-            // 只有行身份/数量变化时才暂停整表重绘；普通状态变化只重绘脏行。
+            // 更新 ListView 时先暂停重绘，批量完成替换/删除/插入后再统一恢复。
             let list_hwnd = self.list_hwnd();
+            SendMessageW(list_hwnd, WM_SETREDRAW, 0, 0);
 
             let mut existing_count = SendMessageW(list_hwnd, LVM_GETITEMCOUNT, 0, 0) as usize;
             let common_count = existing_count.min(self.tasks.len());
@@ -1077,10 +1063,9 @@ impl TaskPageState {
                         selected_identities.contains(&task.identity),
                     );
                     self.tasks[index].dirty_columns = DirtyTaskColumns::default();
-                    dirty_rows.mark(index);
                 } else if task.dirty_columns.any() {
+                    SendMessageW(list_hwnd, LVM_REDRAWITEMS, index, index as LPARAM);
                     self.tasks[index].dirty_columns = DirtyTaskColumns::default();
-                    dirty_rows.mark(index);
                 }
             }
 
@@ -1098,7 +1083,6 @@ impl TaskPageState {
                     selected_identities.contains(&task.identity) || (select_first && index == 0),
                 );
                 self.tasks[index].dirty_columns = DirtyTaskColumns::default();
-                dirty_rows.mark(index);
             }
 
             self.displayed_identities.clear();
@@ -1164,6 +1148,7 @@ impl TaskPageState {
                 ..zeroed()
             };
             SendMessageW(list_hwnd, LVM_SETITEMW, 0, &mut item as *mut _ as LPARAM);
+            SendMessageW(list_hwnd, LVM_REDRAWITEMS, index, index as LPARAM);
         }
     }
 

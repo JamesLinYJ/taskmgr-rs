@@ -39,7 +39,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::chart_renderer::{ChartColor, ChartFrame, ChartRenderer};
-use crate::drawing::{HistoryBuffer, HistoryView};
 use crate::language::{adapter_state, network_column_titles};
 use crate::options::Options;
 use crate::resource::{
@@ -370,23 +369,6 @@ impl NetworkPageState {
         true
     }
 
-    unsafe fn destroy_cached_graph_surface(&mut self) {
-        if !self.cached_graph_dc.is_null() && !self.cached_graph_bitmap_old.is_null() {
-            SelectObject(self.cached_graph_dc, self.cached_graph_bitmap_old);
-        }
-        if !self.cached_graph_bitmap.is_null() {
-            DeleteObject(self.cached_graph_bitmap as _);
-        }
-        if !self.cached_graph_dc.is_null() {
-            DeleteDC(self.cached_graph_dc);
-        }
-        self.cached_graph_dc = null_mut();
-        self.cached_graph_bitmap = null_mut();
-        self.cached_graph_bitmap_old = null_mut();
-        self.cached_graph_width = 0;
-        self.cached_graph_height = 0;
-    }
-
     pub fn graph_pane_index(&self, control_id: i32) -> Option<usize> {
         let pane_index = control_id.saturating_sub(IDC_NICGRAPH) as usize;
         if control_id >= IDC_NICGRAPH && pane_index < self.graphs.len() {
@@ -447,21 +429,21 @@ impl NetworkPageState {
             draw_history(
                 self.cached_graph_dc,
                 &plot_rect,
-                adapter.total_history.view(),
+                &adapter.total_history,
                 rgb(0, 255, 0),
                 zoom,
             );
             draw_history(
                 self.cached_graph_dc,
                 &plot_rect,
-                adapter.received_history.view(),
+                &adapter.received_history,
                 rgb(255, 255, 0),
                 zoom,
             );
             draw_history(
                 self.cached_graph_dc,
                 &plot_rect,
-                adapter.sent_history.view(),
+                &adapter.sent_history,
                 rgb(255, 0, 0),
                 zoom,
             );
@@ -509,21 +491,21 @@ impl NetworkPageState {
             draw_history_gpu(
                 &frame,
                 &plot_rect,
-                adapter.total_history.view(),
+                &adapter.total_history,
                 ChartColor::Green,
                 zoom,
             );
             draw_history_gpu(
                 &frame,
                 &plot_rect,
-                adapter.received_history.view(),
+                &adapter.received_history,
                 ChartColor::Yellow,
                 zoom,
             );
             draw_history_gpu(
                 &frame,
                 &plot_rect,
-                adapter.sent_history.view(),
+                &adapter.sent_history,
                 ChartColor::Red,
                 zoom,
             );
@@ -922,9 +904,9 @@ impl NetworkPageState {
             let total_util =
                 utilization_percent_for_history(total_delta, raw.link_speed_bps, elapsed_secs);
 
-            sent_history.push(sent_util);
-            received_history.push(received_util);
-            total_history.push(total_util);
+            push_history(&mut sent_history, sent_util);
+            push_history(&mut received_history, received_util);
+            push_history(&mut total_history, total_util);
 
             let bytes_total = raw.bytes_sent.saturating_add(raw.bytes_received);
             let mut adapter = NetworkAdapterEntry {
@@ -1065,12 +1047,13 @@ impl NetworkPageState {
             return;
         }
 
+        SendMessageW(list, WM_SETREDRAW, 0, 0);
+
         let mut existing_count = SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) as usize;
         let common_count = existing_count.min(self.adapters.len());
-        let mut current_interface_indices = Vec::with_capacity(common_count);
-        let mut structure_changed = existing_count != self.adapters.len();
 
         for index in 0..common_count {
+            let adapter = &self.adapters[index];
             let mut current_item = LVITEMW {
                 mask: LVIF_PARAM,
                 iItem: index as i32,
@@ -1082,28 +1065,11 @@ impl NetworkPageState {
                 } else {
                     None
                 };
-            if current_interface_index != Some(self.adapters[index].interface_index) {
-                structure_changed = true;
-            }
-            current_interface_indices.push(current_interface_index);
-        }
 
-        if structure_changed {
-            SendMessageW(list, WM_SETREDRAW, 0, 0);
-        }
-
-        let mut dirty_rows = ListViewDirtyRange::default();
-
-        for (index, current_interface_index) in
-            current_interface_indices.iter().copied().enumerate()
-        {
-            let adapter = &self.adapters[index];
             if current_interface_index != Some(adapter.interface_index) {
                 self.replace_row(list, index, adapter);
-                dirty_rows.mark(index);
             } else if adapter.dirty {
                 self.update_row(list, index, adapter);
-                dirty_rows.mark(index);
             }
         }
 
@@ -1114,14 +1080,9 @@ impl NetworkPageState {
 
         for index in common_count..self.adapters.len() {
             self.insert_row(list, index, &self.adapters[index]);
-            dirty_rows.mark(index);
         }
 
-        if structure_changed {
-            finish_list_view_update_deferred(list);
-            InvalidateRect(list, null_mut(), 0);
-        }
-        dirty_rows.redraw(list, self.adapters.len());
+        finish_list_view_update(list);
     }
 
     unsafe fn insert_row(&self, list: HWND, index: usize, adapter: &NetworkAdapterEntry) {
@@ -1239,7 +1200,20 @@ impl NetworkPageState {
                 DestroyWindow(graph.frame_hwnd);
             }
         }
-        self.destroy_cached_graph_surface();
+        if !self.cached_graph_bitmap_old.is_null() {
+            SelectObject(self.cached_graph_dc, self.cached_graph_bitmap_old);
+        }
+        if !self.cached_graph_bitmap.is_null() {
+            DeleteObject(self.cached_graph_bitmap as _);
+        }
+        if !self.cached_graph_dc.is_null() {
+            DeleteDC(self.cached_graph_dc);
+        }
+        self.cached_graph_dc = null_mut();
+        self.cached_graph_bitmap = null_mut();
+        self.cached_graph_bitmap_old = null_mut();
+        self.cached_graph_width = 0;
+        self.cached_graph_height = 0;
         self.graphs_per_page = 0;
         self.first_visible_adapter = 0;
     }

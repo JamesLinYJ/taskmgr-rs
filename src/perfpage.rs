@@ -362,7 +362,7 @@ impl PerformancePageState {
                         &target_rect,
                         plot_layout,
                         HistorySeries {
-                            history: self.kernel_history[pane_index].view(),
+                            history: &self.kernel_history[pane_index],
                             color: ChartColor::Red,
                             stop_on_zero: false,
                         },
@@ -389,7 +389,7 @@ impl PerformancePageState {
                     &target_rect,
                     plot_layout,
                     HistorySeries {
-                        history: self.cpu_history[pane_index].view(),
+                        history: &self.cpu_history[pane_index],
                         color: ChartColor::Green,
                         stop_on_zero: false,
                     },
@@ -464,7 +464,7 @@ impl PerformancePageState {
                     scale,
                 },
                 HistorySeries {
-                    history: self.mem_history.view(),
+                    history: &self.mem_history,
                     color: ChartColor::Yellow,
                     stop_on_zero: true,
                 },
@@ -513,7 +513,7 @@ impl PerformancePageState {
                     &target_rect,
                     plot_layout,
                     HistorySeries {
-                        history: self.kernel_history[pane_index].view(),
+                        history: &self.kernel_history[pane_index],
                         color: ChartColor::Red,
                         stop_on_zero: false,
                     },
@@ -538,7 +538,7 @@ impl PerformancePageState {
                 &target_rect,
                 plot_layout,
                 HistorySeries {
-                    history: self.cpu_history[pane_index].view(),
+                    history: &self.cpu_history[pane_index],
                     color: ChartColor::Green,
                     stop_on_zero: false,
                 },
@@ -579,7 +579,7 @@ impl PerformancePageState {
                 scale,
             },
             HistorySeries {
-                history: self.mem_history.view(),
+                history: &self.mem_history,
                 color: ChartColor::Yellow,
                 stop_on_zero: true,
             },
@@ -846,7 +846,7 @@ impl PerformancePageState {
         // 否则“每核图”和“汇总图”会看到不一致的采样长度。
         if self.processor_count == processor_count
             && self.cpu_history.len() == processor_count
-            && self.mem_history.view().len() == HIST_SIZE
+            && self.mem_history.len() == HIST_SIZE
         {
             return;
         }

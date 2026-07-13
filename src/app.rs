@@ -1407,10 +1407,7 @@ impl App {
     }
 
     fn show_help(&self, hwnd: HWND) {
-        let Some(help_path) = help_file_path() else {
-            return;
-        };
-        let help_path = to_wide_null(&help_path);
+        let help_path = to_wide_null("taskmgr.hlp");
         // 安全性: `help_path` is a NUL-terminated UTF-16 buffer valid for the duration of call.
         unsafe { WinHelpW(hwnd, help_path.as_ptr(), HELP_FINDER, 0) };
     }
@@ -1771,9 +1768,6 @@ impl App {
     fn on_notify(&mut self, lparam: LPARAM) -> isize {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
-            if lparam == 0 {
-                return 0;
-            }
             let header = &*(lparam as *const NMHDR);
             if header.idFrom as i32 == IDC_TABS && header.code == TCN_SELCHANGE {
                 let tabs_hwnd = GetDlgItem(self.main_hwnd, IDC_TABS);
@@ -1896,11 +1890,6 @@ fn clamped_window_size(
     (width_px.max(min_width), height_px.max(min_height))
 }
 
-fn help_file_path() -> Option<String> {
-    let path = env::current_exe().ok()?.parent()?.join("taskmgr.hlp");
-    path.is_file().then(|| path.to_string_lossy().into_owned())
-}
-
 unsafe extern "system" fn main_window_proc(
     hwnd: HWND,
     msg: u32,
@@ -1989,7 +1978,7 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_GETMINMAXINFO => {
-            if lparam != 0 && !application.options.no_title() {
+            if !application.options.no_title() {
                 let info = &mut *(lparam as *mut MINMAXINFO);
                 info.ptMinTrackSize.x = application.min_width;
                 info.ptMinTrackSize.y = application.min_height;
