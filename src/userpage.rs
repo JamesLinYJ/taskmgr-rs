@@ -1,19 +1,23 @@
-use std::cmp::Reverse;
 use std::collections::HashMap;
 
 // 用户页实现。
 // 这里负责枚举终端服务会话、刷新用户列表，并处理发送消息、断开连接、
 // 注销等会话级操作。
-use std::mem::zeroed;
+use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
 use std::slice;
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::thread::{self, JoinHandle};
 
-use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{
+    GetLastError, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_INVALID_PARAMETER,
+    ERROR_NOT_ENOUGH_MEMORY, HWND, LPARAM, RECT, WPARAM,
+};
 
 use windows_sys::Win32::System::RemoteDesktop::{
     WTSActive, WTSClientName, WTSConnectQuery, WTSConnected, WTSDisconnectSession, WTSDisconnected,
-    WTSDomainName, WTSDown, WTSEnumerateSessionsW, WTSIdle, WTSInit, WTSListen, WTSLogoffSession,
-    WTSQuerySessionInformationW, WTSReset, WTSSendMessageW, WTSShadow, WTSUserName,
+    WTSDown, WTSEnumerateSessionsW, WTSIdle, WTSInit, WTSListen, WTSLogoffSession,
+    WTSQuerySessionInformationW, WTSReset, WTSSendMessageW, WTSSessionInfo, WTSShadow, WTSINFOW,
     WTS_CONNECTSTATE_CLASS, WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW,
 };
 use windows_sys::Win32::UI::Controls::{
@@ -27,10 +31,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EndDialog, GetClientRect,
     GetDialogBaseUnits, GetDlgItem, GetWindowTextLengthW, GetWindowTextW, MessageBoxW,
-    SendMessageW, TrackPopupMenuEx, HMENU, IDCANCEL, IDNO, IDOK, MB_DEFBUTTON2, MB_ICONERROR,
-    MB_ICONEXCLAMATION, MB_ICONINFORMATION, MB_OK, MB_TOPMOST, MB_YESNO, MF_BYCOMMAND, MF_CHECKED,
-    MF_DISABLED, MF_GRAYED, MF_UNCHECKED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    TPM_RETURNCMD, WM_COMMAND, WM_INITDIALOG, WM_SETREDRAW,
+    PostMessageW, SendMessageW, TrackPopupMenuEx, HMENU, IDCANCEL, IDOK, IDYES, MB_DEFBUTTON2,
+    MB_ICONERROR, MB_ICONEXCLAMATION, MB_ICONINFORMATION, MB_OK, MB_TOPMOST, MB_YESNO,
+    MF_BYCOMMAND, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_UNCHECKED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, TPM_RETURNCMD, WM_COMMAND, WM_INITDIALOG, WM_SETREDRAW,
 };
 
 use crate::dialog_templates::dialog_box;
@@ -41,24 +45,50 @@ use crate::menus::build_popup_menu;
 use crate::options::Options;
 use crate::resource::{
     IDC_MESSAGE_MESSAGE, IDC_MESSAGE_TITLE, IDC_USERLIST, IDD_MESSAGE, IDM_DISCONNECT, IDM_LOGOFF,
-    IDM_SENDMESSAGE, IDM_SHOWDOMAINNAMES, IDR_USER_CONTEXT,
+    IDM_SENDMESSAGE, IDM_SHOWDOMAINNAMES, IDR_USER_CONTEXT, PWM_USER_WORKER_COMPLETE,
 };
 use crate::winutil::{
-    destroy_menu_handle, finish_list_view_update, get_window_userdata, loword, set_window_userdata,
-    subclass_list_view, to_wide_null, widestr_ptr_to_string, window_rect_relative_to_page,
+    destroy_menu_handle, finish_list_view_update, get_window_userdata, loword, record_win32_error,
+    set_window_userdata, subclass_list_view, to_wide_null, window_rect_relative_to_page,
     OwnedWtsMemory,
 };
 const DEFSPACING_BASE: i32 = 3;
 const DLG_SCALE_X: i32 = 4;
 
-struct UserSessionEntry {
-    // `UserSessionEntry` 保存一行用户/会话信息以及最小重绘所需的脏标志。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct UserSessionIdentity {
     session_id: u32,
-    display_name: String,
+    logon_time_100ns: i64,
+    user_name: String,
+    domain_name: String,
+}
+
+struct UserSessionSnapshot {
+    identity: UserSessionIdentity,
     status: String,
     client_name: String,
     session_name: String,
+}
+
+struct UserSessionEntry {
+    // `UserSessionEntry` 保存一行用户/会话信息以及最小重绘所需的脏标志。
+    identity: UserSessionIdentity,
+    display_name: String,
+    display_name_lower: String,
+    status: String,
+    status_lower: String,
+    client_name: String,
+    client_name_lower: String,
+    session_name: String,
+    session_name_lower: String,
     dirty: bool,
+}
+
+type UserWorkerResult = Result<Vec<UserSessionSnapshot>, u32>;
+
+enum UserWorkerCommand {
+    Collect { notify_hwnd: isize },
+    Shutdown,
 }
 
 #[derive(Default)]
@@ -75,10 +105,16 @@ pub struct UserPageState {
     hwnd: HWND,
     no_title: bool,
     show_domain_names: bool,
-    selected_session_id: Option<u32>,
+    selected_session_identity: Option<UserSessionIdentity>,
     sessions: Vec<UserSessionEntry>,
     sort_column: usize,
     sort_ascending: bool,
+    worker_sender: Option<Sender<UserWorkerCommand>>,
+    worker_result_receiver: Option<Receiver<UserWorkerResult>>,
+    worker_thread: Option<JoinHandle<()>>,
+    collection_in_flight: bool,
+    refresh_requested: bool,
+    last_refresh_error: Option<u32>,
 }
 
 impl UserPageState {
@@ -86,23 +122,23 @@ impl UserPageState {
         Self::default()
     }
 
-    pub fn initialize(&mut self, hwnd: HWND) {
-        // 用户页初始化时把 ListView 立刻配置好并做首轮会话枚举，
-        // 这样页面第一次切入就已经带着当前在线用户状态。
+    pub fn initialize(&mut self, hwnd: HWND) -> Result<(), u32> {
+        // 初始化只配置 ListView 和布局；首轮会话枚举由激活或首帧后的预热入口触发。
         // 安全性: all Win32 calls target the user page HWND and its child controls during UI-thread
         // initialization.
         unsafe {
             self.hinstance =
                 windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(null_mut()) as isize;
             self.hwnd = hwnd;
+            self.start_worker_thread()?;
             let list = self.list_hwnd();
             if !list.is_null() {
                 subclass_list_view(list);
             }
             self.configure_columns();
-            self.refresh();
             self.size_page();
         }
+        Ok(())
     }
 
     pub fn apply_options(&mut self, options: &Options) {
@@ -123,7 +159,58 @@ impl UserPageState {
         self.refresh();
     }
 
-    pub fn destroy(&mut self) {}
+    pub fn destroy(&mut self) {
+        self.stop_worker_thread();
+    }
+
+    fn start_worker_thread(&mut self) -> Result<(), u32> {
+        if self.worker_sender.is_some() {
+            return Ok(());
+        }
+
+        let (command_sender, command_receiver) = channel::<UserWorkerCommand>();
+        let (result_sender, result_receiver) = channel::<UserWorkerResult>();
+        let worker = thread::Builder::new()
+            .name("rtaskmgr-user-sampler".to_string())
+            .spawn(move || {
+                while let Ok(command) = command_receiver.recv() {
+                    match command {
+                        UserWorkerCommand::Collect { notify_hwnd } => {
+                            let result = collect_user_sessions();
+                            if result_sender.send(result).is_ok() {
+                                unsafe {
+                                    PostMessageW(
+                                        notify_hwnd as HWND,
+                                        PWM_USER_WORKER_COMPLETE,
+                                        0,
+                                        0,
+                                    );
+                                }
+                            }
+                        }
+                        UserWorkerCommand::Shutdown => break,
+                    }
+                }
+            })
+            .map_err(thread_spawn_error)?;
+
+        self.worker_sender = Some(command_sender);
+        self.worker_result_receiver = Some(result_receiver);
+        self.worker_thread = Some(worker);
+        Ok(())
+    }
+
+    fn stop_worker_thread(&mut self) {
+        if let Some(sender) = self.worker_sender.take() {
+            let _ = sender.send(UserWorkerCommand::Shutdown);
+        }
+        if let Some(worker) = self.worker_thread.take() {
+            let _ = worker.join();
+        }
+        self.worker_result_receiver = None;
+        self.collection_in_flight = false;
+        self.refresh_requested = false;
+    }
 
     pub fn size_page(&self) {
         // 用户页采用“列表占满上方，按钮固定在下方右侧”的经典布局。
@@ -191,7 +278,7 @@ impl UserPageState {
             let notify = &*(lparam as *const NMLISTVIEW);
             if notify.hdr.idFrom as i32 == IDC_USERLIST {
                 if notify.hdr.code == LVN_ITEMCHANGED {
-                    self.selected_session_id = self.current_selected_session_id();
+                    self.selected_session_identity = self.current_selected_session_identity();
                     self.update_ui_state();
                     return 1;
                 }
@@ -203,7 +290,11 @@ impl UserPageState {
                         self.sort_column = column;
                         self.sort_ascending = true;
                     }
-                    self.refresh();
+                    self.sort_sessions();
+                    self.update_listview();
+                    if let Some(identity) = self.selected_session_identity.clone() {
+                        self.restore_selection(&identity);
+                    }
                     return 1;
                 }
             }
@@ -228,7 +319,7 @@ impl UserPageState {
             }
             IDM_SHOWDOMAINNAMES => {
                 self.show_domain_names = !self.show_domain_names;
-                self.refresh();
+                self.rebuild_display_names();
                 true
             }
             _ => false,
@@ -239,7 +330,7 @@ impl UserPageState {
         // 右键菜单只在有选择时弹出，并按当前会话状态动态禁用不合法操作。
         // 安全性: context menu and selection queries are UI-thread operations for this page.
         unsafe {
-            let selected = self.selected_session_ids();
+            let selected = self.selected_session_identities();
             if selected.is_empty() {
                 return;
             }
@@ -299,118 +390,151 @@ impl UserPageState {
     }
 
     fn refresh(&mut self) {
-        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
-        unsafe {
-            // 刷新时先保存上一轮会话映射，再和新枚举结果做比对，
-            // 这样可以知道哪些行真正发生了变化。
-            let previous_selection = self.selected_session_id;
-            let mut previous_sessions = HashMap::with_capacity(self.sessions.len());
-            for session in self.sessions.drain(..) {
-                previous_sessions.insert(session.session_id, session);
-            }
-            let mut sessions_ptr = null_mut::<WTS_SESSION_INFOW>();
-            let mut session_count = 0u32;
-            if WTSEnumerateSessionsW(
-                WTS_CURRENT_SERVER_HANDLE,
-                0,
-                1,
-                &mut sessions_ptr,
-                &mut session_count,
-            ) == 0
-                || sessions_ptr.is_null()
-            {
-                self.sessions.clear();
-                self.update_listview();
-                self.update_ui_state();
-                return;
-            }
+        self.drain_worker_results();
+        if self.collection_in_flight {
+            self.refresh_requested = true;
+            return;
+        }
 
-            let Some(sessions_memory) = OwnedWtsMemory::new(sessions_ptr) else {
-                return;
+        self.refresh_requested = false;
+        self.schedule_collection();
+    }
+
+    fn schedule_collection(&mut self) {
+        let Some(sender) = self.worker_sender.as_ref() else {
+            self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
+            return;
+        };
+        if sender
+            .send(UserWorkerCommand::Collect {
+                notify_hwnd: self.hwnd as isize,
+            })
+            .is_err()
+        {
+            self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
+            return;
+        }
+        self.collection_in_flight = true;
+    }
+
+    fn drain_worker_results(&mut self) {
+        loop {
+            let result = match self.worker_result_receiver.as_ref() {
+                Some(receiver) => receiver.try_recv(),
+                None => return,
             };
 
-            let mut sessions = Vec::with_capacity(session_count as usize);
-            for session in slice::from_raw_parts(sessions_memory.as_ptr(), session_count as usize) {
-                let user_name = query_session_string(session.SessionId, WTSUserName);
-                if user_name.is_empty() {
-                    continue;
-                }
-
-                let domain_name = query_session_string(session.SessionId, WTSDomainName);
-                let client_name = query_session_string(session.SessionId, WTSClientName);
-                let display_name = if domain_name.is_empty() || !self.show_domain_names {
-                    user_name.clone()
-                } else {
-                    format!("{domain_name}\\{user_name}")
-                };
-
-                let mut entry = UserSessionEntry {
-                    session_id: session.SessionId,
-                    display_name,
-                    status: session_state_text(session.State),
-                    client_name: if client_name.is_empty() {
-                        "-".to_string()
-                    } else {
-                        client_name
-                    },
-                    session_name: widestr_ptr_to_string(session.pWinStationName),
-                    dirty: true,
-                };
-                if let Some(previous) = previous_sessions.remove(&entry.session_id) {
-                    entry.dirty = previous.display_name != entry.display_name
-                        || previous.status != entry.status
-                        || previous.client_name != entry.client_name
-                        || previous.session_name != entry.session_name;
-                }
-                sessions.push(entry);
-            }
-
-            match self.sort_column {
-                1 => sessions.sort_by(|left, right| {
-                    compare_user_sessions(left, right, self.sort_column, self.sort_ascending)
-                }),
-                2 => {
-                    if self.sort_ascending {
-                        sessions.sort_by_cached_key(|entry| entry.status.to_lowercase());
-                    } else {
-                        sessions.sort_by_cached_key(|entry| Reverse(entry.status.to_lowercase()));
+            match result {
+                Ok(result) => {
+                    self.collection_in_flight = false;
+                    match result {
+                        Ok(sessions) => {
+                            self.last_refresh_error = None;
+                            self.apply_session_snapshot(sessions);
+                        }
+                        Err(error) => self.set_refresh_error(error),
                     }
                 }
-                3 => {
-                    if self.sort_ascending {
-                        sessions.sort_by_cached_key(|entry| entry.client_name.to_lowercase());
-                    } else {
-                        sessions
-                            .sort_by_cached_key(|entry| Reverse(entry.client_name.to_lowercase()));
-                    }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.worker_result_receiver = None;
+                    self.worker_sender = None;
+                    self.collection_in_flight = false;
+                    self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
+                    return;
                 }
-                4 => {
-                    if self.sort_ascending {
-                        sessions.sort_by_cached_key(|entry| entry.session_name.to_lowercase());
-                    } else {
-                        sessions
-                            .sort_by_cached_key(|entry| Reverse(entry.session_name.to_lowercase()));
-                    }
-                }
-                _ => {
-                    if self.sort_ascending {
-                        sessions.sort_by_cached_key(|entry| entry.display_name.to_lowercase());
-                    } else {
-                        sessions
-                            .sort_by_cached_key(|entry| Reverse(entry.display_name.to_lowercase()));
-                    }
-                }
-            }
-            self.sessions = sessions;
-            self.update_listview();
-
-            self.selected_session_id = previous_selection;
-            if let Some(session_id) = previous_selection {
-                self.restore_selection(session_id);
-            } else {
-                self.update_ui_state();
             }
         }
+    }
+
+    pub fn handle_worker_completion(&mut self) {
+        self.drain_worker_results();
+        if self.refresh_requested && !self.collection_in_flight {
+            self.refresh_requested = false;
+            self.schedule_collection();
+        }
+    }
+
+    fn apply_session_snapshot(&mut self, snapshots: Vec<UserSessionSnapshot>) {
+        let previous_selection = self.selected_session_identity.clone();
+        let mut sessions = Vec::with_capacity(snapshots.len());
+        for snapshot in snapshots {
+            let display_name =
+                format_session_display_name(&snapshot.identity, self.show_domain_names);
+            sessions.push(UserSessionEntry {
+                identity: snapshot.identity,
+                display_name_lower: display_name.to_lowercase(),
+                display_name,
+                status_lower: snapshot.status.to_lowercase(),
+                status: snapshot.status,
+                client_name_lower: snapshot.client_name.to_lowercase(),
+                client_name: snapshot.client_name,
+                session_name_lower: snapshot.session_name.to_lowercase(),
+                session_name: snapshot.session_name,
+                dirty: true,
+            });
+        }
+
+        let mut previous_sessions = HashMap::with_capacity(self.sessions.len());
+        for session in self.sessions.drain(..) {
+            previous_sessions.insert(session.identity.clone(), session);
+        }
+        for entry in &mut sessions {
+            if let Some(previous) = previous_sessions.remove(&entry.identity) {
+                entry.dirty = previous.display_name != entry.display_name
+                    || previous.status != entry.status
+                    || previous.client_name != entry.client_name
+                    || previous.session_name != entry.session_name;
+            }
+        }
+
+        self.sessions = sessions;
+        self.sort_sessions();
+        self.update_listview();
+
+        self.selected_session_identity = previous_selection.filter(|identity| {
+            self.sessions
+                .iter()
+                .any(|entry| entry.identity == *identity)
+        });
+        if let Some(identity) = self.selected_session_identity.clone() {
+            self.restore_selection(&identity);
+        } else {
+            self.update_ui_state();
+        }
+    }
+
+    fn sort_sessions(&mut self) {
+        self.sessions.sort_by(|left, right| {
+            compare_user_sessions(left, right, self.sort_column, self.sort_ascending)
+        });
+    }
+
+    fn rebuild_display_names(&mut self) {
+        let previous_selection = self.selected_session_identity.clone();
+        for session in &mut self.sessions {
+            let display_name =
+                format_session_display_name(&session.identity, self.show_domain_names);
+            if session.display_name != display_name {
+                session.display_name_lower = display_name.to_lowercase();
+                session.display_name = display_name;
+                session.dirty = true;
+            }
+        }
+        self.sort_sessions();
+        self.update_listview();
+        if let Some(identity) = previous_selection {
+            self.restore_selection(&identity);
+        } else {
+            self.update_ui_state();
+        }
+    }
+
+    fn set_refresh_error(&mut self, error: u32) {
+        if self.last_refresh_error != Some(error) {
+            record_win32_error("user session refresh", error);
+        }
+        self.last_refresh_error = Some(error);
     }
 
     fn update_listview(&self) {
@@ -443,7 +567,7 @@ impl UserPageState {
                         None
                     };
 
-                if current_session_id != Some(session.session_id) {
+                if current_session_id != Some(session.identity.session_id) {
                     self.replace_row(list, index, session);
                 } else if session.dirty {
                     self.update_row(list, index, session);
@@ -473,7 +597,7 @@ impl UserPageState {
                 iSubItem: 0,
                 pszText: user_name.as_mut_ptr(),
                 cchTextMax: user_name.len() as i32,
-                lParam: session.session_id as isize,
+                lParam: session.identity.session_id as isize,
                 ..zeroed()
             };
             SendMessageW(list, LVM_INSERTITEMW, 0, &mut item as *mut _ as isize);
@@ -491,7 +615,7 @@ impl UserPageState {
                 iSubItem: 0,
                 pszText: user_name.as_mut_ptr(),
                 cchTextMax: user_name.len() as i32,
-                lParam: session.session_id as isize,
+                lParam: session.identity.session_id as isize,
                 ..zeroed()
             };
             SendMessageW(list, LVM_SETITEMW, 0, &mut item as *mut _ as isize);
@@ -512,7 +636,7 @@ impl UserPageState {
             ];
             for (subitem, text) in row.iter().enumerate() {
                 let content = if subitem == 1 {
-                    session.session_id.to_string()
+                    session.identity.session_id.to_string()
                 } else {
                     (*text).to_string()
                 };
@@ -530,7 +654,7 @@ impl UserPageState {
         }
     }
 
-    fn restore_selection(&self, session_id: u32) {
+    fn restore_selection(&self, identity: &UserSessionIdentity) {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             let list = self.list_hwnd();
@@ -539,7 +663,7 @@ impl UserPageState {
             }
 
             for (index, session) in self.sessions.iter().enumerate() {
-                if session.session_id != session_id {
+                if session.identity != *identity {
                     continue;
                 }
 
@@ -557,7 +681,7 @@ impl UserPageState {
         }
     }
 
-    fn current_selected_session_id(&self) -> Option<u32> {
+    fn current_selected_session_identity(&self) -> Option<UserSessionIdentity> {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             let list = self.list_hwnd();
@@ -577,7 +701,11 @@ impl UserPageState {
                 ..zeroed()
             };
             if SendMessageW(list, LVM_GETITEMW, 0, &mut item as *mut _ as isize) != 0 {
-                Some(item.lParam as u32)
+                let session_id = item.lParam as u32;
+                self.sessions
+                    .iter()
+                    .find(|entry| entry.identity.session_id == session_id)
+                    .map(|entry| entry.identity.clone())
             } else {
                 None
             }
@@ -589,16 +717,16 @@ impl UserPageState {
         unsafe {
             // “发送消息”只要有选择就可用；
             // “断开”则不能对已经断开的会话再次执行。
-            let selected = self.selected_session_ids();
+            let selected = self.selected_session_identities();
             let send_enabled = !selected.is_empty();
             let mut disconnect_enabled = !selected.is_empty();
             let logoff_enabled = !selected.is_empty();
 
-            for session_id in &selected {
+            for identity in &selected {
                 if let Some(session) = self
                     .sessions
                     .iter()
-                    .find(|entry| entry.session_id == *session_id)
+                    .find(|entry| entry.identity == *identity)
                 {
                     if session.status == session_state("Disconnected") {
                         disconnect_enabled = false;
@@ -621,7 +749,7 @@ impl UserPageState {
         }
     }
 
-    fn selected_session_ids(&self) -> Vec<u32> {
+    fn selected_session_identities(&self) -> Vec<UserSessionIdentity> {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 批量操作都基于当前多选会话列表，因此这里统一把所有选中项提取出来。
@@ -649,25 +777,33 @@ impl UserPageState {
                     ..zeroed()
                 };
                 if SendMessageW(list, LVM_GETITEMW, 0, &mut item as *mut _ as isize) != 0 {
-                    selected.push(item.lParam as u32);
+                    let session_id = item.lParam as u32;
+                    if let Some(identity) = self
+                        .sessions
+                        .iter()
+                        .find(|entry| entry.identity.session_id == session_id)
+                        .map(|entry| entry.identity.clone())
+                    {
+                        selected.push(identity);
+                    }
                 }
             }
             selected
         }
     }
 
-    fn update_menu_state(&self, popup: HMENU, selected: &[u32]) {
+    fn update_menu_state(&self, popup: HMENU, selected: &[UserSessionIdentity]) {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             let send_enabled = !selected.is_empty();
             let mut disconnect_enabled = !selected.is_empty();
             let logoff_enabled = !selected.is_empty();
 
-            for session_id in selected {
+            for identity in selected {
                 if let Some(session) = self
                     .sessions
                     .iter()
-                    .find(|entry| entry.session_id == *session_id)
+                    .find(|entry| entry.identity == *identity)
                 {
                     if session.status == session_state("Disconnected") {
                         disconnect_enabled = false;
@@ -713,7 +849,7 @@ impl UserPageState {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 发送消息会先弹出输入对话框，再逐个会话调用 WTSSendMessageW。
-            let selected = self.selected_session_ids();
+            let selected = self.selected_session_identities();
             if selected.is_empty() {
                 return;
             }
@@ -730,13 +866,26 @@ impl UserPageState {
                 return;
             }
 
+            if let Err(error) = validate_session_identities(&selected) {
+                self.show_command_failure_with_error(text(TextKey::MessageCouldNotBeSent), error);
+                self.refresh();
+                return;
+            }
+
             let title = to_wide_null(&result.title);
             let body = to_wide_null(&result.body);
-            for session_id in selected {
+            for identity in selected {
+                if let Err(error) = validate_session_identity(&identity) {
+                    self.show_command_failure_with_error(
+                        text(TextKey::MessageCouldNotBeSent),
+                        error,
+                    );
+                    break;
+                }
                 let mut response = 0i32;
                 if WTSSendMessageW(
                     WTS_CURRENT_SERVER_HANDLE,
-                    session_id,
+                    identity.session_id,
                     title.as_ptr(),
                     (result.title.encode_utf16().count() * 2) as u32,
                     body.as_ptr(),
@@ -758,7 +907,7 @@ impl UserPageState {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 断开/注销属于高影响操作，先确认，再逐个会话执行，失败时立即报错并停止。
-            let selected = self.selected_session_ids();
+            let selected = self.selected_session_identities();
             if selected.is_empty() {
                 return;
             }
@@ -775,23 +924,34 @@ impl UserPageState {
                 prompt_wide.as_ptr(),
                 caption_wide.as_ptr(),
                 MB_YESNO | MB_DEFBUTTON2 | MB_ICONEXCLAMATION,
-            ) == IDNO
+            ) != IDYES
             {
                 return;
             }
 
-            for session_id in selected {
+            let failure_message = if command_id == IDM_LOGOFF {
+                text(TextKey::SelectedUserCouldNotBeLoggedOff)
+            } else {
+                text(TextKey::SelectedUserCouldNotBeDisconnected)
+            };
+            if let Err(error) = validate_session_identities(&selected) {
+                self.show_command_failure_with_error(failure_message, error);
+                self.refresh();
+                return;
+            }
+
+            for identity in selected {
+                if let Err(error) = validate_session_identity(&identity) {
+                    self.show_command_failure_with_error(failure_message, error);
+                    break;
+                }
                 let succeeded = if command_id == IDM_LOGOFF {
-                    WTSLogoffSession(WTS_CURRENT_SERVER_HANDLE, session_id, 0) != 0
+                    WTSLogoffSession(WTS_CURRENT_SERVER_HANDLE, identity.session_id, 0) != 0
                 } else {
-                    WTSDisconnectSession(WTS_CURRENT_SERVER_HANDLE, session_id, 0) != 0
+                    WTSDisconnectSession(WTS_CURRENT_SERVER_HANDLE, identity.session_id, 0) != 0
                 };
                 if !succeeded {
-                    self.show_command_failure(if command_id == IDM_LOGOFF {
-                        text(TextKey::SelectedUserCouldNotBeLoggedOff)
-                    } else {
-                        text(TextKey::SelectedUserCouldNotBeDisconnected)
-                    });
+                    self.show_command_failure(failure_message);
                     break;
                 }
             }
@@ -804,15 +964,18 @@ impl UserPageState {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 统一附带最后一个 Win32 错误码，方便排查权限或会话状态问题。
-            let last_error = GetLastError();
-            let body = if last_error == 0 {
+            self.show_command_failure_with_error(message, GetLastError());
+        }
+    }
+
+    fn show_command_failure_with_error(&self, message: &str, error: u32) {
+        // 安全性: the strings are converted to stable, null-terminated UTF-16 buffers for the
+        // duration of the synchronous MessageBoxW call.
+        unsafe {
+            let body = if error == 0 {
                 message.to_string()
             } else {
-                format!(
-                    "{}\n\n{} {last_error}",
-                    message,
-                    text(TextKey::Win32ErrorPrefix)
-                )
+                format!("{}\n\n{} {error}", message, text(TextKey::Win32ErrorPrefix))
             };
             let body_wide = to_wide_null(&body);
             let caption_wide = to_wide_null(text(TextKey::AppTitle));
@@ -831,30 +994,195 @@ impl UserPageState {
     }
 }
 
-fn query_session_string(session_id: u32, info_class: i32) -> String {
+fn collect_user_sessions() -> UserWorkerResult {
+    // WTSEnumerateSessionsW and all per-session queries run on the sampler thread. A single
+    // failed query rejects the whole candidate snapshot so the UI never mixes old and partial
+    // session data.
+    unsafe {
+        let mut sessions_ptr = null_mut::<WTS_SESSION_INFOW>();
+        let mut session_count = 0u32;
+        let succeeded = WTSEnumerateSessionsW(
+            WTS_CURRENT_SERVER_HANDLE,
+            0,
+            1,
+            &mut sessions_ptr,
+            &mut session_count,
+        ) != 0;
+        let error = GetLastError();
+        if !succeeded {
+            if let Some(memory) = OwnedWtsMemory::new(sessions_ptr) {
+                drop(memory);
+            }
+            return Err(win32_error_or_gen_failure(error));
+        }
+
+        if session_count == 0 {
+            if let Some(memory) = OwnedWtsMemory::new(sessions_ptr) {
+                drop(memory);
+            }
+            return Ok(Vec::new());
+        }
+
+        let Some(sessions_memory) = OwnedWtsMemory::new(sessions_ptr) else {
+            return Err(ERROR_INVALID_DATA);
+        };
+        let raw_sessions = slice::from_raw_parts(
+            sessions_memory.as_ptr(),
+            usize::try_from(session_count).map_err(|_| ERROR_INVALID_DATA)?,
+        );
+        let mut sessions = Vec::with_capacity(raw_sessions.len());
+        for raw_session in raw_sessions {
+            let info = query_session_info(raw_session.SessionId)?;
+            let identity = session_identity_from_info(&info);
+            if identity.user_name.is_empty() {
+                continue;
+            }
+
+            let client_name = query_session_string(raw_session.SessionId, WTSClientName)?;
+            sessions.push(UserSessionSnapshot {
+                identity,
+                status: session_state_text(info.State),
+                client_name: if client_name.is_empty() {
+                    "-".to_string()
+                } else {
+                    client_name
+                },
+                session_name: wide_array_to_string(&info.WinStationName),
+            });
+        }
+        Ok(sessions)
+    }
+}
+
+fn query_session_info(session_id: u32) -> Result<WTSINFOW, u32> {
+    unsafe {
+        let mut buffer = null_mut::<u16>();
+        let mut bytes = 0u32;
+        let succeeded = WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            session_id,
+            WTSSessionInfo,
+            &mut buffer,
+            &mut bytes,
+        ) != 0;
+        let error = GetLastError();
+        if !succeeded {
+            if let Some(memory) = OwnedWtsMemory::new(buffer) {
+                drop(memory);
+            }
+            return Err(win32_error_or_gen_failure(error));
+        }
+
+        let Some(memory) = OwnedWtsMemory::new(buffer) else {
+            return Err(ERROR_INVALID_DATA);
+        };
+        if bytes < size_of::<WTSINFOW>() as u32 {
+            return Err(ERROR_INVALID_DATA);
+        }
+
+        let info = std::ptr::read_unaligned(memory.as_ptr().cast::<WTSINFOW>());
+        if info.SessionId != session_id {
+            return Err(ERROR_INVALID_DATA);
+        }
+        Ok(info)
+    }
+}
+
+fn session_identity_from_info(info: &WTSINFOW) -> UserSessionIdentity {
+    UserSessionIdentity {
+        session_id: info.SessionId,
+        logon_time_100ns: info.LogonTime,
+        user_name: wide_array_to_string(&info.UserName),
+        domain_name: wide_array_to_string(&info.Domain),
+    }
+}
+
+fn wide_array_to_string(values: &[u16]) -> String {
+    let length = values
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(values.len());
+    String::from_utf16_lossy(&values[..length])
+}
+
+fn format_session_display_name(identity: &UserSessionIdentity, show_domain_names: bool) -> String {
+    if show_domain_names && !identity.domain_name.is_empty() {
+        format!("{}\\{}", identity.domain_name, identity.user_name)
+    } else {
+        identity.user_name.clone()
+    }
+}
+
+fn validate_session_identity(expected: &UserSessionIdentity) -> Result<(), u32> {
+    let current = session_identity_from_info(&query_session_info(expected.session_id)?);
+    validate_observed_session_identity(expected, &current)
+}
+
+fn validate_observed_session_identity(
+    expected: &UserSessionIdentity,
+    current: &UserSessionIdentity,
+) -> Result<(), u32> {
+    if current == expected {
+        Ok(())
+    } else {
+        Err(ERROR_INVALID_PARAMETER)
+    }
+}
+
+fn validate_session_identities(expected: &[UserSessionIdentity]) -> Result<(), u32> {
+    for identity in expected {
+        validate_session_identity(identity)?;
+    }
+    Ok(())
+}
+
+fn win32_error_or_gen_failure(error: u32) -> u32 {
+    if error == 0 {
+        ERROR_GEN_FAILURE
+    } else {
+        error
+    }
+}
+
+fn thread_spawn_error(error: std::io::Error) -> u32 {
+    error
+        .raw_os_error()
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(ERROR_NOT_ENOUGH_MEMORY)
+}
+
+fn query_session_string(session_id: u32, info_class: i32) -> Result<String, u32> {
     // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         // 终端服务 API 返回的是系统分配的 UTF-16 缓冲区，需要在复制完字符串后手动释放。
         let mut buffer = null_mut();
         let mut bytes = 0u32;
-        if WTSQuerySessionInformationW(
+        let succeeded = WTSQuerySessionInformationW(
             WTS_CURRENT_SERVER_HANDLE,
             session_id,
             info_class,
             &mut buffer,
             &mut bytes,
-        ) == 0
-            || buffer.is_null()
-            || bytes == 0
-        {
-            return String::new();
+        ) != 0;
+        let error = GetLastError();
+        if !succeeded {
+            if let Some(buffer) = OwnedWtsMemory::new(buffer) {
+                drop(buffer);
+            }
+            return Err(win32_error_or_gen_failure(error));
         }
-
         let Some(buffer) = OwnedWtsMemory::new(buffer) else {
-            return String::new();
+            return Err(ERROR_INVALID_DATA);
         };
-        let len = (bytes as usize / 2).saturating_sub(1);
-        String::from_utf16_lossy(slice::from_raw_parts(buffer.as_ptr(), len))
+        if bytes < size_of::<u16>() as u32 || !bytes.is_multiple_of(size_of::<u16>() as u32) {
+            return Err(ERROR_INVALID_DATA);
+        }
+        let values = slice::from_raw_parts(buffer.as_ptr(), bytes as usize / size_of::<u16>());
+        let length = values
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(values.len());
+        Ok(String::from_utf16_lossy(&values[..length]))
     }
 }
 
@@ -866,20 +1194,17 @@ fn compare_user_sessions(
 ) -> std::cmp::Ordering {
     // 用户页排序按当前列切换；字符串列统一转小写比较，保证大小写不影响顺序。
     let ordering = match sort_column {
-        1 => left.session_id.cmp(&right.session_id),
-        2 => left.status.to_lowercase().cmp(&right.status.to_lowercase()),
-        3 => left
-            .client_name
-            .to_lowercase()
-            .cmp(&right.client_name.to_lowercase()),
-        4 => left
-            .session_name
-            .to_lowercase()
-            .cmp(&right.session_name.to_lowercase()),
-        _ => left
-            .display_name
-            .to_lowercase()
-            .cmp(&right.display_name.to_lowercase()),
+        1 => left.identity.session_id.cmp(&right.identity.session_id),
+        2 => left.status_lower.cmp(&right.status_lower),
+        3 => left.client_name_lower.cmp(&right.client_name_lower),
+        4 => left.session_name_lower.cmp(&right.session_name_lower),
+        _ => left.display_name_lower.cmp(&right.display_name_lower),
+    };
+
+    let ordering = if ordering == std::cmp::Ordering::Equal {
+        left.identity.session_id.cmp(&right.identity.session_id)
+    } else {
+        ordering
     };
 
     if sort_ascending {
@@ -979,5 +1304,79 @@ fn get_dialog_item_text(hwnd: HWND, control_id: i32) -> String {
         };
 
         String::from_utf16_lossy(&buffer[..actual])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity(session_id: u32, logon_time_100ns: i64) -> UserSessionIdentity {
+        UserSessionIdentity {
+            session_id,
+            logon_time_100ns,
+            user_name: "James".to_string(),
+            domain_name: "WORKGROUP".to_string(),
+        }
+    }
+
+    fn entry(identity: UserSessionIdentity) -> UserSessionEntry {
+        UserSessionEntry {
+            identity,
+            display_name: "James".to_string(),
+            display_name_lower: "james".to_string(),
+            status: "Active".to_string(),
+            status_lower: "active".to_string(),
+            client_name: "-".to_string(),
+            client_name_lower: "-".to_string(),
+            session_name: "Console".to_string(),
+            session_name_lower: "console".to_string(),
+            dirty: false,
+        }
+    }
+
+    #[test]
+    fn reused_session_id_is_not_the_same_identity() {
+        let expected = identity(1, 100);
+        let current = identity(1, 200);
+
+        assert_eq!(
+            validate_observed_session_identity(&expected, &current),
+            Err(ERROR_INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn failed_worker_result_preserves_previous_snapshot() {
+        let expected = identity(1, 100);
+        let mut state = UserPageState::default();
+        state.sessions.push(entry(expected.clone()));
+        state.collection_in_flight = true;
+        let (sender, receiver) = channel::<UserWorkerResult>();
+        sender.send(Err(1722)).unwrap();
+        state.worker_result_receiver = Some(receiver);
+
+        state.drain_worker_results();
+
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].identity, expected);
+        assert_eq!(state.last_refresh_error, Some(1722));
+        assert!(!state.collection_in_flight);
+    }
+
+    #[test]
+    fn fixed_wide_string_stops_at_first_nul() {
+        let values = ['A' as u16, 'B' as u16, 0, 'C' as u16];
+        assert_eq!(wide_array_to_string(&values), "AB");
+    }
+
+    #[test]
+    fn domain_visibility_only_changes_display_name() {
+        let identity = identity(1, 100);
+        assert_eq!(format_session_display_name(&identity, false), "James");
+        assert_eq!(
+            format_session_display_name(&identity, true),
+            "WORKGROUP\\James"
+        );
     }
 }

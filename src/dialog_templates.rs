@@ -29,11 +29,14 @@ const ES_AUTOVSCROLL_STYLE: u32 = ES_AUTOVSCROLL as u32;
 const SBS_VERT_STYLE: u32 = SBS_VERT as u32;
 const DIALOG_FONT_NAME: &str = "MS Shell Dlg";
 const DIALOG_FONT_SIZE: u16 = 8;
-const CPU_LABELS: [&str; 32] = [
+const CPU_LABELS: [&str; 64] = [
     "CPU 0", "CPU 1", "CPU 2", "CPU 3", "CPU 4", "CPU 5", "CPU 6", "CPU 7", "CPU 8", "CPU 9",
     "CPU 10", "CPU 11", "CPU 12", "CPU 13", "CPU 14", "CPU 15", "CPU 16", "CPU 17", "CPU 18",
     "CPU 19", "CPU 20", "CPU 21", "CPU 22", "CPU 23", "CPU 24", "CPU 25", "CPU 26", "CPU 27",
-    "CPU 28", "CPU 29", "CPU 30", "CPU 31",
+    "CPU 28", "CPU 29", "CPU 30", "CPU 31", "CPU 32", "CPU 33", "CPU 34", "CPU 35", "CPU 36",
+    "CPU 37", "CPU 38", "CPU 39", "CPU 40", "CPU 41", "CPU 42", "CPU 43", "CPU 44", "CPU 45",
+    "CPU 46", "CPU 47", "CPU 48", "CPU 49", "CPU 50", "CPU 51", "CPU 52", "CPU 53", "CPU 54",
+    "CPU 55", "CPU 56", "CPU 57", "CPU 58", "CPU 59", "CPU 60", "CPU 61", "CPU 62", "CPU 63",
 ];
 
 struct ControlSpec<'a> {
@@ -64,16 +67,20 @@ struct DialogSpec<'a> {
 }
 
 struct DialogTemplateBuilder {
-    // Win32 对话框模板本质上是一段按字对齐的 `u16` 数据流。
-    words: Vec<u16>,
+    // Win32 要求 DLGTEMPLATE 起始地址 DWORD 对齐；用 Vec<u32> 承载可保证堆指针对齐。
+    dwords: Vec<u32>,
+    word_len: usize,
 }
 
 impl DialogTemplateBuilder {
     fn new() -> Self {
-        Self { words: Vec::new() }
+        Self {
+            dwords: Vec::new(),
+            word_len: 0,
+        }
     }
 
-    fn build(mut self, spec: DialogSpec<'_>) -> Vec<u16> {
+    fn build(mut self, spec: DialogSpec<'_>) -> Vec<u32> {
         // 按 `DLGTEMPLATE` / `DLGITEMTEMPLATE` 的内存布局顺序写入模板。
         self.push_u32(spec.style | DS_SETFONT);
         self.push_u32(spec.ex_style);
@@ -102,32 +109,39 @@ impl DialogTemplateBuilder {
             self.push_u16(0);
         }
 
-        self.words
+        self.dwords
     }
 
     fn align_dword(&mut self) {
         // 子控件模板要求按 DWORD 对齐。
-        if !self.words.len().is_multiple_of(2) {
-            self.words.push(0);
+        if !self.word_len.is_multiple_of(2) {
+            self.push_u16(0);
         }
     }
 
     fn push_u16(&mut self, value: u16) {
-        self.words.push(value);
+        if self.word_len.is_multiple_of(2) {
+            self.dwords.push(u32::from(value));
+        } else if let Some(last) = self.dwords.last_mut() {
+            *last |= u32::from(value) << 16;
+        }
+        self.word_len += 1;
     }
 
     fn push_i16(&mut self, value: i16) {
-        self.words.push(value as u16);
+        self.push_u16(value as u16);
     }
 
     fn push_u32(&mut self, value: u32) {
-        self.words.push((value & 0xFFFF) as u16);
-        self.words.push((value >> 16) as u16);
+        self.push_u16((value & 0xFFFF) as u16);
+        self.push_u16((value >> 16) as u16);
     }
 
     fn push_str(&mut self, text: &str) {
-        self.words.extend(text.encode_utf16());
-        self.words.push(0);
+        for code_unit in text.encode_utf16() {
+            self.push_u16(code_unit);
+        }
+        self.push_u16(0);
     }
 }
 
@@ -654,8 +668,8 @@ fn build_select_columns_dialog() -> DialogSpec<'static> {
 
 fn build_affinity_dialog() -> DialogSpec<'static> {
     let mut controls = Vec::new();
-    for cpu_index in 0..=31 {
-        let (column, row) = (cpu_index / 8, cpu_index % 8);
+    for cpu_index in 0..=MAX_AFFINITY_CPU {
+        let (column, row) = (cpu_index / 16, cpu_index % 16);
         let x = match column {
             0 => 13,
             1 => 65,
@@ -684,12 +698,12 @@ fn build_affinity_dialog() -> DialogSpec<'static> {
         x: 7,
         y: 25,
         cx: 217,
-        cy: 108,
+        cy: 204,
     });
-    controls.push(button("OK", 1, BS_DEFPUSHBUTTON_STYLE, 121, 138, 50, 14));
-    controls.push(button("Cancel", 2, 0, 175, 138, 50, 14));
+    controls.push(button("OK", 1, BS_DEFPUSHBUTTON_STYLE, 121, 234, 50, 14));
+    controls.push(button("Cancel", 2, 0, 175, 234, 50, 14));
     controls.push(static_text(
-        "The Processor Affinity setting controls which CPUs the process will be allowed to execute on.",
+        "Controls which CPUs in the process's current processor group it may execute on.",
         IDC_AFFINITY_DESC,
         0,
         7,
@@ -703,7 +717,7 @@ fn build_affinity_dialog() -> DialogSpec<'static> {
         x: 20,
         y: 20,
         cx: 232,
-        cy: 157,
+        cy: 253,
         title: "Processor Affinity",
         font_name: DIALOG_FONT_NAME,
         font_size: DIALOG_FONT_SIZE,
@@ -845,5 +859,36 @@ pub fn dialog_box(
             dialog_proc,
             init_param,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dialog_spec, DialogTemplateBuilder};
+    use crate::resource::{
+        IDD_AFFINITY, IDD_MAINWND, IDD_MESSAGE, IDD_NETPAGE, IDD_PERFPAGE, IDD_PROCPAGE,
+        IDD_SELECTPROCCOLS, IDD_TASKPAGE, IDD_USERSPAGE,
+    };
+
+    #[test]
+    fn generated_dialog_templates_are_dword_aligned() {
+        for dialog_id in [
+            IDD_MAINWND,
+            IDD_PERFPAGE,
+            IDD_NETPAGE,
+            IDD_PROCPAGE,
+            IDD_TASKPAGE,
+            IDD_SELECTPROCCOLS,
+            IDD_AFFINITY,
+            IDD_USERSPAGE,
+            IDD_MESSAGE,
+        ] {
+            let template = DialogTemplateBuilder::new().build(dialog_spec(dialog_id).unwrap());
+            assert!(!template.is_empty());
+            assert_eq!(
+                (template.as_ptr() as usize) % std::mem::align_of::<u32>(),
+                0
+            );
+        }
     }
 }

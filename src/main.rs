@@ -7,6 +7,7 @@ mod app;
 mod app_controllers;
 mod assets;
 mod chart_renderer;
+mod cpu_sampler;
 mod dialog_templates;
 mod drawing;
 mod language;

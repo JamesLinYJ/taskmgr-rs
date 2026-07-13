@@ -8,8 +8,9 @@ use std::ptr::{null, null_mut, NonNull};
 use std::sync::OnceLock;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, FreeLibrary, ERROR_ALREADY_EXISTS, HANDLE, HINSTANCE, HMODULE, HWND, LPARAM,
-    POINT, RECT, TRUE, WPARAM,
+    CloseHandle, FreeLibrary, ERROR_ALREADY_EXISTS, ERROR_GEN_FAILURE, ERROR_TIMEOUT, HANDLE,
+    HINSTANCE, HMODULE, HWND, LPARAM, POINT, RECT, TRUE, WAIT_ABANDONED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     CreateRectRgn, DeleteObject, FillRect, GetDC, GetDCEx, GetDeviceCaps, GetSysColorBrush,
@@ -21,9 +22,9 @@ use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
 };
-use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, ReleaseMutex, SetProcessShutdownParameters, WaitForSingleObject,
+    CreateMutexW, GetActiveProcessorCount, ReleaseMutex, SetProcessShutdownParameters,
+    WaitForSingleObject, ALL_PROCESSOR_GROUPS,
 };
 use windows_sys::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ICC_TAB_CLASSES,
@@ -34,27 +35,28 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, ReleaseCapture, SetCapture, VK_CONTROL,
 };
-use windows_sys::Win32::UI::Shell::{ShellAboutW, WinHelpW, NIM_ADD, NIM_DELETE};
+use windows_sys::Win32::UI::Shell::{ShellAboutW, ShellExecuteW, WinHelpW, NIM_ADD, NIM_DELETE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CheckMenuItem, CheckMenuRadioItem, CreateWindowExW, DefWindowProcW, DeleteMenu, DestroyWindow,
-    DispatchMessageW, DrawMenuBar, EnableMenuItem, FindWindowW, GetClassInfoW, GetClientRect,
-    GetCursorPos, GetDlgItem, GetForegroundWindow, GetMenu, GetMenuItemInfoW, GetMessageW,
-    GetShellWindow, GetWindowLongW, GetWindowPlacement, GetWindowRect, IsDialogMessageW, IsIconic,
-    IsWindowVisible, IsZoomed, KillTimer, MessageBoxW, OpenIcon, PostMessageW, PostQuitMessage,
-    RegisterClassW, SendMessageTimeoutW, SendMessageW, SetForegroundWindow, SetMenu,
-    SetMenuDefaultItem, SetTimer, SetWindowLongW, SetWindowPos, SetWindowTextW, ShowWindow,
-    TrackPopupMenuEx, TranslateAcceleratorW, TranslateMessage, GWL_STYLE, HACCEL, HELP_FINDER,
-    HICON, HMENU, HTCAPTION, HTCLIENT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDCANCEL,
-    LR_DEFAULTCOLOR, LR_DEFAULTSIZE, MB_ICONSTOP, MB_OK, MENUITEMINFOW, MF_BYCOMMAND, MF_CHECKED,
-    MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_SYSMENU, MF_UNCHECKED, MIIM_ID, MINMAXINFO,
-    MSG, SIZE_MINIMIZED, SMTO_ABORTIFHUNG, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_MINIMIZE, SW_SHOW, SW_SHOWMAXIMIZED,
-    SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, TPM_RETURNCMD, WINDOWPLACEMENT, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITDIALOG,
-    WM_INITMENU, WM_LBUTTONDBLCLK, WM_MENUSELECT, WM_MOVE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK,
-    WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETICON,
-    WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_DLGFRAME,
-    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_TILEDWINDOW, WS_VISIBLE,
+    CheckMenuItem, CheckMenuRadioItem, CreateWindowExW, DefWindowProcW, DeleteMenu,
+    DestroyAcceleratorTable, DestroyWindow, DispatchMessageW, DrawMenuBar, EnableMenuItem,
+    FindWindowW, GetClassInfoW, GetClientRect, GetCursorPos, GetDlgItem, GetForegroundWindow,
+    GetMenu, GetMenuItemInfoW, GetMessageW, GetShellWindow, GetWindowLongW, GetWindowPlacement,
+    GetWindowRect, IsDialogMessageW, IsIconic, IsWindowVisible, IsZoomed, KillTimer, MessageBoxW,
+    OpenIcon, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageTimeoutW, SendMessageW,
+    SetForegroundWindow, SetMenu, SetMenuDefaultItem, SetTimer, SetWindowLongW, SetWindowPos,
+    SetWindowTextW, ShowWindow, TrackPopupMenuEx, TranslateAcceleratorW, TranslateMessage,
+    GWL_STYLE, HACCEL, HELP_FINDER, HICON, HMENU, HTCAPTION, HTCLIENT, HWND_NOTOPMOST, HWND_TOP,
+    HWND_TOPMOST, IDCANCEL, LR_DEFAULTCOLOR, LR_DEFAULTSIZE, MB_ICONSTOP, MB_OK, MENUITEMINFOW,
+    MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_SYSMENU,
+    MF_UNCHECKED, MIIM_ID, MINMAXINFO, MSG, SIZE_MINIMIZED, SMTO_ABORTIFHUNG, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_MINIMIZE,
+    SW_SHOW, SW_SHOWMAXIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_RETURNCMD,
+    WINDOWPLACEMENT, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_INITDIALOG, WM_INITMENU, WM_LBUTTONDBLCLK, WM_MENUSELECT, WM_MOVE,
+    WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETICON, WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD,
+    WS_CLIPSIBLINGS, WS_DLGFRAME, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+    WS_TILEDWINDOW, WS_VISIBLE,
 };
 
 use crate::app_controllers::{
@@ -64,13 +66,15 @@ use crate::assets::{create_accelerator_table, load_icon_resource, MAIN_ICON_RESO
 use crate::dialog_templates::create_dialog;
 use crate::language::{localize_dialog, menu_status_help, text, TextKey};
 use crate::menus::build_popup_menu;
-use crate::options::Options;
+use crate::options::{update_speed_timer_interval, CpuHistoryMode, Options};
 use crate::pages::{default_pages, DialogPage};
+use crate::procpage::ProcIdentity;
 use crate::resource::*;
 use crate::winutil::{
-    call_window_proc, destroy_icon_handle, destroy_menu_handle, format_resource_string, height,
-    hiword, loword, sanitize_task_manager_menu, set_dialog_msg_result, set_style,
-    set_window_userdata_ptr, to_wide_null, width, window_userdata_non_null,
+    call_window_proc, destroy_icon_handle, destroy_menu_handle, enable_debug_privilege,
+    format_resource_string, height, hiword, loword, process_is_elevated, record_win32_error,
+    sanitize_task_manager_menu, set_dialog_msg_result, set_style, set_window_userdata_ptr,
+    to_wide_null, width, window_userdata_non_null,
 };
 
 const STARTUP_MUTEX_NAME: &str = "NTShell Taskman Startup Mutex";
@@ -107,8 +111,11 @@ pub struct App {
     hinstance: HINSTANCE,
     main_hwnd: HWND,
     status_hwnd: HWND,
+    timer_id: usize,
     startup_mutex: HANDLE,
+    startup_mutex_owned: bool,
     accelerator_table: HACCEL,
+    main_icon: HICON,
     menu: MenuController,
     tray: TrayController,
     strings: GlobalStrings,
@@ -119,6 +126,7 @@ pub struct App {
     min_width: i32,
     min_height: i32,
     already_applied_initial_position: bool,
+    initialization_error: Option<u32>,
 }
 
 pub fn run() -> i32 {
@@ -126,9 +134,49 @@ pub fn run() -> i32 {
     // 主窗口过程通过窗口 user data 回到这份状态，而不是依赖可变全局单例。
     // 安全性: 进程启动阶段尚未暴露任何窗口回调，`App` 只在当前线程初始化并运行。
     unsafe {
+        if let Err(error) = enable_debug_privilege() {
+            record_win32_error("enabling SeDebugPrivilege", error);
+            match process_is_elevated() {
+                Ok(false) => {
+                    return match relaunch_elevated() {
+                        Ok(()) => 0,
+                        Err(relaunch_error) => {
+                            record_win32_error("elevated relaunch", relaunch_error);
+                            1
+                        }
+                    };
+                }
+                Ok(true) => return 1,
+                Err(elevation_error) => {
+                    record_win32_error("querying process elevation", elevation_error);
+                    return 1;
+                }
+            }
+        }
+
         let hinstance = GetModuleHandleW(null());
         let mut app = App::new(hinstance);
         app.run_main()
+    }
+}
+
+unsafe fn relaunch_elevated() -> Result<(), u32> {
+    let executable = env::current_exe()
+        .map_err(|error| error.raw_os_error().unwrap_or(ERROR_GEN_FAILURE as i32) as u32)?;
+    let executable = to_wide_null(&executable.to_string_lossy());
+    let verb = to_wide_null("runas");
+    let result = ShellExecuteW(
+        null_mut(),
+        verb.as_ptr(),
+        executable.as_ptr(),
+        null(),
+        null(),
+        SW_SHOWNORMAL,
+    ) as isize;
+    if result > 32 {
+        Ok(())
+    } else {
+        Err(result.max(1) as u32)
     }
 }
 
@@ -171,6 +219,10 @@ unsafe extern "system" fn perf_frame_wndproc(
                             region,
                             DCX_CACHE | DCX_CLIPSIBLINGS | DCX_INTERSECTRGN,
                         );
+                        if !hdc.is_null() {
+                            // DCX_INTERSECTRGN 成功后由系统接管 HRGN，不能再次 DeleteObject。
+                            region = null_mut();
+                        }
                     }
                 }
 
@@ -227,8 +279,11 @@ impl App {
             hinstance,
             main_hwnd: null_mut(),
             status_hwnd: null_mut(),
+            timer_id: 0,
             startup_mutex: null_mut(),
+            startup_mutex_owned: false,
             accelerator_table: null_mut(),
+            main_icon: null_mut(),
             menu: MenuController::default(),
             tray: TrayController::default(),
             strings: GlobalStrings::default(),
@@ -239,13 +294,16 @@ impl App {
             min_width: 0,
             min_height: 0,
             already_applied_initial_position: false,
+            initialization_error: None,
         }
     }
 
     fn run_main(&mut self) -> i32 {
         // 启动链路按“单实例检查 -> 环境初始化 -> 创建主对话框 -> 进入消息循环”展开。
         // 这样既能兼容经典 Task Manager 的行为，也便于在失败点提前退出。
-        self.acquire_startup_mutex();
+        if !self.acquire_startup_mutex() {
+            return 1;
+        }
         if self.activate_existing_instance() {
             self.release_startup_mutex();
             return 0;
@@ -256,9 +314,22 @@ impl App {
             return 1;
         }
 
-        self.initialize_common_controls();
-        self.register_custom_controls();
-        self.load_global_resources();
+        if let Err(error) = self.initialize_common_controls() {
+            record_win32_error("common controls initialization", error);
+            self.release_startup_mutex();
+            return 1;
+        }
+        if let Err(error) = self.register_custom_controls() {
+            record_win32_error("custom control registration", error);
+            self.release_startup_mutex();
+            return 1;
+        }
+        if let Err(error) = self.load_global_resources() {
+            record_win32_error("global resource loading", error);
+            self.cleanup_failed_startup();
+            self.release_startup_mutex();
+            return 1;
+        }
         self.stats.processor_count = self.query_processor_count();
 
         self.main_hwnd = create_dialog(
@@ -269,6 +340,13 @@ impl App {
             self as *mut Self as LPARAM,
         );
         if self.main_hwnd.is_null() {
+            self.cleanup_failed_startup();
+            self.release_startup_mutex();
+            return 1;
+        }
+        if self.initialization_error.take().is_some() {
+            unsafe { DestroyWindow(self.main_hwnd) };
+            self.main_hwnd = null_mut();
             self.release_startup_mutex();
             return 1;
         }
@@ -302,7 +380,23 @@ impl App {
             SetProcessShutdownParameters(1, 0);
 
             let mut message = zeroed::<MSG>();
-            while GetMessageW(&raw mut message, null_mut(), 0, 0) > 0 {
+            loop {
+                let get_message_result = GetMessageW(&raw mut message, null_mut(), 0, 0);
+                if get_message_result == 0 {
+                    break message.wParam as i32;
+                }
+                if get_message_result < 0 {
+                    let error = windows_sys::Win32::Foundation::GetLastError();
+                    record_win32_error(
+                        "message loop",
+                        if error == 0 { ERROR_GEN_FAILURE } else { error },
+                    );
+                    if !self.main_hwnd.is_null() {
+                        DestroyWindow(self.main_hwnd);
+                    }
+                    break 1;
+                }
+
                 let page_hwnd = if self.options.current_page >= 0 {
                     self.pages[self.options.current_page as usize].hwnd()
                 } else {
@@ -329,22 +423,48 @@ impl App {
                     DispatchMessageW(&raw const message);
                 }
             }
-
-            message.wParam as i32
         }
     }
 
-    fn acquire_startup_mutex(&mut self) {
+    fn acquire_startup_mutex(&mut self) -> bool {
         // 命名互斥体用于串行化启动窗口，避免两个实例同时完成“是否已有实例”的判断。
         let mutex_name = to_wide_null(STARTUP_MUTEX_NAME);
         // 安全性: `mutex_name` is NUL-terminated and the returned handle is owned by App until
         // `release_startup_mutex`.
         unsafe {
             self.startup_mutex = CreateMutexW(null_mut(), TRUE, mutex_name.as_ptr());
-            if !self.startup_mutex.is_null()
-                && windows_sys::Win32::Foundation::GetLastError() == ERROR_ALREADY_EXISTS
-            {
-                WaitForSingleObject(self.startup_mutex, FINDME_TIMEOUT);
+            if self.startup_mutex.is_null() {
+                record_win32_error(
+                    "startup mutex creation",
+                    windows_sys::Win32::Foundation::GetLastError(),
+                );
+                return false;
+            }
+
+            if windows_sys::Win32::Foundation::GetLastError() != ERROR_ALREADY_EXISTS {
+                self.startup_mutex_owned = true;
+                return true;
+            }
+
+            let wait_result = WaitForSingleObject(self.startup_mutex, FINDME_TIMEOUT);
+            if wait_result == WAIT_OBJECT_0 || wait_result == WAIT_ABANDONED {
+                self.startup_mutex_owned = true;
+                true
+            } else {
+                let error = if wait_result == WAIT_TIMEOUT {
+                    ERROR_TIMEOUT
+                } else {
+                    let error = windows_sys::Win32::Foundation::GetLastError();
+                    if error == 0 {
+                        ERROR_GEN_FAILURE
+                    } else {
+                        error
+                    }
+                };
+                record_win32_error("startup mutex wait", error);
+                CloseHandle(self.startup_mutex);
+                self.startup_mutex = null_mut();
+                false
             }
         }
     }
@@ -354,10 +474,32 @@ impl App {
         if !self.startup_mutex.is_null() {
             // 安全性: App owns this mutex HANDLE and releases/closes it at most once.
             unsafe {
-                ReleaseMutex(self.startup_mutex);
+                if self.startup_mutex_owned {
+                    ReleaseMutex(self.startup_mutex);
+                }
                 CloseHandle(self.startup_mutex);
             }
             self.startup_mutex = null_mut();
+            self.startup_mutex_owned = false;
+        }
+    }
+
+    fn cleanup_failed_startup(&mut self) {
+        for page in self.pages.iter_mut() {
+            page.destroy();
+        }
+        if !self.menu.current_menu().is_null() {
+            destroy_menu_handle(self.menu.current_menu());
+            self.menu.clear_current_menu();
+        }
+        self.tray.clear_icons();
+        if !self.main_icon.is_null() {
+            destroy_icon_handle(self.main_icon);
+            self.main_icon = null_mut();
+        }
+        if !self.accelerator_table.is_null() {
+            unsafe { DestroyAcceleratorTable(self.accelerator_table) };
+            self.accelerator_table = null_mut();
         }
     }
 
@@ -449,31 +591,38 @@ impl App {
         }
     }
 
-    fn initialize_common_controls(&self) {
+    fn initialize_common_controls(&self) -> Result<(), u32> {
         // 页面里依赖 Tab、ListView、StatusBar 等公共控件类，必须在创建前统一注册。
         let classes = INITCOMMONCONTROLSEX {
             dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_BAR_CLASSES,
         };
         // 安全性: `classes` is initialized according to the common-controls API contract.
-        unsafe { InitCommonControlsEx(&classes) };
+        if unsafe { InitCommonControlsEx(&classes) } == 0 {
+            let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            Err(if error == 0 { ERROR_GEN_FAILURE } else { error })
+        } else {
+            Ok(())
+        }
     }
 
-    fn load_global_resources(&mut self) {
+    fn load_global_resources(&mut self) -> Result<(), u32> {
         // 这些资源会被菜单、状态栏和托盘图标反复使用，启动时一次性加载可以减少分散的 API 调用。
         self.accelerator_table = create_accelerator_table();
+        if self.accelerator_table.is_null() {
+            let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+        }
         self.strings.app_title = text(TextKey::AppTitle).to_string();
         self.strings.fmt_procs = text(TextKey::FormatProcesses).to_string();
         self.strings.fmt_cpu = text(TextKey::FormatCpuUsage).to_string();
         self.strings.fmt_mem = text(TextKey::FormatMemoryUsage).to_string();
+        Ok(())
     }
 
-    fn query_processor_count(&self) -> u8 {
-        // 安全性: SYSTEM_INFO is a POD out buffer filled synchronously by GetSystemInfo.
-        let mut sysinfo = unsafe { zeroed::<SYSTEM_INFO>() };
-        // 安全性: `sysinfo` is a valid out parameter.
-        unsafe { GetSystemInfo(&mut sysinfo) };
-        sysinfo.dwNumberOfProcessors as u8
+    fn query_processor_count(&self) -> usize {
+        // 统计所有 processor groups，避免 64+ CPU 机器被旧 SYSTEM_INFO 视角截断。
+        unsafe { (GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) as usize).max(1) }
     }
 
     fn on_init_dialog(&mut self, hwnd: HWND) -> isize {
@@ -494,6 +643,7 @@ impl App {
                 .set_base_styles(framed_style, borderless_window_style(framed_style));
 
             self.options.load(self.min_width, self.min_height);
+            self.enforce_cpu_history_display_limit();
 
             SetWindowPos(
                 hwnd,
@@ -509,7 +659,10 @@ impl App {
                 SWP_NOMOVE | SWP_NOSIZE,
             );
 
-            self.create_status_bar();
+            if let Err(error) = self.create_status_bar() {
+                self.initialization_error = Some(error);
+                return 0;
+            }
 
             // Keep the status bar above sibling child controls without promoting the whole app to topmost.
             if !self.status_hwnd.is_null() {
@@ -532,7 +685,7 @@ impl App {
                     self.hinstance,
                     self.main_hwnd,
                     tabs_hwnd,
-                    self.stats.processor_count as usize,
+                    self.stats.processor_count,
                 ) {
                     let title = to_wide_null(&self.strings.app_title);
                     let message = to_wide_null(&format!(
@@ -540,6 +693,7 @@ impl App {
                         index, error
                     ));
                     MessageBoxW(hwnd, message.as_ptr(), title.as_ptr(), MB_OK | MB_ICONSTOP);
+                    self.initialization_error = Some(error);
                     return 0;
                 }
 
@@ -574,17 +728,19 @@ impl App {
                 self.options.current_page as usize,
                 0,
             );
-            let _ = self.activate_page(self.options.current_page as usize);
+            if !self.activate_page(self.options.current_page as usize) {
+                self.initialization_error = Some(ERROR_GEN_FAILURE);
+                return 0;
+            }
 
             let mut client_rect = zeroed::<RECT>();
             GetClientRect(hwnd, &mut client_rect);
             self.on_size(hwnd, 0, width(&client_rect), height(&client_rect));
 
-            if self.options.timer_interval != 0 {
-                SetTimer(hwnd, 0, self.options.timer_interval, None);
+            if let Err(error) = self.replace_update_timer(self.options.timer_interval) {
+                self.initialization_error = Some(error);
+                return 0;
             }
-
-            self.on_timer(hwnd);
 
             if self.stats.processor_count <= 1 {
                 let menu = GetMenu(hwnd);
@@ -597,7 +753,7 @@ impl App {
         }
     }
 
-    fn create_status_bar(&mut self) {
+    fn create_status_bar(&mut self) -> Result<(), u32> {
         // 安全性: creates a status bar child for the live main window and configures it
         // synchronously before returning.
         unsafe {
@@ -615,10 +771,19 @@ impl App {
                 self.hinstance,
                 null_mut(),
             );
+            if self.status_hwnd.is_null() {
+                let error = windows_sys::Win32::Foundation::GetLastError();
+                return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+            }
 
             let hdc = GetDC(null_mut());
-            let pixels_per_inch = GetDeviceCaps(hdc, LOGPIXELSX as i32);
-            ReleaseDC(null_mut(), hdc);
+            let pixels_per_inch = if hdc.is_null() {
+                96
+            } else {
+                let dpi = GetDeviceCaps(hdc, LOGPIXELSX as i32).max(96);
+                ReleaseDC(null_mut(), hdc);
+                dpi
+            };
 
             let parts = [
                 pixels_per_inch,
@@ -626,23 +791,57 @@ impl App {
                 pixels_per_inch + (pixels_per_inch * 15) / 4,
                 -1,
             ];
-            SendMessageW(
+            if SendMessageW(
                 self.status_hwnd,
                 SB_SETPARTS,
                 parts.len(),
                 parts.as_ptr() as LPARAM,
-            );
+            ) == 0
+            {
+                let error = windows_sys::Win32::Foundation::GetLastError();
+                return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+            }
+            Ok(())
         }
     }
 
-    fn register_custom_controls(&self) {
+    fn replace_update_timer(&mut self, interval: u32) -> Result<(), u32> {
+        unsafe {
+            let old_timer = self.timer_id;
+            if interval == 0 {
+                if old_timer != 0 && KillTimer(self.main_hwnd, old_timer) == 0 {
+                    let error = windows_sys::Win32::Foundation::GetLastError();
+                    return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+                }
+                self.timer_id = 0;
+                return Ok(());
+            }
+
+            let new_timer = SetTimer(self.main_hwnd, 0, interval, None);
+            if new_timer == 0 {
+                let error = windows_sys::Win32::Foundation::GetLastError();
+                return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+            }
+
+            if old_timer != 0 && KillTimer(self.main_hwnd, old_timer) == 0 {
+                let error = windows_sys::Win32::Foundation::GetLastError();
+                KillTimer(self.main_hwnd, new_timer);
+                return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+            }
+            self.timer_id = new_timer;
+            Ok(())
+        }
+    }
+
+    fn register_custom_controls(&self) -> Result<(), u32> {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 性能页的 frame 控件借用了 Button 类的外观，但需要自定义背景擦除过程来降低闪烁。
             let mut button_class = zeroed::<WNDCLASSW>();
             let button_name = to_wide_null(BUTTON_CLASS);
             if GetClassInfoW(null_mut(), button_name.as_ptr(), &mut button_class) == 0 {
-                return;
+                let error = windows_sys::Win32::Foundation::GetLastError();
+                return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
             }
 
             let _ = FRAME_BASE_WNDPROC.set(button_class.lpfnWndProc);
@@ -650,7 +849,11 @@ impl App {
             button_class.lpfnWndProc = Some(perf_frame_wndproc);
             let class_name = to_wide_null(PERF_FRAME_CLASS_NAME);
             button_class.lpszClassName = class_name.as_ptr();
-            let _ = RegisterClassW(&button_class);
+            if RegisterClassW(&button_class) == 0 {
+                let error = windows_sys::Win32::Foundation::GetLastError();
+                return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+            }
+            Ok(())
         }
     }
 
@@ -670,38 +873,31 @@ impl App {
         let previous_page = self.options.current_page;
         let switching_pages = previous_page >= 0 && previous_page as usize != index;
 
-        if switching_pages {
-            self.pages[previous_page as usize].deactivate(&mut self.options);
-        }
-
         if self.pages[index]
             .activate(
                 self.hinstance,
                 self.main_hwnd,
                 &self.options,
-                self.stats.processor_count as usize,
+                self.stats.processor_count,
                 self.menu.current_menu_mut(),
             )
             .is_ok()
         {
+            if switching_pages {
+                self.pages[previous_page as usize].deactivate(&mut self.options);
+            }
             self.options.current_page = index as i32;
             self.update_menu_states();
             self.size_active_page();
-            self.refresh_active_page();
+            self.refresh_active_page(true);
             self.refresh_summary_stats();
             self.refresh_tray_icon();
             self.refresh_status_bar();
+            self.pages[index].show_and_focus();
             true
         } else {
             if switching_pages {
                 let previous_index = previous_page as usize;
-                let _ = self.pages[previous_index].activate(
-                    self.hinstance,
-                    self.main_hwnd,
-                    &self.options,
-                    self.stats.processor_count as usize,
-                    self.menu.current_menu_mut(),
-                );
                 self.options.current_page = previous_page;
                 // 安全性: retrieves and updates the tab control owned by the main window.
                 let tabs_hwnd = unsafe { GetDlgItem(self.main_hwnd, IDC_TABS) };
@@ -726,7 +922,7 @@ impl App {
             return;
         }
 
-        sanitize_task_manager_menu(menu, self.stats.processor_count as usize);
+        sanitize_task_manager_menu(menu, self.stats.processor_count);
 
         // 安全性: all calls mutate only the menu handle retrieved from this main window.
         unsafe {
@@ -797,26 +993,26 @@ impl App {
 
     fn apply_options_to_pages(&mut self) {
         for page in self.pages.iter_mut() {
-            page.apply_options(&self.options, self.stats.processor_count as usize);
+            page.apply_options(&self.options, self.stats.processor_count);
         }
     }
 
     fn refresh_task_page(&mut self) {
-        self.pages[TASK_PAGE].apply_options(&self.options, self.stats.processor_count as usize);
-        self.pages[TASK_PAGE].timer_event(&self.options, self.stats.processor_count as usize);
+        self.pages[TASK_PAGE].apply_options(&self.options, self.stats.processor_count);
+        self.pages[TASK_PAGE].timer_event(&self.options, self.stats.processor_count, true);
     }
 
     fn refresh_performance_page(&mut self) {
-        self.pages[PERF_PAGE].apply_options(&self.options, self.stats.processor_count as usize);
-        self.pages[PERF_PAGE].timer_event(&self.options, self.stats.processor_count as usize);
+        self.pages[PERF_PAGE].apply_options(&self.options, self.stats.processor_count);
+        self.pages[PERF_PAGE].timer_event(&self.options, self.stats.processor_count, true);
     }
 
-    fn refresh_active_page(&mut self) {
+    fn refresh_active_page(&mut self, force: bool) {
         // 定时器只推动当前可见页，隐藏页在切换到前台时再立即刷新。
         let Some(index) = active_page_index(self.options.current_page, self.pages.len()) else {
             return;
         };
-        self.pages[index].timer_event(&self.options, self.stats.processor_count as usize);
+        self.pages[index].timer_event(&self.options, self.stats.processor_count, force);
     }
 
     fn size_active_page(&mut self) {
@@ -909,6 +1105,47 @@ impl App {
         }
     }
 
+    fn prewarm_page(&mut self, index: usize) {
+        if index >= self.pages.len()
+            || Some(index) == active_page_index(self.options.current_page, self.pages.len())
+        {
+            return;
+        }
+
+        let page_rect = unsafe {
+            if self.options.no_title() {
+                let mut rect = zeroed::<RECT>();
+                GetClientRect(self.main_hwnd, &mut rect);
+                rect
+            } else {
+                let tabs_hwnd = GetDlgItem(self.main_hwnd, IDC_TABS);
+                if tabs_hwnd.is_null() {
+                    return;
+                }
+                adjusted_tab_page_rect(tabs_hwnd, self.main_hwnd)
+            }
+        };
+
+        let page_hwnd = self.pages[index].hwnd();
+        if page_hwnd.is_null() {
+            return;
+        }
+
+        unsafe {
+            SetWindowPos(
+                page_hwnd,
+                null_mut(),
+                page_rect.left,
+                page_rect.top,
+                width(&page_rect),
+                height(&page_rect),
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
+            );
+        }
+        self.pages[index].apply_options(&self.options, self.stats.processor_count);
+        self.pages[index].timer_event(&self.options, self.stats.processor_count, true);
+    }
+
     fn toggle_no_title_mode(&mut self) {
         // 安全性: redraw suppression and final invalidation target the main window owned by App.
         unsafe { SendMessageW(self.main_hwnd, WM_SETREDRAW, 0, 0) };
@@ -987,14 +1224,18 @@ impl App {
         self.size_active_page();
     }
 
-    fn on_timer(&mut self, hwnd: HWND) {
+    fn on_timer(&mut self, hwnd: HWND, force: bool) {
         // 按住 Ctrl 时暂停自动刷新，这与经典 Task Manager 的交互保持一致。
         // 安全性: these calls only query foreground window and keyboard state.
-        if unsafe { GetForegroundWindow() == hwnd && GetAsyncKeyState(i32::from(VK_CONTROL)) < 0 } {
+        if !force
+            && unsafe {
+                GetForegroundWindow() == hwnd && GetAsyncKeyState(i32::from(VK_CONTROL)) < 0
+            }
+        {
             return;
         }
 
-        self.refresh_active_page();
+        self.refresh_active_page(force);
         self.refresh_summary_stats();
 
         self.refresh_tray_icon();
@@ -1007,11 +1248,27 @@ impl App {
         if is_active_page(self.options.current_page, self.pages.len(), PERF_PAGE) {
             if let Some(snapshot) = self.pages[PERF_PAGE].performance_snapshot() {
                 self.stats.apply_snapshot(snapshot);
+                self.enforce_cpu_history_display_limit();
                 return;
             }
         }
 
         self.refresh_runtime_stats();
+        self.enforce_cpu_history_display_limit();
+    }
+
+    fn enforce_cpu_history_display_limit(&mut self) {
+        if self.stats.processor_count <= STATIC_CPU_GRAPH_COUNT
+            || self.options.cpu_history_mode != CpuHistoryMode::Panes as i32
+        {
+            return;
+        }
+
+        self.options.cpu_history_mode = CpuHistoryMode::Sum as i32;
+        if !self.pages[PERF_PAGE].hwnd().is_null() {
+            self.pages[PERF_PAGE].apply_options(&self.options, self.stats.processor_count);
+        }
+        self.update_menu_states();
     }
 
     fn refresh_runtime_stats(&mut self) {
@@ -1100,7 +1357,7 @@ impl App {
 
     fn load_popup_menu(&self, resource_id: u16) -> HMENU {
         // 弹出菜单构造也统一复用运行时菜单系统。
-        build_popup_menu(resource_id, self.stats.processor_count as usize).unwrap_or(null_mut())
+        build_popup_menu(resource_id, self.stats.processor_count).unwrap_or(null_mut())
     }
 
     fn on_tray_notification(&mut self, lparam: LPARAM) {
@@ -1369,26 +1626,32 @@ impl App {
                     self.refresh_task_page();
                 }
                 IDM_ALLCPUS | IDM_MULTIGRAPH => {
+                    if command_id == IDM_MULTIGRAPH
+                        && self.stats.processor_count > STATIC_CPU_GRAPH_COUNT
+                    {
+                        MessageBeep(0);
+                        return;
+                    }
                     self.options.cpu_history_mode = i32::from(command_id - CM_FIRST);
                     self.refresh_performance_page();
                     self.update_menu_states();
                 }
                 IDM_HIGH | IDM_NORMAL | IDM_LOW | IDM_PAUSED => {
-                    const TIMER_DELAYS: [u32; 4] = [500, 2000, 4000, 0];
-
-                    self.options.update_speed = i32::from(command_id - US_FIRST);
-                    let timer_delay = TIMER_DELAYS[self.options.update_speed as usize];
-                    self.options.timer_interval = timer_delay;
-
-                    KillTimer(self.main_hwnd, 0);
-                    if timer_delay != 0 {
-                        SetTimer(self.main_hwnd, 0, timer_delay, None);
+                    let update_speed = i32::from(command_id - US_FIRST);
+                    let Some(timer_delay) = update_speed_timer_interval(update_speed) else {
+                        return;
+                    };
+                    if let Err(error) = self.replace_update_timer(timer_delay) {
+                        record_win32_error("update timer replacement", error);
+                        return;
                     }
 
+                    self.options.update_speed = update_speed;
+                    self.options.timer_interval = timer_delay;
                     self.update_menu_states();
                 }
                 IDM_REFRESH => {
-                    self.on_timer(hwnd);
+                    self.on_timer(hwnd, true);
                 }
                 IDM_ABOUT => {
                     let title = to_wide_null(&self.strings.app_title);
@@ -1508,7 +1771,10 @@ impl App {
             let header = &*(lparam as *const NMHDR);
             if header.idFrom as i32 == IDC_TABS && header.code == TCN_SELCHANGE {
                 let tabs_hwnd = GetDlgItem(self.main_hwnd, IDC_TABS);
-                let selected = SendMessageW(tabs_hwnd, TCM_GETCURSEL, 0, 0) as usize;
+                let selected = SendMessageW(tabs_hwnd, TCM_GETCURSEL, 0, 0);
+                let Ok(selected) = usize::try_from(selected) else {
+                    return 0;
+                };
                 return isize::from(self.activate_page(selected));
             }
 
@@ -1516,7 +1782,7 @@ impl App {
         }
     }
 
-    fn on_find_process(&mut self, thread_id: u32, pid: u32) -> isize {
+    fn on_find_process(&mut self, identity: ProcIdentity) -> isize {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // “转到进程”来自任务页，需要先切到进程页，再尝试把对应进程行选中并滚动到可见区域。
@@ -1528,7 +1794,7 @@ impl App {
 
             SendMessageW(tabs_hwnd, TCM_SETCURSEL, PROC_PAGE, 0);
             if self.activate_page(PROC_PAGE) {
-                isize::from(self.pages[PROC_PAGE].find_process(thread_id, pid))
+                isize::from(self.pages[PROC_PAGE].find_process(identity))
             } else {
                 MessageBeep(0);
                 0
@@ -1541,7 +1807,10 @@ impl App {
         unsafe {
             // 关闭顺序按“停定时器 -> 让页面保存状态 -> 销毁页面资源 -> 移除托盘 -> 写配置”执行，
             // 避免还在刷新的页面访问已经销毁的窗口或句柄。
-            KillTimer(self.main_hwnd, 0);
+            if self.timer_id != 0 {
+                KillTimer(self.main_hwnd, self.timer_id);
+                self.timer_id = 0;
+            }
 
             if self.options.current_page >= 0 {
                 self.pages[self.options.current_page as usize].deactivate(&mut self.options);
@@ -1554,8 +1823,20 @@ impl App {
             let _ = self.options.save();
 
             if !self.menu.current_menu().is_null() {
+                SetMenu(self.main_hwnd, null_mut());
                 destroy_menu_handle(self.menu.current_menu());
                 self.menu.clear_current_menu();
+            }
+
+            self.tray.clear_icons();
+            if !self.main_icon.is_null() {
+                SendMessageW(self.main_hwnd, WM_SETICON, 1, 0);
+                destroy_icon_handle(self.main_icon);
+                self.main_icon = null_mut();
+            }
+            if !self.accelerator_table.is_null() {
+                DestroyAcceleratorTable(self.accelerator_table);
+                self.accelerator_table = null_mut();
             }
 
             PostQuitMessage(0);
@@ -1643,7 +1924,7 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_TIMER => {
-            application.on_timer(hwnd);
+            application.on_timer(hwnd, false);
             0
         }
         WM_COMMAND => {
@@ -1653,20 +1934,46 @@ unsafe extern "system" fn main_window_proc(
         WM_NOTIFY => application.on_notify(lparam),
         WM_MENUSELECT => application.on_menu_select(wparam, lparam),
         WM_INITMENU => application.on_init_menu(),
-        WM_FINDPROC => application.on_find_process(wparam as u32, lparam as u32),
+        WM_FINDPROC => {
+            let Ok(pid) = u32::try_from(wparam) else {
+                return 0;
+            };
+            let creation_time_100ns = lparam as u64;
+            if pid == 0 || creation_time_100ns == 0 {
+                0
+            } else {
+                application.on_find_process(ProcIdentity::new(pid, creation_time_100ns))
+            }
+        }
         PWM_INPOPUP => application.on_popup_state(wparam != 0),
         PWM_DEFERREDINIT => {
-            application.tray.load_icons();
+            if let Err(error) = application.tray.load_icons() {
+                record_win32_error("tray icon loading", error);
+            }
             // 安全性: main HWND is live; icon and tray setup after deferred icon loading.
             unsafe {
                 let icon =
                     load_icon_resource(MAIN_ICON_RESOURCE, 0, 0, LR_DEFAULTCOLOR | LR_DEFAULTSIZE);
                 if !icon.is_null() {
+                    let old_owned_icon = application.main_icon;
                     SendMessageW(hwnd, WM_SETICON, 1, icon as LPARAM);
+                    if !old_owned_icon.is_null() {
+                        destroy_icon_handle(old_owned_icon);
+                    }
+                    application.main_icon = icon;
                 }
                 if let Some(first_icon) = application.tray.first_icon() {
                     application.update_tray(NIM_ADD, first_icon, "");
                 }
+                PostMessageW(hwnd, PWM_PREWARM_PAGE, 0, 0);
+            }
+            0
+        }
+        PWM_PREWARM_PAGE => {
+            let page_index = wparam;
+            application.prewarm_page(page_index);
+            if page_index + 1 < application.pages.len() {
+                unsafe { PostMessageW(hwnd, PWM_PREWARM_PAGE, page_index + 1, 0) };
             }
             0
         }

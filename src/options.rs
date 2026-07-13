@@ -16,7 +16,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::resource::{NUM_COLUMN, NUM_PAGES};
-use crate::winutil::to_wide_null;
+use crate::winutil::{record_win32_error, to_wide_null};
 
 const TASKMAN_KEY: &str = "Software\\Microsoft\\Windows NT\\CurrentVersion\\TaskManager";
 const OPTIONS_KEY: &str = "Preferences";
@@ -109,7 +109,8 @@ impl Default for Options {
         // 默认值尽量贴近经典任务管理器的首次启动体验。
         let mut options = Self {
             cb_size: size_of::<Self>() as u32,
-            timer_interval: 1000,
+            timer_interval: update_speed_timer_interval(UpdateSpeed::Normal as i32)
+                .expect("normal update speed has a timer interval"),
             view_mode: ViewMode::Details as i32,
             cpu_history_mode: CpuHistoryMode::Panes as i32,
             update_speed: UpdateSpeed::Normal as i32,
@@ -195,14 +196,22 @@ impl Options {
             if status != ERROR_SUCCESS
                 || value_type != REG_BINARY
                 || value_size != size_of::<Options>() as u32
-                || !loaded.is_valid()
             {
                 self.set_default_values(min_width, min_height);
                 return false;
             }
 
+            let loaded_was_valid = loaded.is_valid();
+            if !loaded_was_valid {
+                loaded.normalize(min_width, min_height);
+            }
             *self = loaded;
-            true
+            if !loaded_was_valid {
+                if let Err(error) = self.save() {
+                    record_win32_error("normalized options persistence", error);
+                }
+            }
+            loaded_was_valid
         }
     }
 
@@ -317,12 +326,52 @@ impl Options {
             && is_valid_view_mode(self.view_mode)
             && is_valid_cpu_history_mode(self.cpu_history_mode)
             && is_valid_update_speed(self.update_speed)
+            && timer_interval_is_valid(self.update_speed, self.timer_interval)
             && self.flags & !ALL_VALID_FLAGS == 0
-            && self
-                .active_process_columns
-                .iter()
-                .all(|value| *value == -1 || (0..NUM_COLUMN as i32).contains(value))
-            && self.column_widths.iter().all(|value| *value >= -1)
+            && process_columns_are_valid(&self.active_process_columns, &self.column_widths)
+    }
+
+    fn normalize(&mut self, min_width: i32, min_height: i32) {
+        let mut defaults = Self::default();
+        defaults.set_default_values(min_width, min_height);
+
+        self.cb_size = size_of::<Self>() as u32;
+        if !is_valid_view_mode(self.view_mode) {
+            self.view_mode = defaults.view_mode;
+        }
+        if !is_valid_cpu_history_mode(self.cpu_history_mode) {
+            self.cpu_history_mode = defaults.cpu_history_mode;
+        }
+        if !is_valid_update_speed(self.update_speed) {
+            self.update_speed = defaults.update_speed;
+        }
+        if !timer_interval_is_valid(self.update_speed, self.timer_interval) {
+            self.timer_interval = if screen_reader_enabled() {
+                0
+            } else {
+                update_speed_timer_interval(self.update_speed).unwrap_or(defaults.timer_interval)
+            };
+        }
+        if self.current_page < -1 || self.current_page >= NUM_PAGES as i32 {
+            self.current_page = defaults.current_page;
+        }
+        self.flags &= ALL_VALID_FLAGS;
+
+        // 安全性: querying system metrics has no pointer inputs or lifetime requirements.
+        let max_width = unsafe { GetSystemMetrics(SM_CXMAXIMIZED) };
+        // 安全性: querying system metrics has no pointer inputs or lifetime requirements.
+        let max_height = unsafe { GetSystemMetrics(SM_CYMAXIMIZED) };
+        if self.window_rect.left > self.window_rect.right
+            || self.window_rect.top > self.window_rect.bottom
+            || self.window_rect.left > max_width
+            || self.window_rect.top > max_height
+            || self.window_rect.right < 0
+            || self.window_rect.bottom < 0
+        {
+            self.window_rect = defaults.window_rect;
+        }
+
+        normalize_process_columns(&mut self.active_process_columns, &mut self.column_widths);
     }
 
     fn set_flag(&mut self, mask: u32, value: bool) {
@@ -369,6 +418,97 @@ fn is_valid_update_speed(value: i32) -> bool {
     )
 }
 
+pub const fn update_speed_timer_interval(value: i32) -> Option<u32> {
+    match value {
+        x if x == UpdateSpeed::High as i32 => Some(500),
+        x if x == UpdateSpeed::Normal as i32 => Some(2_000),
+        x if x == UpdateSpeed::Low as i32 => Some(4_000),
+        x if x == UpdateSpeed::Paused as i32 => Some(0),
+        _ => None,
+    }
+}
+
+fn timer_interval_is_valid(update_speed: i32, timer_interval: u32) -> bool {
+    let Some(expected) = update_speed_timer_interval(update_speed) else {
+        return false;
+    };
+
+    timer_interval == expected || (timer_interval == 0 && expected != 0 && screen_reader_enabled())
+}
+
+fn process_columns_are_valid(
+    columns: &[i32; NUM_COLUMN + 1],
+    widths: &[i32; NUM_COLUMN + 1],
+) -> bool {
+    if columns[0] != ColumnId::ImageName as i32 {
+        return false;
+    }
+
+    let mut seen = [false; NUM_COLUMN];
+    let mut reached_end = false;
+    for (&column, &width) in columns.iter().zip(widths.iter()) {
+        if column == -1 {
+            reached_end = true;
+            if width != -1 {
+                return false;
+            }
+            continue;
+        }
+        if reached_end || !(0..NUM_COLUMN as i32).contains(&column) || !(width == -1 || width > 0) {
+            return false;
+        }
+
+        let index = column as usize;
+        if seen[index] {
+            return false;
+        }
+        seen[index] = true;
+    }
+
+    true
+}
+
+fn normalize_process_columns(
+    columns: &mut [i32; NUM_COLUMN + 1],
+    widths: &mut [i32; NUM_COLUMN + 1],
+) {
+    let original_columns = *columns;
+    let original_widths = *widths;
+    let mut seen = [false; NUM_COLUMN];
+    let mut next_columns = [-1; NUM_COLUMN + 1];
+    let mut next_widths = [-1; NUM_COLUMN + 1];
+
+    next_columns[0] = ColumnId::ImageName as i32;
+    seen[ColumnId::ImageName as usize] = true;
+    next_widths[0] = original_columns
+        .iter()
+        .position(|column| *column == ColumnId::ImageName as i32)
+        .and_then(|index| original_widths.get(index).copied())
+        .filter(|width| *width > 0)
+        .unwrap_or(-1);
+
+    let mut next = 1usize;
+    for (&column, &width) in original_columns.iter().zip(original_widths.iter()) {
+        if column == -1 {
+            break;
+        }
+        if !(0..NUM_COLUMN as i32).contains(&column) {
+            continue;
+        }
+        let index = column as usize;
+        if seen[index] {
+            continue;
+        }
+        seen[index] = true;
+        next_columns[next] = column;
+        next_widths[next] = if width > 0 { width } else { -1 };
+        next += 1;
+    }
+
+    *columns = next_columns;
+    *widths = next_widths;
+}
+
 fn screen_reader_enabled() -> bool {
     let mut enabled = 0i32;
     // 安全性: `enabled` is a valid writable out parameter for `SPI_GETSCREENREADER`.
@@ -380,5 +520,85 @@ fn screen_reader_enabled() -> bool {
             0,
         ) != 0
             && enabled != 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        normalize_process_columns, process_columns_are_valid, update_speed_timer_interval,
+        ColumnId, Options, UpdateSpeed, NUM_COLUMN,
+    };
+
+    #[test]
+    fn process_columns_reject_missing_primary_and_duplicates() {
+        let mut columns = [-1; NUM_COLUMN + 1];
+        let widths = [-1; NUM_COLUMN + 1];
+        columns[0] = ColumnId::Pid as i32;
+        assert!(!process_columns_are_valid(&columns, &widths));
+
+        columns[0] = ColumnId::ImageName as i32;
+        columns[1] = ColumnId::Pid as i32;
+        columns[2] = ColumnId::Pid as i32;
+        assert!(!process_columns_are_valid(&columns, &widths));
+    }
+
+    #[test]
+    fn normalize_process_columns_restores_primary_and_sentinel_shape() {
+        let mut columns = [-1; NUM_COLUMN + 1];
+        let mut widths = [-1; NUM_COLUMN + 1];
+        columns[0] = ColumnId::Pid as i32;
+        widths[0] = 42;
+        columns[1] = ColumnId::Pid as i32;
+        widths[1] = 43;
+        columns[2] = ColumnId::Cpu as i32;
+        widths[2] = 0;
+        columns[4] = ColumnId::ThreadCount as i32;
+        widths[4] = 99;
+
+        normalize_process_columns(&mut columns, &mut widths);
+
+        assert_eq!(columns[0], ColumnId::ImageName as i32);
+        assert_eq!(columns[1], ColumnId::Pid as i32);
+        assert_eq!(columns[2], ColumnId::Cpu as i32);
+        assert_eq!(columns[3], -1);
+        assert_eq!(widths[0], -1);
+        assert_eq!(widths[1], 42);
+        assert_eq!(widths[2], -1);
+        assert!(process_columns_are_valid(&columns, &widths));
+    }
+
+    #[test]
+    fn default_options_have_valid_process_columns() {
+        let options = Options::default();
+        assert_eq!(
+            options.timer_interval,
+            update_speed_timer_interval(UpdateSpeed::Normal as i32).unwrap()
+        );
+        assert!(process_columns_are_valid(
+            &options.active_process_columns,
+            &options.column_widths
+        ));
+    }
+
+    #[test]
+    fn update_speed_intervals_have_one_canonical_mapping() {
+        assert_eq!(
+            update_speed_timer_interval(UpdateSpeed::High as i32),
+            Some(500)
+        );
+        assert_eq!(
+            update_speed_timer_interval(UpdateSpeed::Normal as i32),
+            Some(2_000)
+        );
+        assert_eq!(
+            update_speed_timer_interval(UpdateSpeed::Low as i32),
+            Some(4_000)
+        );
+        assert_eq!(
+            update_speed_timer_interval(UpdateSpeed::Paused as i32),
+            Some(0)
+        );
+        assert_eq!(update_speed_timer_interval(i32::MAX), None);
     }
 }

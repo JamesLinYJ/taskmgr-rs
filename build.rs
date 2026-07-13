@@ -120,7 +120,8 @@ fn main() {
     );
 
     if profile == "release" {
-        // 仅在 release 产物里要求管理员权限。
+        // Release binaries request elevation before startup. Debug binaries use the runtime
+        // elevation path so Cargo's test harnesses remain executable without UAC metadata.
         println!("cargo:rustc-link-arg=/MANIFESTUAC:level='requireAdministrator' uiAccess='false'");
     }
 }

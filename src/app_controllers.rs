@@ -8,34 +8,37 @@
 //! - WindowModeController：无标题模式与置顶模式
 
 use std::mem::{size_of, zeroed};
-use windows_sys::Win32::Foundation::{FILETIME, HWND};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-use windows_sys::Win32::System::Threading::GetSystemTimes;
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{HICON, HMENU, LR_DEFAULTCOLOR, LR_DEFAULTSIZE};
 
 use crate::assets::{load_icon_resource, TRAY_ICON_RESOURCES};
+use crate::cpu_sampler::{
+    query_processor_performance, summed_processor_times, ProcessorPerformance,
+};
 use crate::perfpage::PerformanceSnapshot;
 use crate::resource::PWM_TRAYICON;
-use crate::winutil::{format_resource_string, to_wide_null};
+use crate::winutil::{destroy_icon_handle, format_resource_string, to_wide_null};
 
 const NOTIFY_ICON_TIP_CAPACITY: usize = 128;
 
 /// 运行时统计控制器。
-/// 通过 GetSystemTimes 差值计算 CPU 使用率，通过 GlobalMemoryStatusEx 获取内存占用。
+/// 通过全 processor-group 累计时间差计算 CPU 使用率，并通过 GlobalMemoryStatusEx 获取内存占用。
 #[derive(Default)]
 pub struct RuntimeStatsController {
     pub cpu_usage: u8,
-    pub mem_usage_kb: u32,
-    pub mem_limit_kb: u32,
+    pub mem_usage_kb: u64,
+    pub mem_limit_kb: u64,
     pub process_count: u32,
-    pub processor_count: u8,
+    pub processor_count: usize,
     previous_idle: u64,
     previous_kernel: u64,
     previous_user: u64,
+    processor_info: Vec<ProcessorPerformance>,
 }
 
 impl RuntimeStatsController {
@@ -44,18 +47,26 @@ impl RuntimeStatsController {
         self.mem_usage_kb = snapshot.mem_usage_kb;
         self.mem_limit_kb = snapshot.mem_limit_kb;
         self.process_count = snapshot.process_count;
+        self.processor_count = snapshot.processor_count;
     }
 
     pub fn refresh_runtime_stats(&mut self) {
         // 安全性: all Win32 calls write into initialized local output buffers.
         unsafe {
-            let mut idle = zeroed::<FILETIME>();
-            let mut kernel = zeroed::<FILETIME>();
-            let mut user = zeroed::<FILETIME>();
-            if GetSystemTimes(&mut idle, &mut kernel, &mut user) != 0 {
-                let idle_value = filetime_to_u64(idle);
-                let kernel_value = filetime_to_u64(kernel);
-                let user_value = filetime_to_u64(user);
+            if query_processor_performance(self.processor_count.max(1), &mut self.processor_info)
+                .is_ok()
+                && !self.processor_info.is_empty()
+            {
+                let processor_count_changed = self.processor_count != self.processor_info.len();
+                self.processor_count = self.processor_info.len();
+                let (idle_value, kernel_value, user_value) =
+                    summed_processor_times(&self.processor_info);
+
+                if processor_count_changed {
+                    self.previous_idle = 0;
+                    self.previous_kernel = 0;
+                    self.previous_user = 0;
+                }
 
                 if self.previous_idle != 0 {
                     let delta_idle = idle_value.saturating_sub(self.previous_idle);
@@ -65,7 +76,8 @@ impl RuntimeStatsController {
 
                     if delta_total != 0 {
                         let active_ticks = delta_total.saturating_sub(delta_idle);
-                        self.cpu_usage = ((active_ticks * 100) / delta_total) as u8;
+                        self.cpu_usage =
+                            ((active_ticks.saturating_mul(100)) / delta_total).min(100) as u8;
                     }
                 }
 
@@ -79,12 +91,14 @@ impl RuntimeStatsController {
                 ..zeroed()
             };
             if GlobalMemoryStatusEx(&mut memory) != 0 {
-                self.mem_usage_kb = ((memory.ullTotalPhys - memory.ullAvailPhys) / 1024) as u32;
-                self.mem_limit_kb = (memory.ullTotalPhys / 1024) as u32;
+                self.mem_usage_kb = memory.ullTotalPhys.saturating_sub(memory.ullAvailPhys) / 1024;
+                self.mem_limit_kb = memory.ullTotalPhys / 1024;
             }
         }
 
-        self.process_count = process_count();
+        if let Some(process_count) = process_count() {
+            self.process_count = process_count;
+        }
     }
 }
 
@@ -103,13 +117,27 @@ impl Default for TrayController {
 }
 
 impl TrayController {
-    pub fn load_icons(&mut self) {
-        self.icons.clear();
+    pub fn load_icons(&mut self) -> Result<(), u32> {
+        let mut loaded = Vec::with_capacity(TRAY_ICON_RESOURCES.len());
         for resource_name in TRAY_ICON_RESOURCES {
             let icon_handle =
                 load_icon_resource(resource_name, 0, 0, LR_DEFAULTCOLOR | LR_DEFAULTSIZE);
-            self.icons.push(icon_handle);
+            if icon_handle.is_null() {
+                let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+                for icon in loaded {
+                    destroy_icon_handle(icon);
+                }
+                return Err(if error == 0 {
+                    windows_sys::Win32::Foundation::ERROR_RESOURCE_DATA_NOT_FOUND
+                } else {
+                    error
+                });
+            }
+            loaded.push(icon_handle);
         }
+        self.clear_icons();
+        self.icons = loaded;
+        Ok(())
     }
 
     pub fn first_icon(&self) -> Option<HICON> {
@@ -155,6 +183,20 @@ impl TrayController {
             self.icons[icon_index],
             &tooltip,
         );
+    }
+
+    pub fn clear_icons(&mut self) {
+        for icon in self.icons.drain(..) {
+            if !icon.is_null() {
+                destroy_icon_handle(icon);
+            }
+        }
+    }
+}
+
+impl Drop for TrayController {
+    fn drop(&mut self) {
+        self.clear_icons();
     }
 }
 
@@ -249,16 +291,12 @@ impl WindowModeController {
     }
 }
 
-fn filetime_to_u64(filetime: FILETIME) -> u64 {
-    (u64::from(filetime.dwHighDateTime) << 32) | u64::from(filetime.dwLowDateTime)
-}
-
-fn process_count() -> u32 {
+fn process_count() -> Option<u32> {
     let mut perf = unsafe { zeroed::<PERFORMANCE_INFORMATION>() };
     perf.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
     if unsafe { K32GetPerformanceInfo(&mut perf, perf.cb) } == 0 {
-        return 0;
+        return None;
     }
 
-    perf.ProcessCount
+    Some(perf.ProcessCount)
 }

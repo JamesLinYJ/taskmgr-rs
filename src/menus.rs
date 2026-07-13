@@ -51,10 +51,7 @@ fn build_file_menu() -> Option<PopupMenu> {
 fn build_options_menu(base_items: &[(u16, TextKey)]) -> Option<PopupMenu> {
     // `command_id == 0` 代表分隔线，其余项则按顺序展开成普通菜单项。
     let mut menu = PopupMenu::new()?;
-    for (index, (command_id, key)) in base_items.iter().copied().enumerate() {
-        if index > 0 && !append_separator(&mut menu) && command_id == 0 {
-            return None;
-        }
+    for (command_id, key) in base_items.iter().copied() {
         if command_id == 0 {
             if !append_separator(&mut menu) {
                 return None;
@@ -269,8 +266,6 @@ fn build_network_main_menu() -> Option<MenuBar> {
     let mut view = PopupMenu::new()?;
     if !append_item(&mut view, IDM_REFRESH, TextKey::RefreshNow)
         || !view.append_submenu(text(TextKey::UpdateSpeed), build_update_speed_menu()?)
-        || !append_separator(&mut view)
-        || !append_item(&mut view, IDM_USERCOLS, TextKey::SelectColumnsMenu)
     {
         return None;
     }
@@ -356,4 +351,37 @@ pub fn build_popup_menu(resource_id: u16, processor_count: usize) -> Option<HMEN
     };
     sanitize_task_manager_menu(menu, processor_count);
     Some(menu)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetMenuItemCount, GetMenuItemInfoW, MENUITEMINFOW, MFT_SEPARATOR, MIIM_FTYPE,
+    };
+
+    #[test]
+    fn options_menu_only_uses_explicit_separator_entries() {
+        let menu = build_options_menu(&[
+            (IDM_ALWAYSONTOP, TextKey::AlwaysOnTop),
+            (0, TextKey::TaskManager),
+            (IDM_CONFIRMATIONS, TextKey::Confirmations),
+        ])
+        .expect("menu creation should succeed");
+
+        unsafe {
+            assert_eq!(GetMenuItemCount(menu.as_raw()), 3);
+            for (position, should_be_separator) in [false, true, false].into_iter().enumerate() {
+                let mut info = zeroed::<MENUITEMINFOW>();
+                info.cbSize = size_of::<MENUITEMINFOW>() as u32;
+                info.fMask = MIIM_FTYPE;
+                assert_ne!(
+                    GetMenuItemInfoW(menu.as_raw(), position as u32, 1, &mut info),
+                    0
+                );
+                assert_eq!(info.fType & MFT_SEPARATOR != 0, should_be_separator);
+            }
+        }
+    }
 }

@@ -5,14 +5,16 @@ use std::collections::HashMap;
 use std::mem::zeroed;
 use std::ptr::null_mut;
 use std::slice;
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use windows_sys::Win32::Foundation::{HWND, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{ERROR_NOT_ENOUGH_MEMORY, HWND, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen, DeleteDC, DeleteObject,
-    DrawTextW, FillRect, GetDC, GetStockObject, InvalidateRect, LineTo, MapWindowPoints, MoveToEx,
-    ReleaseDC, SelectObject, SetBkMode, SetTextColor, UpdateWindow, BLACK_BRUSH, DT_CALCRECT,
-    DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, HBITMAP, HBRUSH, HDC, HGDIOBJ, PS_SOLID, SRCCOPY,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, DrawTextW,
+    FillRect, GetDC, GetStockObject, InvalidateRect, LineTo, MapWindowPoints, MoveToEx, ReleaseDC,
+    SelectObject, SetBkMode, SetDCPenColor, SetTextColor, BLACK_BRUSH, DC_PEN, DT_CALCRECT,
+    DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, HBITMAP, HBRUSH, HDC, HGDIOBJ, SRCCOPY,
     TRANSPARENT,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -28,19 +30,23 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, CreateWindowExW, DeferWindowPos, DestroyWindow, EndDeferWindowPos,
-    GetClientRect, GetDialogBaseUnits, GetDlgItem, GetScrollInfo, GetSystemMetrics, SendMessageW,
-    SetWindowTextW, ShowWindow, BS_OWNERDRAW, HDWP, HMENU, SB_BOTTOM, SB_CTL, SB_LINEDOWN,
-    SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SCROLLINFO,
-    SIF_ALL, SIF_PAGE, SIF_POS, SIF_RANGE, SM_CXVSCROLL, SWP_HIDEWINDOW, SWP_NOACTIVATE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WHEEL_DELTA, WM_GETFONT, WM_SETFONT, WM_SETREDRAW,
-    WS_CHILD, WS_DISABLED, WS_EX_CLIENTEDGE, WS_EX_NOPARENTNOTIFY,
+    GetClientRect, GetDialogBaseUnits, GetDlgItem, GetScrollInfo, GetSystemMetrics, PostMessageW,
+    SendMessageW, SetWindowTextW, ShowWindow, BS_OWNERDRAW, HDWP, HMENU, SB_BOTTOM, SB_CTL,
+    SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP,
+    SCROLLINFO, SIF_ALL, SIF_PAGE, SIF_POS, SIF_RANGE, SM_CXVSCROLL, SWP_HIDEWINDOW,
+    SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WHEEL_DELTA, WM_GETFONT, WM_SETFONT,
+    WM_SETREDRAW, WS_CHILD, WS_DISABLED, WS_EX_CLIENTEDGE, WS_EX_NOPARENTNOTIFY,
 };
 
 use crate::chart_renderer::{ChartColor, ChartFrame, ChartRenderer};
 use crate::language::{adapter_state, network_column_titles};
 use crate::options::Options;
-use crate::resource::{IDC_GRAPHSCROLLVERT, IDC_NICGRAPH, IDC_NICTOTALS, IDC_NOADAPTERS};
-use crate::winutil::{finish_list_view_update, hiword, loword, subclass_list_view, to_wide_null};
+use crate::resource::{
+    IDC_GRAPHSCROLLVERT, IDC_NICGRAPH, IDC_NICTOTALS, IDC_NOADAPTERS, PWM_NET_WORKER_COMPLETE,
+};
+use crate::winutil::{
+    finish_list_view_update, hiword, loword, record_win32_error, subclass_list_view, to_wide_null,
+};
 
 const HIST_SIZE: usize = 2000;
 const GRAPH_GRID: i32 = 12;
@@ -52,10 +58,16 @@ const DLG_SCALE_Y: i32 = 8;
 const FRAME_CLASS_NAME: &str = "TaskManagerFrame";
 const BUTTON_CLASS_NAME: &str = "Button";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct AdapterIdentity {
+    luid: u64,
+    interface_index: u32,
+}
+
 struct RawAdapterEntry {
     // 原始网卡快照保持尽量接近系统 API 返回，便于后续去重和稳定排序。
     interface_index: u32,
-    key: String,
+    key: AdapterIdentity,
     name: String,
     state: String,
     link_speed_bps: u64,
@@ -63,10 +75,85 @@ struct RawAdapterEntry {
     bytes_received: u64,
 }
 
+type NetworkWorkerResult = Result<Vec<RawAdapterEntry>, u32>;
+
+struct NetworkWorkerCompletion {
+    sampled_at: Instant,
+    result: NetworkWorkerResult,
+}
+
+enum NetworkWorkerCommand {
+    Collect { notify_hwnd: isize },
+    Shutdown,
+}
+
+struct HistoryBuffer {
+    values: Vec<u8>,
+    newest: usize,
+    value_counts: [usize; 256],
+    max_value: u8,
+}
+
+impl HistoryBuffer {
+    fn zeroed(len: usize) -> Self {
+        let mut value_counts = [0usize; 256];
+        value_counts[0] = len;
+        Self {
+            values: vec![0; len],
+            newest: 0,
+            value_counts,
+            max_value: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn push(&mut self, value: u8) {
+        if self.values.is_empty() {
+            return;
+        }
+        self.newest = if self.newest == 0 {
+            self.values.len() - 1
+        } else {
+            self.newest - 1
+        };
+        let replaced = self.values[self.newest];
+        self.value_counts[replaced as usize] -= 1;
+        self.values[self.newest] = value;
+        self.value_counts[value as usize] += 1;
+
+        if value > self.max_value {
+            self.max_value = value;
+        } else if replaced == self.max_value && self.value_counts[replaced as usize] == 0 {
+            while self.max_value > 0 && self.value_counts[self.max_value as usize] == 0 {
+                self.max_value -= 1;
+            }
+        }
+    }
+
+    fn newest_value(&self) -> u8 {
+        self.values.get(self.newest).copied().unwrap_or(0)
+    }
+
+    fn max_value(&self) -> u8 {
+        self.max_value
+    }
+
+    fn iter(&self) -> impl Iterator<Item = u8> + '_ {
+        (0..self.values.len()).map(|offset| self.values[(self.newest + offset) % self.values.len()])
+    }
+}
+
 struct NetworkAdapterEntry {
     // 页面最终展示的数据结构，同时包含当前值和三条历史曲线。
     interface_index: u32,
-    key: String,
+    key: AdapterIdentity,
     name: String,
     state: String,
     link_speed: String,
@@ -76,9 +163,9 @@ struct NetworkAdapterEntry {
     bytes_total: String,
     current_sent: u64,
     current_received: u64,
-    sent_history: Vec<u8>,
-    received_history: Vec<u8>,
-    total_history: Vec<u8>,
+    sent_history: HistoryBuffer,
+    received_history: HistoryBuffer,
+    total_history: HistoryBuffer,
     dirty: bool,
 }
 
@@ -120,6 +207,12 @@ pub struct NetworkPageState {
     cached_graph_bitmap_old: HGDIOBJ,
     cached_graph_width: i32,
     cached_graph_height: i32,
+    worker_sender: Option<Sender<NetworkWorkerCommand>>,
+    worker_result_receiver: Option<Receiver<NetworkWorkerCompletion>>,
+    worker_thread: Option<JoinHandle<()>>,
+    collection_in_flight: bool,
+    refresh_requested: bool,
+    last_refresh_error: Option<u32>,
 }
 
 impl NetworkPageState {
@@ -127,18 +220,24 @@ impl NetworkPageState {
         Self::default()
     }
 
-    pub unsafe fn initialize(&mut self, hwnd: HWND, main_hwnd: HWND, hwnd_tabs: HWND) {
-        // 网络页初始化时就先建列并做一次刷新，
-        // 这样页面首次显示时不会先看到空壳列表和空白图表框。
+    pub unsafe fn initialize(
+        &mut self,
+        hwnd: HWND,
+        main_hwnd: HWND,
+        hwnd_tabs: HWND,
+    ) -> Result<(), u32> {
+        // 初始化只建立控件和基础布局；当前页由激活入口采样，隐藏页由首帧后的预热消息采样。
         self.hwnd = hwnd;
         self.main_hwnd = main_hwnd;
         self.hwnd_tabs = hwnd_tabs;
+        self.start_worker_thread()?;
         let list = self.list_hwnd();
         if !list.is_null() {
             subclass_list_view(list);
         }
         self.configure_columns();
-        self.refresh();
+        self.size_page();
+        Ok(())
     }
 
     pub unsafe fn apply_options(&mut self, options: &Options) {
@@ -166,7 +265,61 @@ impl NetworkPageState {
     }
 
     pub unsafe fn destroy(&mut self) {
+        self.stop_worker_thread();
         self.destroy_graphs();
+    }
+
+    fn start_worker_thread(&mut self) -> Result<(), u32> {
+        if self.worker_sender.is_some() {
+            return Ok(());
+        }
+
+        let (command_sender, command_receiver) = channel::<NetworkWorkerCommand>();
+        let (result_sender, result_receiver) = channel::<NetworkWorkerCompletion>();
+        let worker = thread::Builder::new()
+            .name("rtaskmgr-network-sampler".to_string())
+            .spawn(move || {
+                while let Ok(command) = command_receiver.recv() {
+                    match command {
+                        NetworkWorkerCommand::Collect { notify_hwnd } => {
+                            let result = unsafe { NetworkPageState::collect_adapters() };
+                            let completion = NetworkWorkerCompletion {
+                                sampled_at: Instant::now(),
+                                result,
+                            };
+                            if result_sender.send(completion).is_ok() {
+                                unsafe {
+                                    PostMessageW(
+                                        notify_hwnd as HWND,
+                                        PWM_NET_WORKER_COMPLETE,
+                                        0,
+                                        0,
+                                    );
+                                }
+                            }
+                        }
+                        NetworkWorkerCommand::Shutdown => break,
+                    }
+                }
+            })
+            .map_err(thread_spawn_error)?;
+
+        self.worker_sender = Some(command_sender);
+        self.worker_result_receiver = Some(result_receiver);
+        self.worker_thread = Some(worker);
+        Ok(())
+    }
+
+    fn stop_worker_thread(&mut self) {
+        if let Some(sender) = self.worker_sender.take() {
+            let _ = sender.send(NetworkWorkerCommand::Shutdown);
+        }
+        if let Some(worker) = self.worker_thread.take() {
+            let _ = worker.join();
+        }
+        self.worker_result_receiver = None;
+        self.collection_in_flight = false;
+        self.refresh_requested = false;
     }
 
     unsafe fn ensure_graph_surface(&mut self, width: i32, height: i32) -> bool {
@@ -174,6 +327,29 @@ impl NetworkPageState {
             || width > self.cached_graph_width
             || height > self.cached_graph_height
         {
+            let screen_dc = GetDC(null_mut());
+            if screen_dc.is_null() {
+                return false;
+            }
+            let new_dc = CreateCompatibleDC(screen_dc);
+            let new_bitmap = CreateCompatibleBitmap(screen_dc, width, height);
+            ReleaseDC(null_mut(), screen_dc);
+            if new_dc.is_null() || new_bitmap.is_null() {
+                if !new_dc.is_null() {
+                    DeleteDC(new_dc);
+                }
+                if !new_bitmap.is_null() {
+                    DeleteObject(new_bitmap as _);
+                }
+                return false;
+            }
+
+            let new_old = SelectObject(new_dc, new_bitmap as _);
+            if new_old.is_null() || new_old as isize == -1 {
+                DeleteObject(new_bitmap as _);
+                DeleteDC(new_dc);
+                return false;
+            }
             if !self.cached_graph_bitmap_old.is_null() {
                 SelectObject(self.cached_graph_dc, self.cached_graph_bitmap_old);
             }
@@ -183,26 +359,10 @@ impl NetworkPageState {
             if !self.cached_graph_dc.is_null() {
                 DeleteDC(self.cached_graph_dc);
             }
-            let screen_dc = GetDC(null_mut());
-            if screen_dc.is_null() {
-                return false;
-            }
-            self.cached_graph_dc = CreateCompatibleDC(screen_dc);
-            self.cached_graph_bitmap = CreateCompatibleBitmap(screen_dc, width, height);
-            ReleaseDC(null_mut(), screen_dc);
-            if self.cached_graph_dc.is_null() || self.cached_graph_bitmap.is_null() {
-                if !self.cached_graph_dc.is_null() {
-                    DeleteDC(self.cached_graph_dc);
-                    self.cached_graph_dc = null_mut();
-                }
-                if !self.cached_graph_bitmap.is_null() {
-                    DeleteObject(self.cached_graph_bitmap as _);
-                    self.cached_graph_bitmap = null_mut();
-                }
-                return false;
-            }
-            self.cached_graph_bitmap_old =
-                SelectObject(self.cached_graph_dc, self.cached_graph_bitmap as _);
+
+            self.cached_graph_dc = new_dc;
+            self.cached_graph_bitmap = new_bitmap;
+            self.cached_graph_bitmap_old = new_old;
             self.cached_graph_width = width;
             self.cached_graph_height = height;
         }
@@ -223,18 +383,27 @@ impl NetworkPageState {
         // 但缩放规则保持一致，便于横向比较。
         let width = (rect.right - rect.left).max(1);
         let height = (rect.bottom - rect.top).max(1);
-        if !self.ensure_graph_surface(width, height) {
-            return;
-        }
         let adapter_index = pane_index.saturating_add(self.first_visible_adapter());
         let Some(adapter) = self.adapters.get(adapter_index) else {
             return;
         };
 
-        if self.draw_graph_gpu(hdc, rect, adapter) {
-            draw_graph_scale_overlay(hdc, rect, adapter);
+        let scale_max = adapter
+            .sent_history
+            .max_value()
+            .max(adapter.received_history.max_value())
+            .max(adapter.total_history.max_value());
+
+        if self.draw_graph_gpu(hdc, rect, adapter, scale_max) {
+            draw_graph_scale_overlay(hdc, rect, scale_max);
             return;
         }
+        if !self.ensure_graph_surface(width, height) {
+            return;
+        }
+        let Some(adapter) = self.adapters.get(adapter_index) else {
+            return;
+        };
 
         let old_bitmap = SelectObject(self.cached_graph_dc, self.cached_graph_bitmap as _);
         let local_rect = RECT {
@@ -244,14 +413,6 @@ impl NetworkPageState {
             bottom: height,
         };
 
-        let scale_max = adapter
-            .sent_history
-            .iter()
-            .chain(adapter.received_history.iter())
-            .chain(adapter.total_history.iter())
-            .copied()
-            .max()
-            .unwrap_or(0);
         let scale_top = graph_scale_top_value(scale_max);
         let zoom = graph_zoom(scale_max);
         fill_black(self.cached_graph_dc, &local_rect);
@@ -302,20 +463,18 @@ impl NetworkPageState {
         SelectObject(self.cached_graph_dc, old_bitmap);
     }
 
-    unsafe fn draw_graph_gpu(&self, hdc: HDC, rect: RECT, adapter: &NetworkAdapterEntry) -> bool {
+    unsafe fn draw_graph_gpu(
+        &self,
+        hdc: HDC,
+        rect: RECT,
+        adapter: &NetworkAdapterEntry,
+        scale_max: u8,
+    ) -> bool {
         let Some(frame) = self.chart_renderer.begin_frame(hdc, rect) else {
             return false;
         };
 
         let target_rect = frame.bounds();
-        let scale_max = adapter
-            .sent_history
-            .iter()
-            .chain(adapter.received_history.iter())
-            .chain(adapter.total_history.iter())
-            .copied()
-            .max()
-            .unwrap_or(0);
         let scale_top = graph_scale_top_value(scale_max);
         let zoom = graph_zoom(scale_max);
         frame.clear_black();
@@ -520,6 +679,10 @@ impl NetworkPageState {
     }
 
     pub unsafe fn handle_vscroll(&mut self, wparam: WPARAM) -> isize {
+        self.handle_vscroll_steps(wparam, 1)
+    }
+
+    unsafe fn handle_vscroll_steps(&mut self, wparam: WPARAM, steps: i32) -> isize {
         let scrollbar = GetDlgItem(self.hwnd, IDC_GRAPHSCROLLVERT);
         if scrollbar.is_null() {
             return 0;
@@ -537,10 +700,10 @@ impl NetworkPageState {
         match i32::from(loword(wparam)) {
             SB_BOTTOM => scroll_info.nPos = scroll_info.nMax,
             SB_TOP => scroll_info.nPos = scroll_info.nMin,
-            SB_LINEDOWN => scroll_info.nPos += 1,
-            SB_LINEUP => scroll_info.nPos -= 1,
-            SB_PAGEDOWN => scroll_info.nPos += self.graphs_per_page as i32,
-            SB_PAGEUP => scroll_info.nPos -= self.graphs_per_page as i32,
+            SB_LINEDOWN => scroll_info.nPos += steps,
+            SB_LINEUP => scroll_info.nPos -= steps,
+            SB_PAGEDOWN => scroll_info.nPos += self.graphs_per_page as i32 * steps,
+            SB_PAGEUP => scroll_info.nPos -= self.graphs_per_page as i32 * steps,
             SB_THUMBTRACK | SB_THUMBPOSITION => scroll_info.nPos = i32::from(hiword(wparam)),
             _ => {}
         }
@@ -552,10 +715,14 @@ impl NetworkPageState {
             scroll_info.nPos = scroll_info.nMax;
         }
 
-        self.first_visible_adapter = scroll_info.nPos.max(0) as usize;
+        let next_first_visible = scroll_info.nPos.max(0) as usize;
         scroll_info.fMask = SIF_POS;
         SetScrollInfo(scrollbar, SB_CTL, &scroll_info, 1);
-        self.label_graphs();
+        if self.first_visible_adapter != next_first_visible {
+            self.first_visible_adapter = next_first_visible;
+            self.label_graphs();
+            self.update_graphs();
+        }
         1
     }
 
@@ -569,32 +736,114 @@ impl NetworkPageState {
         let wheel_delta = WHEEL_DELTA as i32;
         let step = ((delta.abs() + wheel_delta - 1) / wheel_delta).max(1);
         let command = if delta < 0 { SB_LINEDOWN } else { SB_LINEUP };
-        for _ in 0..step {
-            self.handle_vscroll(command as usize);
-        }
-        1
+        self.handle_vscroll_steps(command as usize, step)
     }
 
     unsafe fn refresh(&mut self) {
-        // 网络页刷新会把原始计数器转换为“总量 + 利用率 + 历史曲线”三类数据，
-        // 这样图表和列表可以共享同一份采样结果。
-        let raw_adapters = collapse_raw_adapters(self.collect_adapters());
-        let now = Instant::now();
+        self.drain_worker_results();
+        if self.collection_in_flight {
+            self.refresh_requested = true;
+            return;
+        }
+
+        self.refresh_requested = false;
+        self.schedule_collection();
+    }
+
+    unsafe fn schedule_collection(&mut self) {
+        let Some(sender) = self.worker_sender.as_ref() else {
+            self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
+            return;
+        };
+
+        if sender
+            .send(NetworkWorkerCommand::Collect {
+                notify_hwnd: self.hwnd as isize,
+            })
+            .is_err()
+        {
+            self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
+            return;
+        }
+        self.collection_in_flight = true;
+    }
+
+    unsafe fn drain_worker_results(&mut self) {
+        loop {
+            let result = match self.worker_result_receiver.as_ref() {
+                Some(receiver) => receiver.try_recv(),
+                None => return,
+            };
+
+            match result {
+                Ok(completion) => {
+                    self.collection_in_flight = false;
+                    match completion.result {
+                        Ok(adapters) => {
+                            self.last_refresh_error = None;
+                            self.apply_adapter_snapshot(adapters, completion.sampled_at);
+                        }
+                        Err(error) => self.set_refresh_error(error),
+                    }
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.worker_result_receiver = None;
+                    self.worker_sender = None;
+                    self.collection_in_flight = false;
+                    self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn set_refresh_error(&mut self, error: u32) {
+        if self.last_refresh_error != Some(error) {
+            record_win32_error("network refresh", error);
+        }
+        self.last_refresh_error = Some(error);
+    }
+
+    pub unsafe fn handle_worker_completion(&mut self) {
+        self.drain_worker_results();
+        if self.refresh_requested && !self.collection_in_flight {
+            self.refresh_requested = false;
+            self.schedule_collection();
+        }
+    }
+
+    unsafe fn apply_adapter_snapshot(
+        &mut self,
+        raw_adapters: Vec<RawAdapterEntry>,
+        sampled_at: Instant,
+    ) {
+        // UI 提交阶段把完整原始快照转换为列表文本和历史曲线；过程中没有系统查询。
+        let raw_adapters = collapse_raw_adapters(raw_adapters);
+        let needs_initial_layout = self.last_sample_time.is_none();
+        let previous_adapter_count = self.adapters.len();
+        let previous_adapter_order = self
+            .adapters
+            .iter()
+            .map(|adapter| adapter.key)
+            .collect::<Vec<_>>();
         let elapsed_secs = self
             .last_sample_time
-            .replace(now)
-            .map(|previous| now.duration_since(previous).as_secs_f64())
+            .replace(sampled_at)
+            .map(|previous| sampled_at.duration_since(previous).as_secs_f64())
             .unwrap_or(0.0);
 
         let mut previous_by_key = HashMap::with_capacity(self.adapters.len());
         for adapter in self.adapters.drain(..) {
-            previous_by_key.insert(adapter.key.clone(), adapter);
+            previous_by_key.insert(adapter.key, adapter);
         }
 
         let mut adapters = Vec::with_capacity(raw_adapters.len());
+        let mut adapter_labels_changed = false;
         for raw in raw_adapters {
             let (mut sent_history, mut received_history, mut total_history, previous_state) =
                 if let Some(previous_adapter) = previous_by_key.remove(&raw.key) {
+                    adapter_labels_changed |= previous_adapter.name != raw.name;
                     let NetworkAdapterEntry {
                         name,
                         state,
@@ -628,10 +877,11 @@ impl NetworkPageState {
                         }),
                     )
                 } else {
+                    adapter_labels_changed = true;
                     (
-                        vec![0; HIST_SIZE],
-                        vec![0; HIST_SIZE],
-                        vec![0; HIST_SIZE],
+                        HistoryBuffer::zeroed(HIST_SIZE),
+                        HistoryBuffer::zeroed(HIST_SIZE),
+                        HistoryBuffer::zeroed(HIST_SIZE),
                         None,
                     )
                 };
@@ -689,14 +939,30 @@ impl NetworkPageState {
         }
 
         self.adapters = adapters;
+        let labels_changed = adapter_labels_changed
+            || previous_adapter_order
+                .iter()
+                .copied()
+                .ne(self.adapters.iter().map(|adapter| adapter.key));
         self.update_listview();
-        self.size_page();
+        if needs_initial_layout || previous_adapter_count != self.adapters.len() {
+            self.size_page();
+        } else if labels_changed {
+            self.label_graphs();
+        }
     }
 
-    unsafe fn collect_adapters(&self) -> Vec<RawAdapterEntry> {
+    unsafe fn collect_adapters() -> Result<Vec<RawAdapterEntry>, u32> {
         let mut table = null_mut::<MIB_IF_TABLE2>();
-        if GetIfTable2(&mut table) != 0 || table.is_null() {
-            return Vec::new();
+        let status = GetIfTable2(&mut table);
+        if status != 0 {
+            if !table.is_null() {
+                FreeMibTable(table as _);
+            }
+            return Err(status);
+        }
+        if table.is_null() {
+            return Err(windows_sys::Win32::Foundation::ERROR_INVALID_DATA);
         }
 
         let count = (*table).NumEntries as usize;
@@ -711,11 +977,10 @@ impl NetworkPageState {
             if name.is_empty() {
                 name = wide_array_to_string(&row.Description);
             }
-            let description = wide_array_to_string(&row.Description);
-            if is_noisy_adapter_label(&name) || is_noisy_adapter_label(&description) {
-                continue;
-            }
-            let key = format!("{}|{}|{}", row.InterfaceIndex, name, description);
+            let key = AdapterIdentity {
+                luid: row.InterfaceLuid.Value,
+                interface_index: row.InterfaceIndex,
+            };
 
             adapters.push(RawAdapterEntry {
                 interface_index: row.InterfaceIndex,
@@ -729,7 +994,7 @@ impl NetworkPageState {
         }
 
         FreeMibTable(table as _);
-        adapters
+        Ok(adapters)
     }
 
     unsafe fn configure_columns(&self) {
@@ -851,15 +1116,12 @@ impl NetworkPageState {
     }
 
     unsafe fn update_row(&self, list: HWND, index: usize, adapter: &NetworkAdapterEntry) {
-        for (subitem, text) in [&adapter.utilization, &adapter.link_speed, &adapter.state]
-            .iter()
-            .enumerate()
-        {
+        for (subitem, text) in adapter_row_texts(adapter).iter().enumerate() {
             let mut value = to_wide_null(text);
             let mut subitem_item = LVITEMW {
                 mask: LVIF_TEXT,
                 iItem: index as i32,
-                iSubItem: (subitem + 1) as i32,
+                iSubItem: subitem as i32,
                 pszText: value.as_mut_ptr(),
                 cchTextMax: value.len() as i32,
                 ..zeroed()
@@ -963,7 +1225,6 @@ impl NetworkPageState {
                 break;
             };
             InvalidateRect(graph.graph_hwnd, null_mut(), 0);
-            UpdateWindow(graph.graph_hwnd);
         }
     }
 
@@ -982,7 +1243,6 @@ impl NetworkPageState {
                 SetWindowTextW(graph.frame_hwnd, title.as_ptr());
             }
         }
-        self.update_graphs();
     }
 
     fn first_visible_adapter(&self) -> usize {
@@ -1090,12 +1350,24 @@ fn scrollbar_width() -> i32 {
     unsafe { GetSystemMetrics(SM_CXVSCROLL).max(17) }
 }
 
-fn push_history(history: &mut [u8], value: u8) {
-    if history.is_empty() {
-        return;
-    }
-    history.copy_within(..history.len() - 1, 1);
-    history[0] = value;
+fn push_history(history: &mut HistoryBuffer, value: u8) {
+    history.push(value);
+}
+
+fn thread_spawn_error(error: std::io::Error) -> u32 {
+    error
+        .raw_os_error()
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(ERROR_NOT_ENOUGH_MEMORY)
+}
+
+fn adapter_row_texts(adapter: &NetworkAdapterEntry) -> [&str; 4] {
+    [
+        &adapter.name,
+        &adapter.utilization,
+        &adapter.link_speed,
+        &adapter.state,
+    ]
 }
 
 fn include_adapter(row: &MIB_IF_ROW2) -> bool {
@@ -1116,37 +1388,16 @@ fn collapse_raw_adapters(adapters: Vec<RawAdapterEntry>) -> Vec<RawAdapterEntry>
             collapsed.push(adapter);
         }
     }
+    collapsed.sort_unstable_by_key(|adapter| (adapter.interface_index, adapter.key.luid));
     collapsed
 }
 
-fn raw_adapter_rank(adapter: &RawAdapterEntry) -> (u8, u8, u8, i64) {
-    let noisy = is_noisy_adapter_label(&adapter.name);
-
+fn raw_adapter_rank(adapter: &RawAdapterEntry) -> (u8, u8, i64) {
     (
-        u8::from(!noisy),
         u8::from(adapter.link_speed_bps != 0),
         u8::from(!adapter.state.eq_ignore_ascii_case("disconnected")),
         -(adapter.name.len() as i64),
     )
-}
-
-fn is_noisy_adapter_label(label: &str) -> bool {
-    let lower = label.to_lowercase();
-    [
-        "filter",
-        "npcap",
-        "scheduler",
-        "light-weight",
-        "light weight",
-        "packet driver",
-        "packet scheduler",
-        "native wifi",
-        "kaspersky",
-        "ndis 6",
-        "qos",
-    ]
-    .iter()
-    .any(|token| lower.contains(token))
 }
 
 fn wide_array_to_string(value: &[u16]) -> String {
@@ -1314,14 +1565,11 @@ unsafe fn draw_scale(hdc: HDC, rect: &RECT, max_scale_value: u32) -> i32 {
         DT_RIGHT,
     );
 
-    let pen = CreatePen(PS_SOLID, 1, rgb(255, 255, 0));
-    if !pen.is_null() {
-        let old_pen = SelectObject(hdc, pen as _);
-        MoveToEx(hdc, divider_x, rect.top, null_mut());
-        LineTo(hdc, divider_x, rect.bottom);
-        SelectObject(hdc, old_pen);
-        DeleteObject(pen as _);
-    }
+    let old_pen = SelectObject(hdc, GetStockObject(DC_PEN) as _);
+    SetDCPenColor(hdc, rgb(255, 255, 0));
+    MoveToEx(hdc, divider_x, rect.top, null_mut());
+    LineTo(hdc, divider_x, rect.bottom);
+    SelectObject(hdc, old_pen);
 
     scale_width + 3
 }
@@ -1365,12 +1613,8 @@ unsafe fn measure_graph_text(hdc: HDC, text: &str) -> (i32, i32) {
 
 unsafe fn draw_grid(hdc: HDC, rect: &RECT, scroll_offset: i32, zoom: u32) {
     // 网格密度会随着 zoom 调整，避免在低利用率场景下曲线长期贴底看不清。
-    let pen = CreatePen(PS_SOLID, 1, rgb(0, 128, 64));
-    if pen.is_null() {
-        return;
-    }
-
-    let old_pen = SelectObject(hdc, pen as _);
+    let old_pen = SelectObject(hdc, GetStockObject(DC_PEN) as _);
+    SetDCPenColor(hdc, rgb(0, 128, 64));
     let square_height = GRAPH_GRID + ((20 * (100 - (100 / zoom.max(1) as i32))) / 100);
 
     let mut y = rect.bottom - square_height - 1;
@@ -1388,7 +1632,6 @@ unsafe fn draw_grid(hdc: HDC, rect: &RECT, scroll_offset: i32, zoom: u32) {
     }
 
     SelectObject(hdc, old_pen);
-    DeleteObject(pen as _);
 }
 
 fn draw_grid_gpu(frame: &ChartFrame<'_>, rect: &RECT, scroll_offset: i32, zoom: u32) {
@@ -1419,7 +1662,7 @@ fn draw_grid_gpu(frame: &ChartFrame<'_>, rect: &RECT, scroll_offset: i32, zoom: 
     }
 }
 
-unsafe fn draw_history(hdc: HDC, rect: &RECT, history: &[u8], color: u32, zoom: u32) {
+unsafe fn draw_history(hdc: HDC, rect: &RECT, history: &HistoryBuffer, color: u32, zoom: u32) {
     // 三条折线都共用这套绘制函数，只靠颜色区分 total / received / sent。
     if history.is_empty() {
         return;
@@ -1427,18 +1670,14 @@ unsafe fn draw_history(hdc: HDC, rect: &RECT, history: &[u8], color: u32, zoom: 
 
     let width = (rect.right - rect.left).max(1) as usize;
     let graph_height = (rect.bottom - rect.top).max(1);
-    let scale = ((width - 1) / HIST_SIZE).max(1);
+    let scale = ((width - 1) / history.len()).max(1);
 
-    let pen = CreatePen(PS_SOLID, 2, color);
-    if pen.is_null() {
-        return;
-    }
-
-    let old_pen = SelectObject(hdc, pen as _);
+    let old_pen = SelectObject(hdc, GetStockObject(DC_PEN) as _);
+    SetDCPenColor(hdc, color);
     MoveToEx(
         hdc,
         rect.right,
-        scaled_history_y(rect, graph_height, history[0], zoom),
+        scaled_history_y(rect, graph_height, history.newest_value(), zoom),
         null_mut(),
     );
 
@@ -1449,18 +1688,17 @@ unsafe fn draw_history(hdc: HDC, rect: &RECT, history: &[u8], color: u32, zoom: 
         LineTo(
             hdc,
             rect.right - (scale * index) as i32,
-            scaled_history_y(rect, graph_height, *value, zoom),
+            scaled_history_y(rect, graph_height, value, zoom),
         );
     }
 
     SelectObject(hdc, old_pen);
-    DeleteObject(pen as _);
 }
 
 fn draw_history_gpu(
     frame: &ChartFrame<'_>,
     rect: &RECT,
-    history: &[u8],
+    history: &HistoryBuffer,
     color: ChartColor,
     zoom: u32,
 ) {
@@ -1470,10 +1708,10 @@ fn draw_history_gpu(
 
     let width = (rect.right - rect.left).max(1) as usize;
     let graph_height = (rect.bottom - rect.top).max(1);
-    let scale = ((width - 1) / HIST_SIZE).max(1);
+    let scale = ((width - 1) / history.len()).max(1);
 
     let mut previous_x = rect.right as f32;
-    let mut previous_y = scaled_history_y(rect, graph_height, history[0], zoom) as f32;
+    let mut previous_y = scaled_history_y(rect, graph_height, history.newest_value(), zoom) as f32;
 
     for (index, value) in history.iter().enumerate() {
         if index * scale >= width {
@@ -1481,7 +1719,7 @@ fn draw_history_gpu(
         }
 
         let x = (rect.right - (scale * index) as i32) as f32;
-        let y = scaled_history_y(rect, graph_height, *value, zoom) as f32;
+        let y = scaled_history_y(rect, graph_height, value, zoom) as f32;
         frame.draw_series_line(previous_x, previous_y, x, y, color);
         previous_x = x;
         previous_y = y;
@@ -1535,15 +1773,7 @@ unsafe fn draw_graph_text(hdc: HDC, mut rect: RECT, text: &str, color: u32, alig
     );
 }
 
-unsafe fn draw_graph_scale_overlay(hdc: HDC, rect: RECT, adapter: &NetworkAdapterEntry) {
-    let scale_max = adapter
-        .sent_history
-        .iter()
-        .chain(adapter.received_history.iter())
-        .chain(adapter.total_history.iter())
-        .copied()
-        .max()
-        .unwrap_or(0);
+unsafe fn draw_graph_scale_overlay(hdc: HDC, rect: RECT, scale_max: u8) {
     draw_scale(hdc, &rect, graph_scale_top_value(scale_max));
 }
 
@@ -1556,4 +1786,51 @@ unsafe fn layout_spacing() -> (i32, i32) {
 
 const fn rgb(red: u8, green: u8, blue: u8) -> u32 {
     red as u32 | ((green as u32) << 8) | ((blue as u32) << 16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_adapter(name: &str) -> NetworkAdapterEntry {
+        NetworkAdapterEntry {
+            interface_index: 7,
+            key: AdapterIdentity {
+                luid: 42,
+                interface_index: 7,
+            },
+            name: name.to_string(),
+            state: "Connected".to_string(),
+            link_speed: "1.0 Gbps".to_string(),
+            utilization: "2%".to_string(),
+            bytes_sent: "10".to_string(),
+            bytes_received: "20".to_string(),
+            bytes_total: "30".to_string(),
+            current_sent: 10,
+            current_received: 20,
+            sent_history: HistoryBuffer::zeroed(3),
+            received_history: HistoryBuffer::zeroed(3),
+            total_history: HistoryBuffer::zeroed(3),
+            dirty: true,
+        }
+    }
+
+    #[test]
+    fn history_max_updates_when_the_previous_maximum_expires() {
+        let mut history = HistoryBuffer::zeroed(3);
+        history.push(90);
+        history.push(10);
+        history.push(20);
+        assert_eq!(history.max_value(), 90);
+
+        history.push(30);
+        assert_eq!(history.max_value(), 30);
+        assert_eq!(history.iter().collect::<Vec<_>>(), vec![30, 20, 10]);
+    }
+
+    #[test]
+    fn renamed_adapter_updates_the_primary_list_column() {
+        let adapter = test_adapter("Renamed Ethernet");
+        assert_eq!(adapter_row_texts(&adapter)[0], "Renamed Ethernet");
+    }
 }

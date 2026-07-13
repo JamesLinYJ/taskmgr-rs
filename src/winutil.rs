@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::ffi::OsStr;
 
 // 跨模块复用的 Win32 工具函数。
@@ -10,31 +11,44 @@ use std::ptr::NonNull;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, RECT, WPARAM,
+    CloseHandle, GetLastError, SetLastError, ERROR_NOT_ALL_ASSIGNED, HANDLE, HWND,
+    INVALID_HANDLE_VALUE, LPARAM, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     CombineRgn, CreateRectRgn, CreateSolidBrush, DeleteObject, FillRgn, GetSysColor,
-    InvalidateRect, MapWindowPoints, SetRectRgn, UpdateWindow, COLOR_WINDOW, HBRUSH, HDC, HRGN,
-    RGN_DIFF, RGN_OR,
+    InvalidateRect, MapWindowPoints, SetRectRgn, COLOR_WINDOW, HBRUSH, HDC, HRGN, RGN_DIFF, RGN_OR,
 };
+use windows_sys::Win32::Security::{
+    AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, TokenElevation,
+    LUID_AND_ATTRIBUTES, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_ELEVATION, TOKEN_PRIVILEGES, TOKEN_QUERY,
+};
+use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows_sys::Win32::System::RemoteDesktop::WTSFreeMemory;
 use windows_sys::Win32::System::Threading::{
-    IsWow64Process, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, IsWow64Process, OpenProcess, OpenProcessToken,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows_sys::Win32::UI::Controls::{LVIR_BOUNDS, LVM_GETITEMCOUNT, LVM_GETITEMRECT};
+use windows_sys::Win32::UI::Controls::{
+    LVIR_BOUNDS, LVM_GETCOUNTPERPAGE, LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETTOPINDEX,
+};
+use windows_sys::Win32::UI::Shell::{
+    DefSubclassProc, GetWindowSubclass, RemoveWindowSubclass, SetWindowSubclass,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, DeleteMenu, DestroyIcon, DestroyMenu, GetClientRect, GetSystemMetrics,
-    GetWindowLongPtrW, GetWindowRect, SendMessageW, SetWindowLongPtrW, DWLP_MSGRESULT,
-    GWLP_USERDATA, GWLP_WNDPROC, GWL_STYLE, HICON, HMENU, MF_BYCOMMAND, SM_CXEDGE, WM_ERASEBKGND,
-    WM_NCDESTROY, WM_SETREDRAW, WM_SYSCOLORCHANGE, WNDPROC,
+    CallWindowProcW, DeleteMenu, DestroyIcon, DestroyMenu, EnableMenuItem, GetClientRect,
+    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, SendMessageW, SetWindowLongPtrW,
+    DWLP_MSGRESULT, GWLP_USERDATA, GWL_STYLE, HICON, HMENU, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED,
+    SM_CXEDGE, WM_ERASEBKGND, WM_NCDESTROY, WM_SETREDRAW, WM_SYSCOLORCHANGE, WNDPROC,
 };
 
 use crate::language::{text, TextKey};
-use crate::resource::{IDM_ALLCPUS, IDM_RUN};
+use crate::resource::{IDM_ALLCPUS, IDM_MULTIGRAPH, IDM_RUN, STATIC_CPU_GRAPH_COUNT};
 
 const REST_NORUN: u32 = 0x0000_0001;
 const LVM_SETEXTENDEDLISTVIEWSTYLE: u32 = 0x1036;
 const LVS_EX_DOUBLEBUFFER: usize = 0x0001_0000;
+const LIST_VIEW_SUBCLASS_ID: usize = 0x5254_4D47;
 
 pub struct OwnedHandle {
     handle: HANDLE,
@@ -55,6 +69,104 @@ pub fn destroy_icon_handle(icon: HICON) {
     if !icon.is_null() {
         // 安全性: callers pass an icon handle they own and want to release.
         unsafe { DestroyIcon(icon) };
+    }
+}
+
+pub fn record_win32_error(component: &str, error: u32) {
+    let message = to_wide_null(&format!(
+        "rtaskmgr: {component} failed with Win32 error {error}\r\n"
+    ));
+    // 安全性: `message` is null-terminated and remains alive for the synchronous call.
+    unsafe { OutputDebugStringW(message.as_ptr()) };
+}
+
+pub fn record_ntstatus_error(component: &str, status: i32) {
+    let message = to_wide_null(&format!(
+        "rtaskmgr: {component} failed with NTSTATUS 0x{:08X}\r\n",
+        status as u32
+    ));
+    // 安全性: `message` is null-terminated and remains alive for the synchronous call.
+    unsafe { OutputDebugStringW(message.as_ptr()) };
+}
+
+pub fn enable_debug_privilege() -> Result<(), u32> {
+    // Task Manager needs SeDebugPrivilege to query process tokens owned by services and SYSTEM.
+    // AdjustTokenPrivileges may return success while reporting ERROR_NOT_ALL_ASSIGNED, so both
+    // return channels must be checked.
+    unsafe {
+        let mut raw_token = null_mut();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut raw_token,
+        ) == 0
+        {
+            return Err(GetLastError());
+        }
+        let Some(token) = OwnedHandle::new(raw_token) else {
+            return Err(ERROR_NOT_ALL_ASSIGNED);
+        };
+
+        let mut luid = zeroed();
+        if LookupPrivilegeValueW(null(), SE_DEBUG_NAME, &mut luid) == 0 {
+            return Err(GetLastError());
+        }
+
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        SetLastError(0);
+        if AdjustTokenPrivileges(token.as_raw(), 0, &privileges, 0, null_mut(), null_mut()) == 0 {
+            return Err(GetLastError());
+        }
+
+        let error = GetLastError();
+        if error == 0 {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+}
+
+pub fn process_is_elevated() -> Result<bool, u32> {
+    unsafe {
+        let mut raw_token = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) == 0 {
+            let error = GetLastError();
+            return Err(if error == 0 {
+                ERROR_NOT_ALL_ASSIGNED
+            } else {
+                error
+            });
+        }
+        let Some(token) = OwnedHandle::new(raw_token) else {
+            return Err(ERROR_NOT_ALL_ASSIGNED);
+        };
+
+        let mut elevation = zeroed::<TOKEN_ELEVATION>();
+        let mut returned = 0u32;
+        if GetTokenInformation(
+            token.as_raw(),
+            TokenElevation,
+            &mut elevation as *mut _ as *mut _,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        ) == 0
+        {
+            let error = GetLastError();
+            return Err(if error == 0 {
+                ERROR_NOT_ALL_ASSIGNED
+            } else {
+                error
+            });
+        }
+
+        Ok(elevation.TokenIsElevated != 0)
     }
 }
 
@@ -97,16 +209,14 @@ impl Drop for OwnedHandle {
 }
 
 struct ListViewPaintState {
-    original_wndproc: WNDPROC,
     brush: HBRUSH,
     view_rgn: HRGN,
     clip_rgn: HRGN,
 }
 
 impl ListViewPaintState {
-    fn new(original_wndproc: WNDPROC) -> Self {
+    fn new() -> Self {
         Self {
-            original_wndproc,
             brush: null_mut(),
             view_rgn: null_mut(),
             clip_rgn: null_mut(),
@@ -264,6 +374,16 @@ pub fn sanitize_task_manager_menu(menu: HMENU, processor_count: usize) {
         if processor_count <= 1 {
             DeleteMenu(menu, u32::from(IDM_ALLCPUS), MF_BYCOMMAND);
         }
+        EnableMenuItem(
+            menu,
+            u32::from(IDM_MULTIGRAPH),
+            MF_BYCOMMAND
+                | if processor_count <= 1 || processor_count > STATIC_CPU_GRAPH_COUNT {
+                    MF_GRAYED
+                } else {
+                    MF_ENABLED
+                },
+        );
     }
 }
 
@@ -273,8 +393,8 @@ pub fn subclass_list_view(hwnd: HWND) {
         return;
     }
 
-    // 安全性: all operations target a live ListView HWND supplied by the caller; userdata stores
-    // the boxed subclass state until WM_NCDESTROY.
+    // 安全性: all operations target a live ListView HWND supplied by the caller; ComCtl32 keeps
+    // the boxed state pointer as subclass ref-data until WM_NCDESTROY.
     unsafe {
         SendMessageW(
             hwnd,
@@ -283,21 +403,31 @@ pub fn subclass_list_view(hwnd: HWND) {
             LVS_EX_DOUBLEBUFFER as isize,
         );
 
-        if !list_view_state_ptr(hwnd).is_null() {
+        let mut existing_ref_data = 0usize;
+        if GetWindowSubclass(
+            hwnd,
+            Some(list_view_wnd_proc),
+            LIST_VIEW_SUBCLASS_ID,
+            &mut existing_ref_data,
+        ) != 0
+        {
             return;
         }
 
-        let previous = set_window_long_ptr_value(
+        let state = Box::into_raw(Box::new(ListViewPaintState::new()));
+        if SetWindowSubclass(
             hwnd,
-            GWLP_WNDPROC,
-            list_view_wnd_proc as *const () as usize as isize,
-        );
-        let state = Box::new(ListViewPaintState::new(wndproc_from_isize(previous)));
-        set_window_userdata_ptr(hwnd, Box::into_raw(state));
+            Some(list_view_wnd_proc),
+            LIST_VIEW_SUBCLASS_ID,
+            state as usize,
+        ) == 0
+        {
+            drop(Box::from_raw(state));
+        }
     }
 }
 
-fn finish_list_view_update_internal(hwnd: HWND, invalidate: bool, immediate: bool) {
+fn finish_list_view_update_internal(hwnd: HWND, invalidate: bool) {
     if hwnd.is_null() {
         return;
     }
@@ -308,20 +438,12 @@ fn finish_list_view_update_internal(hwnd: HWND, invalidate: bool, immediate: boo
         if invalidate {
             InvalidateRect(hwnd, null(), 0);
         }
-        if immediate {
-            UpdateWindow(hwnd);
-        }
     }
 }
 
 pub fn finish_list_view_update(hwnd: HWND) {
-    // 适合需要立刻看到完整结果的页面：恢复重绘后马上同步刷新。
-    finish_list_view_update_internal(hwnd, true, true);
-}
-
-pub fn finish_list_view_update_deferred(hwnd: HWND) {
-    // 高频刷新的列表只恢复重绘，不整窗失效；调用方自己决定该重画哪些行。
-    finish_list_view_update_internal(hwnd, false, false);
+    // 恢复重绘并安排一次异步刷新，避免采样/提交消息被同步 GDI 绘制阻塞。
+    finish_list_view_update_internal(hwnd, true);
 }
 
 pub fn is_32_bit_process_handle(handle: HANDLE) -> bool {
@@ -341,28 +463,12 @@ pub fn is_32_bit_process_pid(pid: u32) -> bool {
         .is_some_and(|handle| is_32_bit_process_handle(handle.as_raw()))
 }
 
-pub fn append_32_bit_suffix(label: &str, is_32_bit: bool) -> String {
+pub fn append_32_bit_suffix(label: &str, is_32_bit: bool) -> Cow<'_, str> {
     if !is_32_bit {
-        return label.to_string();
+        return Cow::Borrowed(label);
     }
 
-    format!("{label} {}", text(TextKey::Bitness32Suffix))
-}
-
-pub fn wndproc_to_isize(wndproc: WNDPROC) -> isize {
-    wndproc.map_or(0, |wndproc| wndproc as usize as isize)
-}
-
-type RawWndProc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> isize;
-
-unsafe fn wndproc_from_isize(value: isize) -> WNDPROC {
-    if value == 0 {
-        None
-    } else {
-        // 安全性: `value` originates from the `GWLP_WNDPROC` slot or `wndproc_to_isize`,
-        // both of which store a valid window-proc function pointer representation.
-        Some(unsafe { std::mem::transmute::<isize, RawWndProc>(value) })
-    }
+    Cow::Owned(format!("{label} {}", text(TextKey::Bitness32Suffix)))
 }
 
 pub unsafe fn call_window_proc(
@@ -372,16 +478,12 @@ pub unsafe fn call_window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> isize {
-    // 安全性: callers pass a WNDPROC previously returned by Win32 or installed through
-    // `wndproc_to_isize`, and the message parameters are forwarded unchanged.
+    // 安全性: callers pass a WNDPROC previously returned by Win32, and the message parameters
+    // are forwarded unchanged.
     wndproc.map_or(0, |proc| {
         // 安全性: see the function-level safety note above.
         unsafe { CallWindowProcW(Some(proc), hwnd, msg, wparam, lparam) }
     })
-}
-
-fn list_view_state_ptr(hwnd: HWND) -> *mut ListViewPaintState {
-    window_userdata_non_null(hwnd).map_or(null_mut(), NonNull::as_ptr)
 }
 
 fn set_rect_rgn_indirect(region: HRGN, rect: &RECT) {
@@ -403,11 +505,17 @@ fn list_view_get_view_rgn(hwnd: HWND, state: &mut ListViewPaintState) {
         SetRectRgn(state.view_rgn, 0, 0, 0, 0);
     }
     // 安全性: read-only ListView query for item count.
-    let item_count = unsafe { SendMessageW(hwnd, LVM_GETITEMCOUNT, 0, 0) as i32 };
+    let item_count = unsafe { SendMessageW(hwnd, LVM_GETITEMCOUNT, 0, 0) as usize };
+    let top_index = unsafe { SendMessageW(hwnd, LVM_GETTOPINDEX, 0, 0).max(0) as usize };
+    let visible_count = unsafe { SendMessageW(hwnd, LVM_GETCOUNTPERPAGE, 0, 0).max(0) as usize };
+    let end_index = top_index
+        .saturating_add(visible_count)
+        .saturating_add(1)
+        .min(item_count);
     // 安全性: querying a process-global system metric has no caller-side invariants.
     let edge_width = unsafe { GetSystemMetrics(SM_CXEDGE) };
 
-    for index in 0..item_count {
+    for index in top_index..end_index {
         let mut item_rect = RECT {
             left: LVIR_BOUNDS as i32,
             // 安全性: RECT is a plain old data Win32 struct where all-zero is valid.
@@ -419,7 +527,7 @@ fn list_view_get_view_rgn(hwnd: HWND, state: &mut ListViewPaintState) {
             SendMessageW(
                 hwnd,
                 LVM_GETITEMRECT,
-                index as usize,
+                index,
                 &mut item_rect as *mut _ as LPARAM,
             )
         } == 0
@@ -439,14 +547,16 @@ unsafe extern "system" fn list_view_wnd_proc(
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
+    _subclass_id: usize,
+    ref_data: usize,
 ) -> isize {
-    // 自定义 ListView 窗口过程只接管背景擦除相关消息，其余消息回落给原始过程。
-    // 安全性: the subclass installs a `ListViewPaintState` pointer in GWLP_USERDATA and removes
-    // it during WM_NCDESTROY; the mutable borrow is limited to this message dispatch.
-    let state_ptr = list_view_state_ptr(hwnd);
+    // 自定义 ListView 子类只接管背景擦除相关消息，其余消息继续走 ComCtl32 子类链。
+    // 安全性: SetWindowSubclass stores a live `ListViewPaintState` pointer in ref-data until
+    // WM_NCDESTROY; the mutable borrow is limited to this message dispatch.
+    let state_ptr = ref_data as *mut ListViewPaintState;
     // 安全性: `state_ptr` either points to that live state object or is null.
     let Some(state) = (unsafe { state_ptr.as_mut() }) else {
-        return 0;
+        return unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
     };
 
     match msg {
@@ -481,26 +591,18 @@ unsafe extern "system" fn list_view_wnd_proc(
             }
         }
         WM_NCDESTROY => {
-            let original_wndproc = state.original_wndproc;
-            // 安全性: teardown restores the original proc before releasing the boxed state.
-            let result = unsafe {
-                set_window_userdata_ptr::<ListViewPaintState>(hwnd, null_mut());
-                let _ = set_window_long_ptr_value(
-                    hwnd,
-                    GWLP_WNDPROC,
-                    wndproc_to_isize(original_wndproc),
-                );
-                let result = call_window_proc(original_wndproc, hwnd, msg, wparam, lparam);
-                drop(Box::from_raw(state_ptr));
-                result
-            };
+            unsafe {
+                RemoveWindowSubclass(hwnd, Some(list_view_wnd_proc), LIST_VIEW_SUBCLASS_ID);
+            }
+            let result = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+            unsafe { drop(Box::from_raw(state_ptr)) };
             return result;
         }
         _ => {}
     }
 
-    // 安全性: unhandled messages are forwarded unchanged to the original list-view proc.
-    unsafe { call_window_proc(state.original_wndproc, hwnd, msg, wparam, lparam) }
+    // 安全性: unhandled messages continue through the system-managed subclass chain.
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
 pub fn window_rect_relative_to_page(hwnd: HWND, page_hwnd: HWND) -> RECT {
@@ -519,14 +621,14 @@ pub fn copy_text_to_callback_buffer(buffer: *mut u16, capacity: usize, text: &st
     }
 
     let max_len = capacity.saturating_sub(1);
-    let encoded = text.encode_utf16().take(max_len).collect::<Vec<_>>();
-
-    // 安全性: `buffer` is a caller-provided callback buffer with `capacity` UTF-16 slots; we
-    // copy at most capacity-1 units and always write the trailing NUL.
-    unsafe {
-        std::ptr::copy_nonoverlapping(encoded.as_ptr(), buffer, encoded.len());
-        *buffer.add(encoded.len()) = 0;
+    let mut written = 0usize;
+    for code_unit in text.encode_utf16().take(max_len) {
+        // 安全性: `written` is bounded by capacity - 1.
+        unsafe { *buffer.add(written) = code_unit };
+        written += 1;
     }
+    // 安全性: one slot was reserved for the terminator.
+    unsafe { *buffer.add(written) = 0 };
 }
 
 pub unsafe fn widestr_ptr_to_string(ptr: *const u16) -> String {

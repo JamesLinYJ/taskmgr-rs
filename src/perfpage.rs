@@ -1,11 +1,12 @@
-use std::ffi::c_void;
 // 性能页实现。
 // 该模块负责采样系统级 CPU/内存指标，并绘制经典任务管理器里的折线图、
 // 数值面板和状态快照。
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{HINSTANCE, HWND, RECT};
+use windows_sys::Win32::Foundation::{
+    GetLastError, ERROR_GEN_FAILURE, HINSTANCE, HWND, POINT, RECT,
+};
 use windows_sys::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, DrawTextW, GetDC,
     GetStockObject, InvalidateRect, Rectangle, RedrawWindow, ReleaseDC, SelectObject, SetBkMode,
@@ -24,12 +25,13 @@ use crate::assets::{
     STRIP_UNLIT_BITMAP_RESOURCE,
 };
 use crate::chart_renderer::{ChartColor, ChartRenderer};
-use crate::drawing::{fill_black, push_history, rgb};
+use crate::cpu_sampler::{query_processor_performance, ProcessorPerformance};
+use crate::drawing::{fill_black, rgb, HistoryBuffer};
 use crate::options::{CpuHistoryMode, Options};
 use crate::perf_drawing::{
-    average_history_into, current_font_height, defer_resize, draw_grid_width, draw_grid_width_gpu,
-    draw_history_series, draw_history_series_gpu, draw_meter, format_mem_meter_text,
-    set_numeric_text, HistoryPlotLayout, HistorySeries, GRAPH_GRID, HIST_SIZE,
+    current_font_height, defer_resize, draw_grid_width, draw_grid_width_gpu, draw_history_series,
+    draw_history_series_gpu, draw_meter, format_mem_meter_text, set_numeric_text,
+    HistoryPlotLayout, HistorySeries, GRAPH_GRID, HIST_SIZE,
 };
 use crate::perf_layout::{
     compute_perf_layout, next_graph_surface_extent, PerfDialogSpacing, PerfLayoutAnchors,
@@ -43,7 +45,10 @@ use crate::resource::{
     IDC_STATIC6, IDC_STATIC8, IDC_STATIC9, IDC_TOTAL_HANDLES, IDC_TOTAL_PHYSICAL,
     IDC_TOTAL_PROCESSES, IDC_TOTAL_THREADS, STATIC_CPU_GRAPH_COUNT,
 };
-use crate::winutil::{hiword, loword, to_wide_null, window_rect_relative_to_page};
+use crate::winutil::{
+    hiword, loword, record_ntstatus_error, record_win32_error, to_wide_null,
+    window_rect_relative_to_page,
+};
 
 const STRIP_HEIGHT: i32 = 75;
 const STRIP_WIDTH: i32 = 33;
@@ -100,40 +105,14 @@ const PERF_FRAME_CONTROLS: [i32; 8] = [
     IDC_STATIC13,
 ];
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct SystemProcessorPerformanceInformation {
-    // `NtQuerySystemInformation(SystemProcessorPerformanceInformation)` 的返回结构。
-    idle_time: i64,
-    kernel_time: i64,
-    user_time: i64,
-    dpc_time: i64,
-    interrupt_time: i64,
-    interrupt_count: u32,
-}
-
-#[repr(i32)]
-enum SystemInformationClass {
-    ProcessorPerformanceInformation = 8,
-}
-
-#[link(name = "ntdll")]
-unsafe extern "system" {
-    fn NtQuerySystemInformation(
-        system_information_class: i32,
-        system_information: *mut c_void,
-        system_information_length: u32,
-        return_length: *mut u32,
-    ) -> i32;
-}
-
 #[derive(Clone, Copy, Default)]
 pub struct PerformanceSnapshot {
     // 主框架只需要这一小部分汇总信息来更新状态栏和托盘。
     pub cpu_usage: u8,
-    pub mem_usage_kb: u32,
-    pub mem_limit_kb: u32,
+    pub mem_usage_kb: u64,
+    pub mem_limit_kb: u64,
     pub process_count: u32,
+    pub processor_count: usize,
 }
 
 #[derive(Default)]
@@ -143,17 +122,17 @@ pub struct PerformancePageState {
     processor_count: usize,
     cpu_usage: u8,
     kernel_usage: u8,
-    physical_mem_usage_kb: u32,
-    physical_mem_limit_kb: u32,
-    commit_total_kb: u32,
-    commit_limit_kb: u32,
-    commit_peak_kb: u32,
-    total_physical_kb: u32,
-    avail_physical_kb: u32,
-    file_cache_kb: u32,
-    kernel_total_kb: u32,
-    kernel_paged_kb: u32,
-    kernel_nonpaged_kb: u32,
+    physical_mem_usage_kb: u64,
+    physical_mem_limit_kb: u64,
+    commit_total_kb: u64,
+    commit_limit_kb: u64,
+    commit_peak_kb: u64,
+    total_physical_kb: u64,
+    avail_physical_kb: u64,
+    file_cache_kb: u64,
+    kernel_total_kb: u64,
+    kernel_paged_kb: u64,
+    kernel_nonpaged_kb: u64,
     handle_count: u32,
     thread_count: u32,
     process_count: u32,
@@ -164,12 +143,14 @@ pub struct PerformancePageState {
     previous_idle_times: Vec<i64>,
     previous_total_times: Vec<i64>,
     previous_kernel_times: Vec<i64>,
-    cpu_history: Vec<Vec<u8>>,
-    kernel_history: Vec<Vec<u8>>,
-    mem_history: Vec<u8>,
-    processor_info: Vec<SystemProcessorPerformanceInformation>,
-    cached_averaged_cpu: Vec<u8>,
-    cached_averaged_kernel: Vec<u8>,
+    cpu_samples_initialized: bool,
+    cpu_history: Vec<HistoryBuffer>,
+    kernel_history: Vec<HistoryBuffer>,
+    mem_history: HistoryBuffer,
+    processor_info: Vec<ProcessorPerformance>,
+    averaged_cpu_history: HistoryBuffer,
+    averaged_kernel_history: HistoryBuffer,
+    gdi_history_points: Vec<POINT>,
     strip_lit_bitmap: HBITMAP,
     strip_lit_red_bitmap: HBITMAP,
     strip_unlit_bitmap: HBITMAP,
@@ -179,6 +160,8 @@ pub struct PerformancePageState {
     graph_bitmap_old: HGDIOBJ,
     graph_bitmap_width: i32,
     graph_bitmap_height: i32,
+    last_cpu_refresh_error: Option<i32>,
+    last_system_refresh_error: Option<u32>,
 }
 
 impl PerformancePageState {
@@ -186,53 +169,79 @@ impl PerformancePageState {
         Self::default()
     }
 
-    pub fn initialize(&mut self, hinstance: HINSTANCE, processor_count: usize) {
+    pub fn initialize(&mut self, hinstance: HINSTANCE, processor_count: usize) -> Result<(), u32> {
         // 性能页启动时先准备采样缓冲和仪表位图；
         // 真正依赖窗口尺寸的离屏表面会在布局完成后再创建。
         self.hinstance = hinstance;
         self.ensure_history_capacity(processor_count.max(1));
-        self.load_meter_bitmaps();
+        if let Err(error) = self.load_meter_bitmaps() {
+            // The vector meter is a complete renderer, not a partial bitmap approximation.
+            // Keep the resource set empty and make the selected renderer explicit in diagnostics.
+            record_win32_error(
+                "performance bitmap meter initialization; using GDI meter",
+                error,
+            );
+        }
         self.chart_renderer = ChartRenderer::new();
+        Ok(())
     }
 
-    pub fn apply_options(&mut self, hwnd_page: HWND, options: &Options, processor_count: usize) {
+    pub fn apply_options(
+        &mut self,
+        hwnd_page: HWND,
+        options: &Options,
+        processor_count: usize,
+    ) -> bool {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 配置变化会同时影响图表数量、是否叠加内核时间，以及文字区是否折叠。
-            self.ensure_history_capacity(processor_count.max(1));
+            let processor_count = processor_count.max(1);
+            let layout_changed = self.processor_count != processor_count
+                || self.cpu_history_mode != options.cpu_history_mode
+                || self.no_title != options.no_title();
+            let graph_style_changed = self.show_kernel_times != options.kernel_times();
+
+            self.ensure_history_capacity(processor_count);
             self.cpu_history_mode = options.cpu_history_mode;
             self.show_kernel_times = options.kernel_times();
             self.no_title = options.no_title();
 
-            let pane_count = self.visible_cpu_graph_count();
-
-            for index in 0..self.cpu_graph_slot_count() {
-                let control = self.cpu_graph_hwnd(hwnd_page, index);
-                if !control.is_null() {
-                    ShowWindow(control, if index < pane_count { SW_SHOW } else { SW_HIDE });
-                }
+            if !layout_changed && !graph_style_changed {
+                return false;
             }
 
-            let detail_state = if self.no_title { SW_HIDE } else { SW_SHOW };
-            for control_id in PERF_TEXT_CONTROLS {
-                let control = GetDlgItem(hwnd_page, control_id);
-                if !control.is_null() {
-                    ShowWindow(control, detail_state);
-                }
-            }
+            if layout_changed {
+                let pane_count = self.visible_cpu_graph_count();
 
-            for control_id in [IDC_MEMGRAPH, IDC_MEMFRAME, IDC_MEMBARFRAME, IDC_MEMMETER] {
-                let control = GetDlgItem(hwnd_page, control_id);
-                if !control.is_null() {
-                    ShowWindow(control, detail_state);
+                for index in 0..self.cpu_graph_slot_count() {
+                    let control = self.cpu_graph_hwnd(hwnd_page, index);
+                    if !control.is_null() {
+                        ShowWindow(control, if index < pane_count { SW_SHOW } else { SW_HIDE });
+                    }
                 }
-            }
 
-            if !self.no_title {
-                self.update_detail_texts(hwnd_page);
+                let detail_state = if self.no_title { SW_HIDE } else { SW_SHOW };
+                for control_id in PERF_TEXT_CONTROLS {
+                    let control = GetDlgItem(hwnd_page, control_id);
+                    if !control.is_null() {
+                        ShowWindow(control, detail_state);
+                    }
+                }
+
+                for control_id in [IDC_MEMGRAPH, IDC_MEMFRAME, IDC_MEMBARFRAME, IDC_MEMMETER] {
+                    let control = GetDlgItem(hwnd_page, control_id);
+                    if !control.is_null() {
+                        ShowWindow(control, detail_state);
+                    }
+                }
+
+                if !self.no_title {
+                    self.update_detail_texts(hwnd_page);
+                }
             }
 
             InvalidateRect(hwnd_page, null(), 0);
+            layout_changed
         }
     }
 
@@ -255,6 +264,7 @@ impl PerformancePageState {
             mem_usage_kb: self.physical_mem_usage_kb,
             mem_limit_kb: self.physical_mem_limit_kb,
             process_count: self.process_count,
+            processor_count: self.processor_count,
         }
     }
 
@@ -303,12 +313,15 @@ impl PerformancePageState {
         }
     }
 
-    pub fn draw_cpu_graph(&self, hdc: HDC, rect: RECT, pane_index: usize) {
+    pub fn draw_cpu_graph(&mut self, hdc: HDC, rect: RECT, pane_index: usize) {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // CPU 图优先绘制到离屏 DC，再一次性拷回目标 DC，
             // 这样网格线和曲线更新时不会在前台逐步闪出来。
             if pane_index >= self.cpu_history.len() {
+                return;
+            }
+            if self.draw_cpu_graph_gpu(hdc, rect, pane_index) {
                 return;
             }
 
@@ -353,6 +366,7 @@ impl PerformancePageState {
                             color: ChartColor::Red,
                             stop_on_zero: false,
                         },
+                        &mut self.gdi_history_points,
                     );
                 } else {
                     draw_history_series(
@@ -360,10 +374,11 @@ impl PerformancePageState {
                         &target_rect,
                         plot_layout,
                         HistorySeries {
-                            history: &self.cached_averaged_kernel,
+                            history: &self.averaged_kernel_history,
                             color: ChartColor::Red,
                             stop_on_zero: false,
                         },
+                        &mut self.gdi_history_points,
                     );
                 }
             }
@@ -378,6 +393,7 @@ impl PerformancePageState {
                         color: ChartColor::Green,
                         stop_on_zero: false,
                     },
+                    &mut self.gdi_history_points,
                 );
             } else {
                 draw_history_series(
@@ -385,10 +401,11 @@ impl PerformancePageState {
                     &target_rect,
                     plot_layout,
                     HistorySeries {
-                        history: &self.cached_averaged_cpu,
+                        history: &self.averaged_cpu_history,
                         color: ChartColor::Green,
                         stop_on_zero: false,
                     },
+                    &mut self.gdi_history_points,
                 );
             }
 
@@ -409,7 +426,7 @@ impl PerformancePageState {
         }
     }
 
-    pub fn draw_mem_graph(&self, hdc: HDC, rect: RECT) {
+    pub fn draw_mem_graph(&mut self, hdc: HDC, rect: RECT) {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 内存历史图复用 CPU 图的绘制策略，只是数据源和颜色不同。
@@ -451,6 +468,7 @@ impl PerformancePageState {
                     color: ChartColor::Yellow,
                     stop_on_zero: true,
                 },
+                &mut self.gdi_history_points,
             );
 
             if use_backbuffer {
@@ -469,7 +487,6 @@ impl PerformancePageState {
         }
     }
 
-    #[allow(dead_code)]
     fn draw_cpu_graph_gpu(&self, hdc: HDC, rect: RECT, pane_index: usize) -> bool {
         let Some(frame) = self.chart_renderer.begin_frame(hdc, rect) else {
             return false;
@@ -507,7 +524,7 @@ impl PerformancePageState {
                     &target_rect,
                     plot_layout,
                     HistorySeries {
-                        history: &self.cached_averaged_kernel,
+                        history: &self.averaged_kernel_history,
                         color: ChartColor::Red,
                         stop_on_zero: false,
                     },
@@ -532,7 +549,7 @@ impl PerformancePageState {
                 &target_rect,
                 plot_layout,
                 HistorySeries {
-                    history: &self.cached_averaged_cpu,
+                    history: &self.averaged_cpu_history,
                     color: ChartColor::Green,
                     stop_on_zero: false,
                 },
@@ -801,11 +818,15 @@ impl PerformancePageState {
             }
 
             EndDeferWindowPos(hdwp);
-            self.ensure_graph_surface(
-                hwnd_page,
-                layout.graph_surface_width,
-                layout.graph_surface_height,
-            );
+            if self.chart_renderer.is_available() {
+                self.destroy_graph_surface();
+            } else {
+                self.ensure_graph_surface(
+                    hwnd_page,
+                    layout.graph_surface_width,
+                    layout.graph_surface_height,
+                );
+            }
             set_redraw_for_windows(&redraw_windows, true);
             self.redraw_after_layout(hwnd_page);
         }
@@ -816,18 +837,7 @@ impl PerformancePageState {
         unsafe {
             // 性能页销毁时顺带释放仪表位图和共享离屏表面。
             self.destroy_graph_surface();
-            if !self.strip_lit_bitmap.is_null() {
-                DeleteObject(self.strip_lit_bitmap as _);
-                self.strip_lit_bitmap = null_mut();
-            }
-            if !self.strip_lit_red_bitmap.is_null() {
-                DeleteObject(self.strip_lit_red_bitmap as _);
-                self.strip_lit_red_bitmap = null_mut();
-            }
-            if !self.strip_unlit_bitmap.is_null() {
-                DeleteObject(self.strip_unlit_bitmap as _);
-                self.strip_unlit_bitmap = null_mut();
-            }
+            self.destroy_meter_bitmaps();
         }
     }
 
@@ -845,9 +855,16 @@ impl PerformancePageState {
         self.previous_idle_times.resize(processor_count, 0);
         self.previous_total_times.resize(processor_count, 0);
         self.previous_kernel_times.resize(processor_count, 0);
-        self.cpu_history = vec![vec![0; HIST_SIZE]; processor_count];
-        self.kernel_history = vec![vec![0; HIST_SIZE]; processor_count];
-        self.mem_history = vec![0; HIST_SIZE];
+        self.cpu_samples_initialized = false;
+        self.cpu_history = (0..processor_count)
+            .map(|_| HistoryBuffer::zeroed(HIST_SIZE))
+            .collect();
+        self.kernel_history = (0..processor_count)
+            .map(|_| HistoryBuffer::zeroed(HIST_SIZE))
+            .collect();
+        self.averaged_cpu_history = HistoryBuffer::zeroed(HIST_SIZE);
+        self.averaged_kernel_history = HistoryBuffer::zeroed(HIST_SIZE);
+        self.mem_history = HistoryBuffer::zeroed(HIST_SIZE);
     }
 
     fn refresh_measurements(&mut self, hwnd_page: HWND) {
@@ -861,75 +878,81 @@ impl PerformancePageState {
     }
 
     fn refresh_cpu_histories(&mut self) {
-        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
-        unsafe {
-            // 内核返回的是累积 CPU 时间，所以这里必须与上一轮做差，
-            // 再换算成本轮使用率和内核时间占比。
-            self.processor_info.resize(
-                self.processor_count,
-                SystemProcessorPerformanceInformation::default(),
-            );
-            let status = NtQuerySystemInformation(
-                SystemInformationClass::ProcessorPerformanceInformation as i32,
-                self.processor_info.as_mut_ptr() as *mut c_void,
-                (self.processor_info.len() * size_of::<SystemProcessorPerformanceInformation>())
-                    as u32,
-                null_mut(),
-            );
-            if status < 0 {
-                return;
+        // 内核返回的是累积 CPU 时间，所以这里必须与上一轮做差，
+        // 再换算成本轮使用率和内核时间占比。
+        if let Err(status) =
+            query_processor_performance(self.processor_count, &mut self.processor_info)
+        {
+            if self.last_cpu_refresh_error != Some(status) {
+                record_ntstatus_error("performance CPU sampling", status);
             }
+            self.last_cpu_refresh_error = Some(status);
+            return;
+        }
+        self.last_cpu_refresh_error = None;
+        if self.processor_info.len() != self.processor_count && !self.processor_info.is_empty() {
+            self.ensure_history_capacity(self.processor_info.len());
+        }
 
-            let mut sum_idle = 0i64;
-            let mut sum_total = 0i64;
-            let mut sum_kernel = 0i64;
+        let mut sum_idle = 0i64;
+        let mut sum_total = 0i64;
+        let mut sum_kernel = 0i64;
+        let first_sample = !self.cpu_samples_initialized;
 
-            for (index, entry) in self.processor_info.iter().enumerate() {
-                let idle_time = entry.idle_time;
-                let kernel_time = entry.kernel_time.saturating_sub(entry.idle_time);
-                let total_time = entry.kernel_time.saturating_add(entry.user_time);
+        for (index, entry) in self.processor_info.iter().enumerate() {
+            let idle_time = entry.idle_time;
+            let kernel_time = entry.kernel_time.saturating_sub(entry.idle_time);
+            let total_time = entry.kernel_time.saturating_add(entry.user_time);
 
-                let delta_idle = idle_time.saturating_sub(self.previous_idle_times[index]);
-                let delta_kernel = kernel_time.saturating_sub(self.previous_kernel_times[index]);
-                let delta_total = total_time.saturating_sub(self.previous_total_times[index]);
-
-                sum_idle = sum_idle.saturating_add(delta_idle);
-                sum_kernel = sum_kernel.saturating_add(delta_kernel);
-                sum_total = sum_total.saturating_add(delta_total);
-
-                let cpu_percent = if delta_total > 0 {
-                    (100 - ((delta_idle * 100) / delta_total)).clamp(0, 100) as u8
-                } else {
-                    0
-                };
-                let kernel_percent = if delta_total > 0 {
-                    ((delta_kernel * 100) / delta_total).clamp(0, 100) as u8
-                } else {
-                    0
-                };
-
-                push_history(&mut self.cpu_history[index], cpu_percent);
-                push_history(&mut self.kernel_history[index], kernel_percent);
-
+            if first_sample {
                 self.previous_idle_times[index] = idle_time;
                 self.previous_total_times[index] = total_time;
                 self.previous_kernel_times[index] = kernel_time;
+                continue;
             }
 
-            self.cpu_usage = if sum_total > 0 {
-                (100 - ((sum_idle * 100) / sum_total)).clamp(0, 100) as u8
+            let delta_idle = idle_time.saturating_sub(self.previous_idle_times[index]);
+            let delta_kernel = kernel_time.saturating_sub(self.previous_kernel_times[index]);
+            let delta_total = total_time.saturating_sub(self.previous_total_times[index]);
+
+            sum_idle = sum_idle.saturating_add(delta_idle);
+            sum_kernel = sum_kernel.saturating_add(delta_kernel);
+            sum_total = sum_total.saturating_add(delta_total);
+
+            let cpu_percent = if delta_total > 0 {
+                (100 - ((delta_idle * 100) / delta_total)).clamp(0, 100) as u8
             } else {
                 0
             };
-            self.kernel_usage = if sum_total > 0 {
-                ((sum_kernel * 100) / sum_total).clamp(0, 100) as u8
+            let kernel_percent = if delta_total > 0 {
+                ((delta_kernel * 100) / delta_total).clamp(0, 100) as u8
             } else {
                 0
             };
+
+            self.cpu_history[index].push(cpu_percent);
+            self.kernel_history[index].push(kernel_percent);
+
+            self.previous_idle_times[index] = idle_time;
+            self.previous_total_times[index] = total_time;
+            self.previous_kernel_times[index] = kernel_time;
         }
-        // Pre-compute averaged histories once per tick rather than on every paint.
-        average_history_into(&self.cpu_history, &mut self.cached_averaged_cpu);
-        average_history_into(&self.kernel_history, &mut self.cached_averaged_kernel);
+
+        self.cpu_usage = if sum_total > 0 {
+            (100 - ((sum_idle * 100) / sum_total)).clamp(0, 100) as u8
+        } else {
+            0
+        };
+        self.kernel_usage = if sum_total > 0 {
+            ((sum_kernel * 100) / sum_total).clamp(0, 100) as u8
+        } else {
+            0
+        };
+        if !first_sample {
+            self.averaged_cpu_history.push(self.cpu_usage);
+            self.averaged_kernel_history.push(self.kernel_usage);
+        }
+        self.cpu_samples_initialized = true;
     }
 
     fn refresh_system_info(&mut self, hwnd_page: HWND) {
@@ -940,13 +963,19 @@ impl PerformancePageState {
             let mut perf = zeroed::<PERFORMANCE_INFORMATION>();
             perf.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
             if K32GetPerformanceInfo(&mut perf, perf.cb) == 0 {
+                let error = GetLastError();
+                let error = if error == 0 { ERROR_GEN_FAILURE } else { error };
+                if self.last_system_refresh_error != Some(error) {
+                    record_win32_error("performance system sampling", error);
+                }
+                self.last_system_refresh_error = Some(error);
                 return;
             }
+            self.last_system_refresh_error = None;
 
-            let page_kb = (perf.PageSize / 1024).max(1);
-            let pages_to_kb = |page_count: usize| -> u32 {
-                page_count.saturating_mul(page_kb).min(u32::MAX as usize) as u32
-            };
+            let page_kb = ((perf.PageSize as u64) / 1024).max(1);
+            let pages_to_kb =
+                |page_count: usize| -> u64 { (page_count as u64).saturating_mul(page_kb) };
 
             self.total_physical_kb = pages_to_kb(perf.PhysicalTotal);
             self.avail_physical_kb = pages_to_kb(perf.PhysicalAvailable);
@@ -971,7 +1000,7 @@ impl PerformancePageState {
                 ((self.physical_mem_usage_kb.saturating_mul(100)) / self.physical_mem_limit_kb)
                     .min(100) as u8
             };
-            push_history(&mut self.mem_history, mem_percent);
+            self.mem_history.push(mem_percent);
 
             if !self.no_title {
                 self.update_detail_texts(hwnd_page);
@@ -991,20 +1020,62 @@ impl PerformancePageState {
         set_numeric_text(hwnd_page, IDC_KERNEL_TOTAL, self.kernel_total_kb);
         set_numeric_text(hwnd_page, IDC_KERNEL_PAGED, self.kernel_paged_kb);
         set_numeric_text(hwnd_page, IDC_KERNEL_NONPAGED, self.kernel_nonpaged_kb);
-        set_numeric_text(hwnd_page, IDC_TOTAL_HANDLES, self.handle_count);
-        set_numeric_text(hwnd_page, IDC_TOTAL_THREADS, self.thread_count);
-        set_numeric_text(hwnd_page, IDC_TOTAL_PROCESSES, self.process_count);
+        set_numeric_text(hwnd_page, IDC_TOTAL_HANDLES, u64::from(self.handle_count));
+        set_numeric_text(hwnd_page, IDC_TOTAL_THREADS, u64::from(self.thread_count));
+        set_numeric_text(
+            hwnd_page,
+            IDC_TOTAL_PROCESSES,
+            u64::from(self.process_count),
+        );
     }
 
-    fn load_meter_bitmaps(&mut self) {
-        // 条形仪表优先复用资源位图；如果资源已经加载过，就不再重复创建 GDI 对象。
-        if !self.strip_lit_bitmap.is_null() {
-            return;
+    fn load_meter_bitmaps(&mut self) -> Result<(), u32> {
+        // 三个位图是一组资源；只有全部加载成功才提交到页面状态。
+        if !self.strip_lit_bitmap.is_null()
+            && !self.strip_lit_red_bitmap.is_null()
+            && !self.strip_unlit_bitmap.is_null()
+        {
+            return Ok(());
+        }
+        unsafe { self.destroy_meter_bitmaps() };
+
+        let lit = load_bitmap_resource(STRIP_LIT_BITMAP_RESOURCE);
+        if lit.is_null() {
+            return Err(last_error_or_gen_failure());
+        }
+        let lit_red = load_bitmap_resource(STRIP_LIT_RED_BITMAP_RESOURCE);
+        if lit_red.is_null() {
+            let error = last_error_or_gen_failure();
+            unsafe { DeleteObject(lit as _) };
+            return Err(error);
+        }
+        let unlit = load_bitmap_resource(STRIP_UNLIT_BITMAP_RESOURCE);
+        if unlit.is_null() {
+            let error = last_error_or_gen_failure();
+            unsafe {
+                DeleteObject(lit as _);
+                DeleteObject(lit_red as _);
+            }
+            return Err(error);
         }
 
-        self.strip_lit_bitmap = load_bitmap_resource(STRIP_LIT_BITMAP_RESOURCE);
-        self.strip_lit_red_bitmap = load_bitmap_resource(STRIP_LIT_RED_BITMAP_RESOURCE);
-        self.strip_unlit_bitmap = load_bitmap_resource(STRIP_UNLIT_BITMAP_RESOURCE);
+        self.strip_lit_bitmap = lit;
+        self.strip_lit_red_bitmap = lit_red;
+        self.strip_unlit_bitmap = unlit;
+        Ok(())
+    }
+
+    unsafe fn destroy_meter_bitmaps(&mut self) {
+        for bitmap in [
+            &mut self.strip_lit_bitmap,
+            &mut self.strip_lit_red_bitmap,
+            &mut self.strip_unlit_bitmap,
+        ] {
+            if !bitmap.is_null() {
+                DeleteObject(*bitmap as _);
+                *bitmap = null_mut();
+            }
+        }
     }
 
     fn draw_strip_meter(
@@ -1189,6 +1260,11 @@ impl PerformancePageState {
             }
 
             let old_bitmap = SelectObject(graph_dc, graph_bitmap as HGDIOBJ);
+            if old_bitmap.is_null() || old_bitmap as isize == -1 {
+                DeleteObject(graph_bitmap as _);
+                DeleteDC(graph_dc);
+                return;
+            }
             let previous_dc = self.graph_dc;
             let previous_bitmap = self.graph_bitmap;
             let previous_old = self.graph_bitmap_old;
@@ -1301,6 +1377,15 @@ impl PerformancePageState {
     pub fn redraw_after_layout(&self, hwnd_page: HWND) {
         let redraw_windows = self.redraw_windows(hwnd_page);
         redraw_performance_page(hwnd_page, &redraw_windows);
+    }
+}
+
+fn last_error_or_gen_failure() -> u32 {
+    let error = unsafe { GetLastError() };
+    if error == 0 {
+        ERROR_GEN_FAILURE
+    } else {
+        error
     }
 }
 

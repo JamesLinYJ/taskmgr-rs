@@ -44,17 +44,18 @@ enum RendererBackend {
 struct Direct2DRenderer {
     // 共享一份 D2D DC RenderTarget，逐帧绑定到不同 HDC 上使用。
     target: ID2D1DCRenderTarget,
-}
-
-pub struct ChartFrame<'a> {
-    // `ChartFrame` 代表一帧有效的绘制上下文，结束时由调用方显式提交。
-    renderer: &'a Direct2DRenderer,
     black: ID2D1SolidColorBrush,
     green: ID2D1SolidColorBrush,
     yellow: ID2D1SolidColorBrush,
     red: ID2D1SolidColorBrush,
     grid: ID2D1SolidColorBrush,
+}
+
+pub struct ChartFrame<'a> {
+    // `ChartFrame` 代表一帧有效的绘制上下文，结束时由调用方显式提交。
+    renderer: &'a Direct2DRenderer,
     rect: WinRect,
+    ended: bool,
 }
 
 impl ChartRenderer {
@@ -73,6 +74,10 @@ impl ChartRenderer {
             RendererBackend::Direct2D(renderer) => renderer.begin_frame(hdc, rect),
             RendererBackend::Unavailable => None,
         }
+    }
+
+    pub fn is_available(&self) -> bool {
+        matches!(self.backend, RendererBackend::Direct2D(_))
     }
 
     #[cfg(debug_assertions)]
@@ -111,7 +116,23 @@ impl Direct2DRenderer {
                 minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
             };
             let target = factory.CreateDCRenderTarget(&properties).ok()?;
-            Some(Self { target })
+            let black = target.CreateSolidColorBrush(&color(0, 0, 0), None).ok()?;
+            let green = target.CreateSolidColorBrush(&color(0, 255, 0), None).ok()?;
+            let yellow = target
+                .CreateSolidColorBrush(&color(255, 255, 0), None)
+                .ok()?;
+            let red = target.CreateSolidColorBrush(&color(255, 0, 0), None).ok()?;
+            let grid = target
+                .CreateSolidColorBrush(&color(0, 128, 64), None)
+                .ok()?;
+            Some(Self {
+                target,
+                black,
+                green,
+                yellow,
+                red,
+                grid,
+            })
         }
     }
 
@@ -130,35 +151,10 @@ impl Direct2DRenderer {
             self.target.BindDC(WinHdc(hdc as _), &rect).ok()?;
             self.target.BeginDraw();
 
-            let black = self
-                .target
-                .CreateSolidColorBrush(&color(0, 0, 0), None)
-                .ok()?;
-            let green = self
-                .target
-                .CreateSolidColorBrush(&color(0, 255, 0), None)
-                .ok()?;
-            let yellow = self
-                .target
-                .CreateSolidColorBrush(&color(255, 255, 0), None)
-                .ok()?;
-            let red = self
-                .target
-                .CreateSolidColorBrush(&color(255, 0, 0), None)
-                .ok()?;
-            let grid = self
-                .target
-                .CreateSolidColorBrush(&color(0, 128, 64), None)
-                .ok()?;
-
             Some(ChartFrame {
                 renderer: self,
-                black,
-                green,
-                yellow,
-                red,
-                grid,
                 rect: local_rect,
+                ended: false,
             })
         }
     }
@@ -226,20 +222,34 @@ impl ChartFrame<'_> {
         }
     }
 
-    pub fn end(self) -> bool {
+    pub fn end(mut self) -> bool {
         // `EndDraw` 失败时由调用方决定是否退回 GDI。
         // 安全性: this consumes the active frame and closes the matching BeginDraw call.
-        unsafe { self.renderer.target.EndDraw(None, None).is_ok() }
+        self.finish()
     }
 
     fn brush(&self, color: ChartColor) -> &ID2D1SolidColorBrush {
         match color {
-            ChartColor::Black => &self.black,
-            ChartColor::Green => &self.green,
-            ChartColor::Yellow => &self.yellow,
-            ChartColor::Red => &self.red,
-            ChartColor::Grid => &self.grid,
+            ChartColor::Black => &self.renderer.black,
+            ChartColor::Green => &self.renderer.green,
+            ChartColor::Yellow => &self.renderer.yellow,
+            ChartColor::Red => &self.renderer.red,
+            ChartColor::Grid => &self.renderer.grid,
         }
+    }
+
+    fn finish(&mut self) -> bool {
+        if self.ended {
+            return true;
+        }
+        self.ended = true;
+        unsafe { self.renderer.target.EndDraw(None, None).is_ok() }
+    }
+}
+
+impl Drop for ChartFrame<'_> {
+    fn drop(&mut self) {
+        let _ = self.finish();
     }
 }
 
