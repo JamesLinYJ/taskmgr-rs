@@ -66,7 +66,9 @@ struct UserSessionIdentity {
 struct UserSessionSnapshot {
     identity: UserSessionIdentity,
     status: String,
+    status_lower: String,
     client_name: String,
+    client_name_lower: String,
     session_name: String,
 }
 
@@ -546,13 +548,12 @@ impl UserPageState {
                 return;
             }
 
-            SendMessageW(list, WM_SETREDRAW, 0, 0);
-
             let mut existing_count = SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) as usize;
             let common_count = existing_count.min(self.sessions.len());
+            let mut current_session_ids = Vec::with_capacity(common_count);
+            let mut structure_changed = existing_count != self.sessions.len();
 
             for index in 0..common_count {
-                let session = &self.sessions[index];
                 let mut current_item = LVITEMW {
                     mask: LVIF_PARAM,
                     iItem: index as i32,
@@ -566,11 +567,18 @@ impl UserPageState {
                     } else {
                         None
                     };
+                if current_session_id != Some(self.sessions[index].session_id) {
+                    structure_changed = true;
+                }
+                current_session_ids.push(current_session_id);
+            }
 
                 if current_session_id != Some(session.identity.session_id) {
                     self.replace_row(list, index, session);
+                    dirty_rows.mark(index);
                 } else if session.dirty {
                     self.update_row(list, index, session);
+                    dirty_rows.mark(index);
                 }
             }
 
@@ -581,9 +589,14 @@ impl UserPageState {
 
             for index in common_count..self.sessions.len() {
                 self.insert_row(list, index, &self.sessions[index]);
+                dirty_rows.mark(index);
             }
 
-            finish_list_view_update(list);
+            if structure_changed {
+                finish_list_view_update_deferred(list);
+                InvalidateRect(list, null_mut(), 0);
+            }
+            dirty_rows.redraw(list, self.sessions.len());
         }
     }
 
@@ -1186,13 +1199,80 @@ fn query_session_string(session_id: u32, info_class: i32) -> Result<String, u32>
     }
 }
 
+fn query_session_entry(session_id: u32, show_domain_names: bool) -> Option<UserSessionEntry> {
+    unsafe {
+        let mut sessions_ptr = null_mut::<WTS_SESSION_INFOW>();
+        let mut session_count = 0u32;
+        if WTSEnumerateSessionsW(
+            WTS_CURRENT_SERVER_HANDLE,
+            0,
+            1,
+            &mut sessions_ptr,
+            &mut session_count,
+        ) == 0
+            || sessions_ptr.is_null()
+        {
+            return None;
+        }
+
+        let sessions_memory = OwnedWtsMemory::new(sessions_ptr)?;
+        let session = slice::from_raw_parts(sessions_memory.as_ptr(), session_count as usize)
+            .iter()
+            .find(|session| session.SessionId == session_id)?;
+        let user_name = query_session_string(session.SessionId, WTSUserName);
+        if user_name.is_empty() {
+            return None;
+        }
+
+        let domain_name = query_session_string(session.SessionId, WTSDomainName);
+        let client_name = query_session_string(session.SessionId, WTSClientName);
+        let display_name = if domain_name.is_empty() || !show_domain_names {
+            user_name
+        } else {
+            format!("{domain_name}\\{user_name}")
+        };
+
+        let display_name_lower = display_name.to_lowercase();
+        let status = session_state_text(session.State);
+        let status_lower = status.to_lowercase();
+        let client_name = if client_name.is_empty() {
+            "-".to_string()
+        } else {
+            client_name
+        };
+        let client_name_lower = client_name.to_lowercase();
+        let session_name = widestr_ptr_to_string(session.pWinStationName);
+        let session_name_lower = session_name.to_lowercase();
+        Some(UserSessionEntry {
+            session_id: session.SessionId,
+            display_name_lower,
+            status_lower,
+            client_name_lower,
+            session_name_lower,
+            display_name,
+            status,
+            client_name,
+            session_name,
+            dirty: false,
+        })
+    }
+}
+
+fn session_matches_current_state(expected: &UserSessionEntry, show_domain_names: bool) -> bool {
+    query_session_entry(expected.session_id, show_domain_names).is_some_and(|current| {
+        current.display_name == expected.display_name
+            && current.status == expected.status
+            && current.session_name == expected.session_name
+    })
+}
+
 fn compare_user_sessions(
     left: &UserSessionEntry,
     right: &UserSessionEntry,
     sort_column: usize,
     sort_ascending: bool,
 ) -> std::cmp::Ordering {
-    // 用户页排序按当前列切换；字符串列统一转小写比较，保证大小写不影响顺序。
+    // 用户页排序按当前列切换；字符串列使用缓存小写键，避免每轮刷新重复分配。
     let ordering = match sort_column {
         1 => left.identity.session_id.cmp(&right.identity.session_id),
         2 => left.status_lower.cmp(&right.status_lower),

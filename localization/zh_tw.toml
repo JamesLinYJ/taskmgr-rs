@@ -1,7 +1,7 @@
 [text]
 AppTitle = "Windows NT 工作管理員"
 RunTitle = "執行"
-RunPrompt = "Windows 將根據你所輸入的名稱，為你開啟相應的程式、資料夾、文件或 Internet 資源。"
+RunPrompt = "輸入程式、資料夾、文件或網際網路資源的名稱，Windows 會自動開啟。"
 ApplicationsPageTitle = "應用程式"
 ProcessesPageTitle = "處理程序"
 PerformancePageTitle = "效能"

@@ -50,6 +50,33 @@ const LVM_SETEXTENDEDLISTVIEWSTYLE: u32 = 0x1036;
 const LVS_EX_DOUBLEBUFFER: usize = 0x0001_0000;
 const LIST_VIEW_SUBCLASS_ID: usize = 0x5254_4D47;
 
+#[derive(Clone, Copy, Default)]
+pub struct ListViewDirtyRange {
+    start: Option<usize>,
+    end: usize,
+}
+
+impl ListViewDirtyRange {
+    pub fn mark(&mut self, index: usize) {
+        self.start = Some(self.start.map_or(index, |current| current.min(index)));
+        self.end = self.end.max(index);
+    }
+
+    pub unsafe fn redraw(self, hwnd: HWND, item_count: usize) {
+        let Some(start) = self.start else {
+            return;
+        };
+        if item_count == 0 {
+            return;
+        }
+
+        let end = self.end.min(item_count - 1);
+        if start <= end {
+            SendMessageW(hwnd, LVM_REDRAWITEMS, start, end as LPARAM);
+        }
+    }
+}
+
 pub struct OwnedHandle {
     handle: HANDLE,
 }

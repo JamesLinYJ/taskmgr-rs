@@ -256,6 +256,20 @@ impl PageState {
         }
     }
 
+    fn handle_task_refresh_complete(&mut self, seq: u64) -> isize {
+        match self {
+            Self::Task(state) => state.handle_refresh_complete(seq),
+            _ => 0,
+        }
+    }
+
+    unsafe fn handle_process_refresh_complete(&mut self, seq: u64) -> isize {
+        match self {
+            Self::Process(state) => state.handle_refresh_complete(seq),
+            _ => 0,
+        }
+    }
+
     fn handle_context_menu(&mut self, hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
         match self {
             Self::Task(state) if wparam as HWND == unsafe { GetDlgItem(hwnd, IDC_TASKLIST) } => {
@@ -740,6 +754,13 @@ unsafe extern "system" fn task_page_proc(
                     (*page).state.handle_notify(lparam)
                 }
             }
+            PWM_TASK_REFRESH_COMPLETE => {
+                if page.is_null() {
+                    0
+                } else {
+                    (*page).state.handle_task_refresh_complete(wparam as u64)
+                }
+            }
             WM_CONTEXTMENU => {
                 if page.is_null() {
                     0
@@ -821,6 +842,13 @@ unsafe extern "system" fn proc_page_proc(
                     (*page).state.handle_notify(lparam)
                 }
             }
+            PWM_PROC_REFRESH_COMPLETE => {
+                if page.is_null() {
+                    0
+                } else {
+                    (*page).state.handle_process_refresh_complete(wparam as u64)
+                }
+            }
             WM_CONTEXTMENU => {
                 if page.is_null() {
                     0
@@ -899,7 +927,7 @@ unsafe extern "system" fn performance_page_proc(
                 0
             }
             WM_DRAWITEM => {
-                if page.is_null() {
+                if page.is_null() || lparam == 0 {
                     return 0;
                 }
 

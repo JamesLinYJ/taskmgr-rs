@@ -27,7 +27,7 @@ use windows_sys::Win32::Foundation::{
     ERROR_NOT_ENOUGH_MEMORY, ERROR_NO_MORE_FILES, FILETIME, HANDLE, HINSTANCE, HWND,
     INVALID_HANDLE_VALUE, LPARAM, POINT, RECT, WPARAM,
 };
-use windows_sys::Win32::Graphics::Gdi::MapWindowPoints;
+use windows_sys::Win32::Graphics::Gdi::{InvalidateRect, MapWindowPoints};
 use windows_sys::Win32::Security::{
     GetLengthSid, GetTokenInformation, IsValidSid, IsWellKnownSid, LookupAccountSidW,
     TokenSessionId, TokenUser, WinLocalServiceSid, WinLocalSystemSid, WinNetworkServiceSid,
@@ -208,34 +208,10 @@ impl DirtyColumns {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct DirtyRowRange {
-    // 列表刷新时只记录真正变更的行范围，避免整表重绘。
-    start: Option<usize>,
-    end: usize,
-}
-
-impl DirtyRowRange {
-    fn mark(&mut self, index: usize) {
-        self.start = Some(self.start.map_or(index, |current| current.min(index)));
-        self.end = self.end.max(index);
-    }
-
-    unsafe fn redraw(self, list_hwnd: HWND, item_count: usize) {
-        let Some(start) = self.start else {
-            return;
-        };
-        if item_count == 0 {
-            return;
-        }
-
-        let end = self.end.min(item_count - 1);
-        if start > end {
-            return;
-        }
-
-        SendMessageW(list_hwnd, LVM_REDRAWITEMS, start, end as LPARAM);
-    }
+#[derive(Clone, Copy)]
+struct ProcessIdentity {
+    pid: u32,
+    creation_time_100ns: u64,
 }
 
 #[derive(Clone)]
@@ -243,6 +219,7 @@ pub struct ProcEntry {
     // `ProcEntry` 同时承载原始采样值、展示值和刷新期的脏信息。
     identity: ProcIdentity,
     pid: u32,
+    creation_time_100ns: u64,
     image_name: String,
     image_name_lower: String,
     is_32_bit: bool,
@@ -420,6 +397,13 @@ enum ProcWorkerCommand {
         notify_hwnd: isize,
     },
     Shutdown,
+}
+
+struct ProcWorkerResult {
+    seq: u64,
+    system_total: u64,
+    entries: Vec<ProcEntry>,
+    next_samples: HashMap<u32, PreviousProcSample>,
 }
 
 pub struct ProcessPageState {
@@ -609,6 +593,15 @@ impl ProcessPageState {
         if force || !self.paused {
             self.refresh_processes();
         }
+    }
+
+    pub unsafe fn handle_refresh_complete(&mut self, _seq: u64) -> isize {
+        self.consume_refresh_results();
+        if self.refresh_pending && !self.paused {
+            self.refresh_pending = false;
+            self.refresh_processes();
+        }
+        1
     }
 
     pub unsafe fn deactivate(&mut self, options: &mut Options) {
@@ -1144,7 +1137,7 @@ impl ProcessPageState {
             SendMessageW(list_hwnd, WM_SETREDRAW, 0, 0);
         }
 
-        let mut dirty_rows = DirtyRowRange::default();
+        let mut dirty_rows = ListViewDirtyRange::default();
 
         for index in 0..common_count {
             let entry = &self.entries[index];
@@ -1326,6 +1319,14 @@ impl ProcessPageState {
         self.entries.get(index as usize).map(|entry| entry.identity)
     }
 
+    unsafe fn current_selected_process_identity(&self) -> Option<ProcessIdentity> {
+        let pid = self.current_selected_pid()?;
+        self.entries
+            .iter()
+            .find(|entry| entry.pid == pid)
+            .map(ProcEntry::identity)
+    }
+
     fn selected_entry(&self) -> Option<&ProcEntry> {
         let identity = self.selected_identity?;
         self.entries.iter().find(|entry| entry.identity == identity)
@@ -1476,7 +1477,7 @@ impl ProcessPageState {
             let target_pid = target_identity.pid;
             if TerminateProcess(handle, 1) == 0 {
                 any_failure = true;
-                if target_pid == pid {
+                if target.pid == identity.pid {
                     root_error = windows_sys::Win32::Foundation::GetLastError();
                 }
             } else {
@@ -1574,6 +1575,16 @@ impl ProcessPageState {
                 return false;
             }
         };
+        let image_path = match query_process_image_path_from_handle(handle) {
+            Some(path) => path,
+            None => {
+                let error = windows_sys::Win32::Foundation::GetLastError();
+                CloseHandle(handle);
+                self.show_failure_message(&self.strings.cant_open_file_location, error);
+                return false;
+            }
+        };
+        CloseHandle(handle);
 
         if !Path::new(&image_path).exists() {
             self.show_failure_message(&self.strings.cant_open_file_location, 2);
@@ -1592,6 +1603,7 @@ impl ProcessPageState {
             "{explorer_path} /select,{}",
             quote_command_line_arg(&image_path)
         );
+        let application_name = to_wide_null(&explorer_path);
         let mut command_line_wide = to_wide_null(&command_line);
         let startup_info = STARTUPINFOW {
             cb: size_of::<STARTUPINFOW>() as u32,
@@ -1599,7 +1611,7 @@ impl ProcessPageState {
         };
         let mut process_info = zeroed::<PROCESS_INFORMATION>();
         let created = CreateProcessW(
-            null(),
+            application_name.as_ptr(),
             command_line_wide.as_mut_ptr(),
             null_mut(),
             null_mut(),
@@ -2677,9 +2689,6 @@ unsafe fn query_process_image_path(identity: ProcIdentity) -> Result<String, u32
     let mut capacity = 32768u32;
     let mut buffer = vec![0u16; capacity as usize];
     let success = QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut capacity);
-    let error = windows_sys::Win32::Foundation::GetLastError();
-    CloseHandle(handle);
-
     if success == 0 {
         return Err(error);
     }
@@ -2699,6 +2708,51 @@ unsafe fn query_windows_directory() -> Result<String, u32> {
         }
         buffer.resize(length.saturating_add(1), 0);
     }
+}
+
+unsafe fn query_process_creation_time(handle: HANDLE) -> Option<u64> {
+    let mut creation = zeroed::<FILETIME>();
+    let mut exit = zeroed::<FILETIME>();
+    let mut kernel = zeroed::<FILETIME>();
+    let mut user = zeroed::<FILETIME>();
+    (GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) != 0)
+        .then_some(filetime_to_u64(creation))
+}
+
+unsafe fn query_process_creation_time_for_pid(pid: u32) -> Option<u64> {
+    let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+    if handle.is_null() {
+        return None;
+    }
+    let creation_time = query_process_creation_time(handle);
+    CloseHandle(handle);
+    creation_time
+}
+
+unsafe fn open_revalidated_process(
+    identity: &ProcessIdentity,
+    desired_access: u32,
+) -> Result<HANDLE, u32> {
+    let handle = OpenProcess(
+        desired_access | PROCESS_QUERY_LIMITED_INFORMATION,
+        0,
+        identity.pid,
+    );
+    if handle.is_null() {
+        return Err(windows_sys::Win32::Foundation::GetLastError());
+    }
+
+    if identity.creation_time_100ns != 0 {
+        match query_process_creation_time(handle) {
+            Some(creation_time) if creation_time == identity.creation_time_100ns => {}
+            _ => {
+                CloseHandle(handle);
+                return Err(ERROR_INVALID_PARAMETER);
+            }
+        }
+    }
+
+    Ok(handle)
 }
 
 unsafe fn collect_process_entries(
@@ -2936,6 +2990,13 @@ unsafe fn window_rect_relative_to_page(hwnd: HWND, page_hwnd: HWND) -> RECT {
 }
 
 impl ProcEntry {
+    fn identity(&self) -> ProcessIdentity {
+        ProcessIdentity {
+            pid: self.pid,
+            creation_time_100ns: self.creation_time_100ns,
+        }
+    }
+
     fn with_pass_count(mut self, pass_count: u64) -> Self {
         self.pass_count = pass_count;
         self.dirty_columns = DirtyColumns::all();
@@ -2961,6 +3022,7 @@ fn update_process_entry(entry: &mut ProcEntry, snapshot: &ProcEntry, pass_count:
         entry.pid = snapshot.pid;
         entry.dirty_columns.mark(ColumnId::Pid);
     }
+    entry.creation_time_100ns = snapshot.creation_time_100ns;
     if entry.user_name != snapshot.user_name {
         entry.user_name.clone_from(&snapshot.user_name);
         entry.user_name_lower = snapshot.user_name_lower.clone();
