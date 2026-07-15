@@ -475,14 +475,13 @@ impl DialogPage {
         // 激活页面时顺带切换主菜单和焦点目标，
         // 这样每个页面都能看起来像自己“拥有”一套独立菜单。
         if self.hwnd.is_null() {
-            // 安全性: used only to preserve the previous error reporting contract.
-            return Err(unsafe { GetLastError() });
+            return Err(ERROR_INVALID_WINDOW_HANDLE);
         }
 
         let previous_menu = *current_menu;
         let Some(next_menu) = build_main_menu(self.menu_id, processor_count) else {
-            // 安全性: used only to preserve the previous error reporting contract.
-            return Err(unsafe { GetLastError() });
+            let error = unsafe { GetLastError() };
+            return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
         };
 
         if !options.no_title() {
@@ -908,12 +907,13 @@ unsafe extern "system" fn performance_page_proc(
                     return 0;
                 };
 
-                match wparam as i32 {
-                    id if perf_state.cpu_graph_pane_index(id).is_some() => {
-                        let pane_index = perf_state.cpu_graph_pane_index(id).unwrap_or_default();
-                        perf_state.draw_cpu_graph(draw_item.hDC, draw_item.rcItem, pane_index);
-                        1
-                    }
+                let control_id = wparam as i32;
+                if let Some(pane_index) = perf_state.cpu_graph_pane_index(control_id) {
+                    perf_state.draw_cpu_graph(draw_item.hDC, draw_item.rcItem, pane_index);
+                    return 1;
+                }
+
+                match control_id {
                     IDC_CPUMETER => {
                         perf_state.draw_cpu_meter(draw_item.hDC, draw_item.rcItem);
                         1

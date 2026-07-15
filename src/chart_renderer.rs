@@ -1,5 +1,8 @@
 //! 图表渲染抽象。
-//! 当前优先走 Direct2D；如果初始化或每帧绑定失败，调用方可以回退到原有 GDI 路径。
+//! Direct2D 与 GDI 都是受支持的图表后端。初始化时明确选择后端，运行期绘制错误会
+//! 记录 HRESULT，调用方只在已知的 GDI 后端或已记录的帧失败后使用 GDI 绘制器。
+
+use std::cell::Cell;
 
 use windows::Win32::Foundation::RECT as WinRect;
 use windows::Win32::Graphics::Direct2D::Common::{
@@ -13,6 +16,8 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
 use windows::Win32::Graphics::Gdi::HDC as WinHdc;
 use windows_numerics::Vector2;
+
+use crate::winutil::record_hresult_error;
 
 type SysRect = windows_sys::Win32::Foundation::RECT;
 type SysHdc = windows_sys::Win32::Graphics::Gdi::HDC;
@@ -33,12 +38,13 @@ pub enum ChartColor {
 pub struct ChartRenderer {
     // `ChartRenderer` 是页面能看到的唯一渲染入口。
     backend: RendererBackend,
+    last_frame_error: Cell<Option<i32>>,
 }
 
 enum RendererBackend {
-    // 目前后端只有 Direct2D 和“不可用时回退”两种状态。
+    // GDI 路径由性能页/网络页现有的完整软件绘制器实现。
     Direct2D(Direct2DRenderer),
-    Unavailable,
+    Gdi,
 }
 
 struct Direct2DRenderer {
@@ -54,25 +60,42 @@ struct Direct2DRenderer {
 pub struct ChartFrame<'a> {
     // `ChartFrame` 代表一帧有效的绘制上下文，结束时由调用方显式提交。
     renderer: &'a Direct2DRenderer,
+    last_frame_error: &'a Cell<Option<i32>>,
     rect: WinRect,
     ended: bool,
 }
 
 impl ChartRenderer {
     pub fn new() -> Self {
-        // 初始化失败时静默进入 `Unavailable`，让调用方自然回退到 GDI 路径。
+        let backend = match Direct2DRenderer::new() {
+            Ok(renderer) => RendererBackend::Direct2D(renderer),
+            Err(error) => {
+                record_hresult_error(
+                    "Direct2D chart initialization; selecting GDI backend",
+                    error,
+                );
+                RendererBackend::Gdi
+            }
+        };
         Self {
-            backend: Direct2DRenderer::new()
-                .map(RendererBackend::Direct2D)
-                .unwrap_or(RendererBackend::Unavailable),
+            backend,
+            last_frame_error: Cell::new(None),
         }
     }
 
     pub fn begin_frame(&self, hdc: SysHdc, rect: SysRect) -> Option<ChartFrame<'_>> {
         // 只有后端可用并且本帧成功绑定到目标 DC 时才返回可绘制帧。
         match &self.backend {
-            RendererBackend::Direct2D(renderer) => renderer.begin_frame(hdc, rect),
-            RendererBackend::Unavailable => None,
+            RendererBackend::Direct2D(renderer) => {
+                match renderer.begin_frame(hdc, rect, &self.last_frame_error) {
+                    Ok(frame) => Some(frame),
+                    Err(error) => {
+                        record_frame_error(&self.last_frame_error, "Direct2D chart BindDC", error);
+                        None
+                    }
+                }
+            }
+            RendererBackend::Gdi => None,
         }
     }
 
@@ -85,7 +108,7 @@ impl ChartRenderer {
     pub fn debug_backend_name(&self) -> &'static str {
         match self.backend {
             RendererBackend::Direct2D(_) => "direct2d",
-            RendererBackend::Unavailable => "gdi-fallback",
+            RendererBackend::Gdi => "gdi",
         }
     }
 }
@@ -97,13 +120,13 @@ impl Default for ChartRenderer {
 }
 
 impl Direct2DRenderer {
-    fn new() -> Option<Self> {
+    fn new() -> Result<Self, i32> {
         // 安全性: Direct2D COM wrapper methods validate HRESULTs; the factory and render target
         // are retained by `Direct2DRenderer` and used on the UI drawing thread.
         unsafe {
             // 图表绘制是 2D 单线程工作负载，因此单线程 D2D factory 足够。
-            let factory: ID2D1Factory =
-                D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).ok()?;
+            let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)
+                .map_err(windows_error_code)?;
             let properties = D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
                 pixelFormat: D2D1_PIXEL_FORMAT {
@@ -115,17 +138,25 @@ impl Direct2DRenderer {
                 usage: D2D1_RENDER_TARGET_USAGE_NONE,
                 minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
             };
-            let target = factory.CreateDCRenderTarget(&properties).ok()?;
-            let black = target.CreateSolidColorBrush(&color(0, 0, 0), None).ok()?;
-            let green = target.CreateSolidColorBrush(&color(0, 255, 0), None).ok()?;
+            let target = factory
+                .CreateDCRenderTarget(&properties)
+                .map_err(windows_error_code)?;
+            let black = target
+                .CreateSolidColorBrush(&color(0, 0, 0), None)
+                .map_err(windows_error_code)?;
+            let green = target
+                .CreateSolidColorBrush(&color(0, 255, 0), None)
+                .map_err(windows_error_code)?;
             let yellow = target
                 .CreateSolidColorBrush(&color(255, 255, 0), None)
-                .ok()?;
-            let red = target.CreateSolidColorBrush(&color(255, 0, 0), None).ok()?;
+                .map_err(windows_error_code)?;
+            let red = target
+                .CreateSolidColorBrush(&color(255, 0, 0), None)
+                .map_err(windows_error_code)?;
             let grid = target
                 .CreateSolidColorBrush(&color(0, 128, 64), None)
-                .ok()?;
-            Some(Self {
+                .map_err(windows_error_code)?;
+            Ok(Self {
                 target,
                 black,
                 green,
@@ -136,7 +167,12 @@ impl Direct2DRenderer {
         }
     }
 
-    fn begin_frame(&self, hdc: SysHdc, rect: SysRect) -> Option<ChartFrame<'_>> {
+    fn begin_frame<'a>(
+        &'a self,
+        hdc: SysHdc,
+        rect: SysRect,
+        last_frame_error: &'a Cell<Option<i32>>,
+    ) -> Result<ChartFrame<'a>, i32> {
         // 安全性: `hdc` and `rect` come from the current paint operation; D2D calls are
         // synchronous and brushes are owned by the returned frame until `end`.
         unsafe {
@@ -148,11 +184,14 @@ impl Direct2DRenderer {
                 right: rect.right - rect.left,
                 bottom: rect.bottom - rect.top,
             };
-            self.target.BindDC(WinHdc(hdc as _), &rect).ok()?;
+            self.target
+                .BindDC(WinHdc(hdc as _), &rect)
+                .map_err(windows_error_code)?;
             self.target.BeginDraw();
 
-            Some(ChartFrame {
+            Ok(ChartFrame {
                 renderer: self,
+                last_frame_error,
                 rect: local_rect,
                 ended: false,
             })
@@ -243,13 +282,36 @@ impl ChartFrame<'_> {
             return true;
         }
         self.ended = true;
-        unsafe { self.renderer.target.EndDraw(None, None).is_ok() }
+        match unsafe { self.renderer.target.EndDraw(None, None) } {
+            Ok(()) => {
+                self.last_frame_error.set(None);
+                true
+            }
+            Err(error) => {
+                record_frame_error(
+                    self.last_frame_error,
+                    "Direct2D chart EndDraw",
+                    error.code().0,
+                );
+                false
+            }
+        }
     }
 }
 
 impl Drop for ChartFrame<'_> {
     fn drop(&mut self) {
-        let _ = self.finish();
+        self.finish();
+    }
+}
+
+fn windows_error_code(error: windows::core::Error) -> i32 {
+    error.code().0
+}
+
+fn record_frame_error(state: &Cell<Option<i32>>, component: &str, error: i32) {
+    if state.replace(Some(error)) != Some(error) {
+        record_hresult_error(component, error);
     }
 }
 

@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -14,21 +13,21 @@ use std::collections::{HashMap, HashSet};
 //   5. 任务移除时，remove_stale_tasks() 回收对应的 ImageList 槽位并调整剩余条目的图标索引。
 //
 // 线程模型：
-//   WorkerCommand 工作线程在后台执行 collect_tasks_worker()（枚举窗口 + 抓取图标）。
-//   UI 线程通过 mpsc channel 提交命令，worker 完成后投递页面消息提交结果。
-//   线程退出时发送 Shutdown 命令并 join。
+//   一个 BackgroundWorker 枚举窗口，另一个 BackgroundWorker 并行抓取图标。
+//   UI 线程只提交请求和应用完整结果，采集失败不会覆盖上一轮可信列表。
 //
 // 缓存失效策略：
 //   bitness_by_pid (HashMap) 在枚举窗口时按需填充并缓存，提升同进程多窗口的效率。
 //   DirtyTaskColumns 作为列级脏标记，避免 ListView 全量重绘。
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
-use std::thread::{self, JoinHandle};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::mpsc::TryRecvError;
+use std::thread;
 
 use windows_sys::Win32::Foundation::{
-    BOOL, ERROR_NOT_ENOUGH_MEMORY, ERROR_RESOURCE_DATA_NOT_FOUND, HANDLE, HINSTANCE, HWND, LPARAM,
-    RECT,
+    GetLastError, BOOL, ERROR_GEN_FAILURE, ERROR_RESOURCE_DATA_NOT_FOUND, HANDLE, HINSTANCE, HWND,
+    LPARAM, RECT,
 };
 use windows_sys::Win32::System::StationsAndDesktops::{
     EnumDesktopWindows, GetProcessWindowStation, GetThreadDesktop, GetUserObjectInformationW,
@@ -52,15 +51,17 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, CascadeWindows, CheckMenuRadioItem, CopyIcon, DeferWindowPos, DrawMenuBar,
     EnableMenuItem, EndDeferWindowPos, GetClassLongPtrW, GetClientRect, GetDesktopWindow,
     GetDlgItem, GetWindow, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow, IsWindowVisible, PostMessageW,
+    GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow, IsWindowVisible, MessageBoxW,
     SendMessageTimeoutW, SendMessageW, SetForegroundWindow, SetMenuDefaultItem, SetWindowLongW,
     SetWindowPos, ShowWindow, ShowWindowAsync, TileWindows, TrackPopupMenuEx, GCL_HICON,
-    GCL_HICONSM, HICON, MDITILE_HORIZONTAL, MDITILE_VERTICAL, MF_BYCOMMAND, MF_DISABLED, MF_GRAYED,
-    SMTO_ABORTIFHUNG, SMTO_NORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, TPM_RETURNCMD, WM_COMMAND, WM_GETICON, WM_SETREDRAW,
+    GCL_HICONSM, HICON, MB_ICONERROR, MB_OK, MDITILE_HORIZONTAL, MDITILE_VERTICAL, MF_BYCOMMAND,
+    MF_DISABLED, MF_GRAYED, SMTO_ABORTIFHUNG, SMTO_NORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, TPM_RETURNCMD, WM_COMMAND, WM_GETICON,
+    WM_SETREDRAW,
 };
 
 use crate::assets::{load_icon_resource, DEFAULT_ICON_RESOURCE};
+use crate::background_worker::BackgroundWorker;
 use crate::language::{text, TextKey};
 use crate::menus::build_popup_menu;
 use crate::options::{Options, ViewMode};
@@ -84,6 +85,7 @@ const TASK_COLUMNS: [TaskColumn; 4] = [
     TaskColumn::new(TextKey::TaskColumnWinstation, 70),
     TaskColumn::new(TextKey::TaskColumnDesktop, 70),
 ];
+const MAX_TASK_ICON_WORKERS: usize = 8;
 
 const ACTIVE_COLUMNS: [TaskColumnId; 2] = [TaskColumnId::Name, TaskColumnId::Status];
 // 图标拉取放在后台线程里，避免顶层窗口枚举时阻塞 UI。
@@ -139,6 +141,7 @@ pub struct TaskEntry {
     // `TaskEntry` 代表一个顶层窗口/任务，并附带图标索引和脏列状态。
     identity: TaskIdentity,
     pub title: String,
+    display_title: String,
     title_lower: String,
     pub is_32_bit: bool,
     pub winstation: String,
@@ -148,26 +151,41 @@ pub struct TaskEntry {
     pub is_hung: bool,
     pub small_icon: usize,
     pub large_icon: usize,
+    icons_loaded: bool,
     pass_count: u64,
     dirty_columns: DirtyTaskColumns,
 }
 
-// 工作线程采集到的任务条目，包含顶层窗口基本信息和已抓取的图标句柄。
-// small_icon / large_icon 在后台线程中以 isize（HICON）形式存储，
-// 传递到 UI 线程后再通过 add_icon() 加入 ImageList 并转换为索引。
+// 快照 worker 只采集顶层窗口基本信息；图标由独立 worker 处理。
 struct WorkerTaskEntry {
-    // 后台线程负责窗口枚举和图标抓取；图标句柄通过 channel 安全传递回 UI 线程。
     identity: TaskIdentity,
     title: String,
     is_32_bit: bool,
     winstation: String,
     desktop: String,
     is_hung: bool,
+}
+
+type TaskWorkerResult = Result<Vec<WorkerTaskEntry>, u32>;
+
+#[derive(Clone, Copy)]
+struct TaskIconRequest {
+    identity: TaskIdentity,
+    is_hung: bool,
+}
+
+struct TaskIconResult {
+    identity: TaskIdentity,
     small_icon: isize,
     large_icon: isize,
 }
 
-impl WorkerTaskEntry {
+struct TaskIconCompletion {
+    requested_identities: Vec<TaskIdentity>,
+    result: Result<Vec<TaskIconResult>, u32>,
+}
+
+impl TaskIconResult {
     fn take_small_icon(&mut self) -> HICON {
         let icon = self.small_icon as HICON;
         self.small_icon = 0;
@@ -181,7 +199,7 @@ impl WorkerTaskEntry {
     }
 }
 
-impl Drop for WorkerTaskEntry {
+impl Drop for TaskIconResult {
     fn drop(&mut self) {
         if self.small_icon != 0 {
             destroy_icon_handle(self.small_icon as HICON);
@@ -190,26 +208,6 @@ impl Drop for WorkerTaskEntry {
             destroy_icon_handle(self.large_icon as HICON);
         }
     }
-}
-
-type TaskWorkerResult = Result<Vec<WorkerTaskEntry>, u32>;
-
-// 工作线程命令枚举。
-// Collect: 在后台线程枚举窗口 + 抓取新窗口图标，结果写入持久结果队列。
-// Shutdown: 通知线程退出主循环。
-//
-// 线程生命周期：
-//   1. prepare_initialize() 中 start_worker_thread() 创建线程。
-//   2. 每轮 refresh_tasks() 提交 Collect 命令后立即返回。
-//   3. destroy() 中 stop_worker_thread() 发送 Shutdown + join。
-enum WorkerCommand {
-    // 后台线程当前只负责枚举任务窗口和有序退出。
-    Collect {
-        main_hwnd: isize,
-        notify_hwnd: isize,
-        known_tasks: HashSet<TaskIdentity>,
-    },
-    Shutdown,
 }
 
 impl TaskEntry {
@@ -239,6 +237,10 @@ impl DirtyTaskColumns {
     fn any(self) -> bool {
         self.0 != 0
     }
+
+    fn contains(self, column_id: TaskColumnId) -> bool {
+        self.0 & (1u32 << column_id as u32) != 0
+    }
 }
 
 pub struct TaskPageState {
@@ -260,12 +262,13 @@ pub struct TaskPageState {
     sort_column: TaskColumnId,
     sort_direction: i32,
     pass_count: u64,
-    worker_sender: Option<Sender<WorkerCommand>>,
-    worker_result_receiver: Option<Receiver<TaskWorkerResult>>,
-    worker_thread: Option<JoinHandle<()>>,
+    snapshot_worker: Option<BackgroundWorker<isize, TaskWorkerResult>>,
+    icon_worker: Option<BackgroundWorker<Vec<TaskIconRequest>, TaskIconCompletion>>,
+    pending_icon_identities: HashSet<TaskIdentity>,
     collection_in_flight: bool,
     refresh_requested: bool,
     last_refresh_error: Option<u32>,
+    last_icon_error: Option<u32>,
 }
 
 impl Default for TaskPageState {
@@ -288,12 +291,13 @@ impl Default for TaskPageState {
             sort_column: TaskColumnId::Name,
             sort_direction: 1,
             pass_count: 0,
-            worker_sender: None,
-            worker_result_receiver: None,
-            worker_thread: None,
+            snapshot_worker: None,
+            icon_worker: None,
+            pending_icon_identities: HashSet::new(),
             collection_in_flight: false,
             refresh_requested: false,
             last_refresh_error: None,
+            last_icon_error: None,
         }
     }
 }
@@ -577,8 +581,24 @@ impl TaskPageState {
                 }
                 id if id == IDM_TASK_ENDTASK || id == IDC_ENDTASK as u16 => {
                     let force = (GetKeyState(i32::from(VK_CONTROL)) & (1 << 15)) != 0;
+                    let mut first_error = None;
                     for hwnd in self.selected_hwnds(true) {
-                        EndTask(hwnd, 0, if force { 1 } else { 0 });
+                        if EndTask(hwnd, 0, if force { 1 } else { 0 }) == 0 {
+                            let error = last_error_or_gen_failure();
+                            record_win32_error("ending task", error);
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                    if let Some(error) = first_error {
+                        let title = to_wide_null(text(TextKey::WarningTitle));
+                        let body =
+                            to_wide_null(&format!("{} {error}", text(TextKey::Win32ErrorPrefix)));
+                        MessageBoxW(
+                            self.hwnd_page,
+                            body.as_ptr(),
+                            title.as_ptr(),
+                            MB_OK | MB_ICONERROR,
+                        );
                     }
                 }
                 IDM_TASK_FINDPROCESS => {
@@ -593,9 +613,7 @@ impl TaskPageState {
                         }
                     }
                 }
-                _ => {
-                    let _ = command_id;
-                }
+                _ => {}
             }
         }
 
@@ -610,14 +628,14 @@ impl TaskPageState {
             let has_selection = self.selected_count > 0;
             let selected_hwnds = self.selected_hwnds(true);
             let popup = if has_selection {
-                load_popup_menu(self.hinstance, IDR_TASK_CONTEXT)
+                build_popup_menu(IDR_TASK_CONTEXT)
             } else {
-                load_popup_menu(self.hinstance, IDR_TASKVIEW)
+                build_popup_menu(IDR_TASKVIEW)
             };
 
-            if popup.is_null() {
+            let Some(popup) = popup else {
                 return;
-            }
+            };
 
             if !has_selection {
                 let checked_id = match self.current_view_mode {
@@ -826,12 +844,30 @@ impl TaskPageState {
                     self.small_icons
                 },
             );
+            if !self.tasks.is_empty() {
+                SendMessageW(list_hwnd, WM_SETREDRAW, 0, 0);
+                for (index, task) in self.tasks.iter().enumerate() {
+                    let mut item = LVITEMW {
+                        mask: LVIF_IMAGE,
+                        iItem: index as i32,
+                        iImage: if view_mode == ViewMode::LargeIcon as i32 {
+                            task.large_icon as i32
+                        } else {
+                            task.small_icon as i32
+                        },
+                        ..zeroed()
+                    };
+                    SendMessageW(list_hwnd, LVM_SETITEMW, 0, &mut item as *mut _ as LPARAM);
+                }
+                finish_list_view_update(list_hwnd);
+            }
             DrawMenuBar(self.main_hwnd);
         }
     }
 
     fn refresh_tasks(&mut self) {
         self.drain_worker_results();
+        self.drain_icon_worker_results();
         if self.collection_in_flight {
             self.refresh_requested = true;
             return;
@@ -842,21 +878,13 @@ impl TaskPageState {
     }
 
     fn schedule_task_collection(&mut self) {
-        let Some(sender) = self.worker_sender.as_ref() else {
+        let Some(worker) = self.snapshot_worker.as_ref() else {
             self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
             return;
         };
 
-        let known_tasks = self.tasks.iter().map(|task| task.identity).collect();
-        if sender
-            .send(WorkerCommand::Collect {
-                main_hwnd: self.main_hwnd as isize,
-                notify_hwnd: self.hwnd_page as isize,
-                known_tasks,
-            })
-            .is_err()
-        {
-            self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
+        if let Err(error) = worker.submit(self.main_hwnd as isize, self.hwnd_page) {
+            self.set_refresh_error(error);
             return;
         }
 
@@ -865,28 +893,49 @@ impl TaskPageState {
 
     fn drain_worker_results(&mut self) {
         loop {
-            let result = match self.worker_result_receiver.as_ref() {
-                Some(receiver) => receiver.try_recv(),
+            let result = match self.snapshot_worker.as_ref() {
+                Some(worker) => worker.try_recv(),
                 None => return,
             };
 
             match result {
-                Ok(result) => {
-                    self.collection_in_flight = false;
-                    match result {
-                        Ok(tasks) => {
-                            self.last_refresh_error = None;
-                            self.apply_task_snapshot(tasks);
-                        }
-                        Err(error) => self.set_refresh_error(error),
-                    }
-                }
+                Ok(result) => self.apply_task_worker_result(result),
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
-                    self.worker_result_receiver = None;
-                    self.worker_sender = None;
+                    self.snapshot_worker = None;
                     self.collection_in_flight = false;
                     self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn apply_task_worker_result(&mut self, result: TaskWorkerResult) {
+        self.collection_in_flight = false;
+        match result {
+            Ok(tasks) => {
+                self.last_refresh_error = None;
+                self.apply_task_snapshot(tasks);
+            }
+            Err(error) => self.set_refresh_error(error),
+        }
+    }
+
+    fn drain_icon_worker_results(&mut self) {
+        loop {
+            let result = match self.icon_worker.as_ref() {
+                Some(worker) => worker.try_recv(),
+                None => return,
+            };
+
+            match result {
+                Ok(completion) => self.apply_task_icon_completion(completion),
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.icon_worker = None;
+                    self.pending_icon_identities.clear();
+                    self.set_icon_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
                     return;
                 }
             }
@@ -898,39 +947,40 @@ impl TaskPageState {
         let selected_identities: HashSet<_> =
             self.selected_task_identities(true).into_iter().collect();
         let current_pass = self.pass_count;
+        let mut sort_dirty = false;
+        let mut icon_requests = Vec::new();
         let mut task_index_by_identity = HashMap::with_capacity(self.tasks.len());
         for (index, task) in self.tasks.iter().enumerate() {
             task_index_by_identity.insert(task.identity, index);
         }
 
-        for mut worker_task in worker_tasks {
+        for worker_task in worker_tasks {
             let identity = worker_task.identity;
             if let Some(&index) = task_index_by_identity.get(&identity) {
-                update_task_entry(&mut self.tasks[index], &worker_task, current_pass);
+                let changed = update_task_entry(&mut self.tasks[index], &worker_task, current_pass);
+                sort_dirty |= changed.contains(self.sort_column);
+                if !self.tasks[index].icons_loaded {
+                    icon_requests.push(TaskIconRequest {
+                        identity,
+                        is_hung: worker_task.is_hung,
+                    });
+                }
             } else {
-                let small_icon = add_icon(
-                    self.small_icons,
-                    worker_task.take_small_icon(),
-                    self.default_small_icon,
-                );
-                let large_icon = add_icon(
-                    self.large_icons,
-                    worker_task.take_large_icon(),
-                    self.default_large_icon,
-                );
-                self.tasks.push(TaskEntry::from_worker(
-                    worker_task,
-                    small_icon,
-                    large_icon,
-                    current_pass,
-                ));
+                let is_hung = worker_task.is_hung;
+                self.tasks
+                    .push(TaskEntry::from_worker(worker_task, current_pass));
                 task_index_by_identity.insert(identity, self.tasks.len() - 1);
+                sort_dirty = true;
+                icon_requests.push(TaskIconRequest { identity, is_hung });
             }
         }
 
-        self.remove_stale_tasks(current_pass);
-        self.resort_tasks();
+        sort_dirty |= self.remove_stale_tasks(current_pass);
+        if sort_dirty {
+            self.resort_tasks();
+        }
         self.update_task_listview(&selected_identities);
+        self.schedule_icon_collection(icon_requests);
         self.pass_count = self.pass_count.wrapping_add(1);
     }
 
@@ -941,8 +991,108 @@ impl TaskPageState {
         self.last_refresh_error = Some(error);
     }
 
+    fn set_icon_error(&mut self, error: u32) {
+        if self.last_icon_error != Some(error) {
+            record_win32_error("task icon refresh", error);
+        }
+        self.last_icon_error = Some(error);
+    }
+
+    fn schedule_icon_collection(&mut self, mut requests: Vec<TaskIconRequest>) {
+        requests.retain(|request| self.pending_icon_identities.insert(request.identity));
+        if requests.is_empty() {
+            return;
+        }
+
+        let identities = requests
+            .iter()
+            .map(|request| request.identity)
+            .collect::<Vec<_>>();
+        let Some(worker) = self.icon_worker.as_ref() else {
+            for identity in identities {
+                self.pending_icon_identities.remove(&identity);
+            }
+            self.set_icon_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
+            return;
+        };
+
+        if let Err(error) = worker.submit(requests, self.hwnd_page) {
+            for identity in identities {
+                self.pending_icon_identities.remove(&identity);
+            }
+            self.icon_worker = None;
+            self.set_icon_error(error);
+        }
+    }
+
+    fn apply_task_icon_completion(&mut self, completion: TaskIconCompletion) {
+        for identity in completion.requested_identities {
+            self.pending_icon_identities.remove(&identity);
+        }
+
+        match completion.result {
+            Ok(results) => {
+                self.last_icon_error = None;
+                self.apply_task_icon_results(results);
+            }
+            Err(error) => self.set_icon_error(error),
+        }
+    }
+
+    fn apply_task_icon_results(&mut self, results: Vec<TaskIconResult>) {
+        let list_hwnd = self.list_hwnd();
+        for mut result in results {
+            let Some(index) = self
+                .tasks
+                .iter()
+                .position(|task| task.identity == result.identity)
+            else {
+                continue;
+            };
+            if !window_matches_identity(result.identity) {
+                continue;
+            }
+
+            let icons = add_icon_pair(
+                self.small_icons,
+                self.large_icons,
+                result.take_small_icon(),
+                result.take_large_icon(),
+            );
+            let (small_icon, large_icon) = match icons {
+                Ok(icons) => icons,
+                Err(error) => {
+                    self.set_icon_error(error);
+                    continue;
+                }
+            };
+            let task = &mut self.tasks[index];
+            task.small_icon = small_icon;
+            task.large_icon = large_icon;
+            task.icons_loaded = true;
+
+            if !list_hwnd.is_null() {
+                let mut item = LVITEMW {
+                    mask: LVIF_IMAGE,
+                    iItem: index as i32,
+                    iImage: if self.current_view_mode == ViewMode::LargeIcon as i32 {
+                        large_icon as i32
+                    } else {
+                        small_icon as i32
+                    },
+                    ..unsafe { zeroed() }
+                };
+                unsafe {
+                    SendMessageW(list_hwnd, LVM_SETITEMW, 0, &mut item as *mut _ as LPARAM);
+                    SendMessageW(list_hwnd, LVM_REDRAWITEMS, index, index as LPARAM);
+                }
+            }
+        }
+    }
+
     pub fn handle_worker_completion(&mut self) {
         self.drain_worker_results();
+        self.drain_icon_worker_results();
         if self.refresh_requested && !self.collection_in_flight {
             self.refresh_requested = false;
             self.schedule_task_collection();
@@ -958,63 +1108,39 @@ impl TaskPageState {
     fn start_worker_thread(&mut self) -> Result<(), u32> {
         // 顶层窗口枚举可能涉及跨窗口站和桌面切换，
         // 放到后台线程可以避免主线程在刷新时明显卡顿。
-        if self.worker_sender.is_some() {
+        if self.snapshot_worker.is_some() && self.icon_worker.is_some() {
             return Ok(());
         }
 
-        let (command_tx, command_rx) = channel::<WorkerCommand>();
-        let (result_tx, result_rx) = channel::<TaskWorkerResult>();
-        let worker = thread::Builder::new()
-            .name("rtaskmgr-task-sampler".to_string())
-            .spawn(move || {
-                while let Ok(command) = command_rx.recv() {
-                    match command {
-                        WorkerCommand::Collect {
-                            main_hwnd,
-                            notify_hwnd,
-                            known_tasks,
-                        } => {
-                            let result = collect_tasks_worker(main_hwnd, &known_tasks);
-                            if result_tx.send(result).is_ok() {
-                                unsafe {
-                                    PostMessageW(
-                                        notify_hwnd as HWND,
-                                        PWM_TASK_WORKER_COMPLETE,
-                                        0,
-                                        0,
-                                    );
-                                }
-                            }
-                        }
-                        WorkerCommand::Shutdown => break,
-                    }
-                }
-            })
-            .map_err(thread_spawn_error)?;
-
-        self.worker_sender = Some(command_tx);
-        self.worker_result_receiver = Some(result_rx);
-        self.worker_thread = Some(worker);
+        if self.snapshot_worker.is_none() {
+            self.snapshot_worker = Some(BackgroundWorker::spawn(
+                "rtaskmgr-task-sampler",
+                PWM_TASK_WORKER_COMPLETE,
+                |main_hwnd: isize| collect_tasks_worker(main_hwnd),
+            )?);
+        }
+        if self.icon_worker.is_none() {
+            self.icon_worker = Some(BackgroundWorker::spawn(
+                "rtaskmgr-task-icons",
+                PWM_TASK_WORKER_COMPLETE,
+                collect_task_icons,
+            )?);
+        }
         Ok(())
     }
 
-    // 发送 Shutdown 命令并等待工作线程退出。清理线程句柄和 channel。
     fn stop_worker_thread(&mut self) {
-        if let Some(sender) = self.worker_sender.take() {
-            let _ = sender.send(WorkerCommand::Shutdown);
-        }
-
-        if let Some(worker) = self.worker_thread.take() {
-            let _ = worker.join();
-        }
-        self.worker_result_receiver = None;
+        self.snapshot_worker = None;
+        self.icon_worker = None;
+        self.pending_icon_identities.clear();
         self.collection_in_flight = false;
         self.refresh_requested = false;
     }
 
-    fn remove_stale_tasks(&mut self, current_pass: u64) {
+    fn remove_stale_tasks(&mut self, current_pass: u64) -> bool {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
+            let previous_len = self.tasks.len();
             let mut removed_small = Vec::with_capacity(self.tasks.len());
             let mut removed_large = Vec::with_capacity(self.tasks.len());
 
@@ -1039,6 +1165,7 @@ impl TaskPageState {
                     task.large_icon = adjusted_icon_index(task.large_icon, &removed_large);
                 }
             }
+            previous_len != self.tasks.len()
         }
     }
 
@@ -1174,12 +1301,12 @@ impl TaskPageState {
             };
 
             let text = match column_id {
-                TaskColumnId::Name => append_32_bit_suffix(&task.title, task.is_32_bit),
-                TaskColumnId::Status => Cow::Borrowed(task.status_text()),
-                TaskColumnId::Winstation => Cow::Borrowed(task.winstation.as_str()),
-                TaskColumnId::Desktop => Cow::Borrowed(task.desktop.as_str()),
+                TaskColumnId::Name => task.display_title.as_str(),
+                TaskColumnId::Status => task.status_text(),
+                TaskColumnId::Winstation => task.winstation.as_str(),
+                TaskColumnId::Desktop => task.desktop.as_str(),
             };
-            copy_text_to_callback_buffer(item.pszText, item.cchTextMax as usize, &text);
+            copy_text_to_callback_buffer(item.pszText, item.cchTextMax as usize, text);
         }
     }
 
@@ -1300,35 +1427,103 @@ impl TaskPageState {
     }
 }
 
-// 从资源加载弹出菜单。当前始终通过 build_popup_menu 构造，忽略 hinstance。
-fn load_popup_menu(
-    hinstance: HINSTANCE,
-    resource_id: u16,
-) -> windows_sys::Win32::UI::WindowsAndMessaging::HMENU {
-    let _ = hinstance;
-    build_popup_menu(resource_id, usize::MAX).unwrap_or(null_mut())
-}
-
-fn collect_tasks_worker(main_hwnd: isize, known_tasks: &HashSet<TaskIdentity>) -> TaskWorkerResult {
+fn collect_tasks_worker(main_hwnd: isize) -> TaskWorkerResult {
     // 应用程序页只展示当前交互桌面的顶层窗口。直接枚举 worker 所属桌面，避免把
     // Winlogon 等不可访问安全桌面误判成整轮采样失败。
     let tasks = collect_tasks_current_winsta_worker(main_hwnd as HWND)?;
     let mut valid_tasks = Vec::with_capacity(tasks.len());
-    // 图标抓取通过 SendMessageTimeoutW 完成，放在后台线程避免了 UI 卡顿。
-    // SMTO_ABORTIFHUNG 确保单次不超过 100ms；挂起的窗口会被跳过。
-    for mut task in tasks {
+    // 首先提交轻量窗口快照；图标由独立 worker 补全，慢窗口不会再阻塞列表出现。
+    for task in tasks {
         if !window_matches_identity(task.identity) {
             continue;
-        }
-        if !known_tasks.contains(&task.identity) {
-            let hwnd = task.identity.hwnd();
-            let (small_icon, large_icon) = fetch_window_icons(hwnd, task.is_hung);
-            task.small_icon = small_icon as isize;
-            task.large_icon = large_icon as isize;
         }
         valid_tasks.push(task);
     }
     Ok(valid_tasks)
+}
+
+fn collect_task_icons(requests: Vec<TaskIconRequest>) -> TaskIconCompletion {
+    let requested_identities = requests
+        .iter()
+        .map(|request| request.identity)
+        .collect::<Vec<_>>();
+    let result = collect_task_icons_parallel(&requests);
+    TaskIconCompletion {
+        requested_identities,
+        result,
+    }
+}
+
+fn collect_task_icons_parallel(requests: &[TaskIconRequest]) -> Result<Vec<TaskIconResult>, u32> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // A bounded group prevents one unresponsive application from serializing icon discovery for
+    // every other row while avoiding an unbounded thread per window.
+    let worker_count = thread::available_parallelism()
+        .map_err(io_error_code)
+        .map(usize::from)?
+        .min(MAX_TASK_ICON_WORKERS)
+        .min(requests.len());
+    let next_request = AtomicUsize::new(0);
+
+    thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            workers.push(scope.spawn(|| {
+                let mut results = Vec::new();
+                loop {
+                    let index = next_request.fetch_add(1, AtomicOrdering::Relaxed);
+                    let Some(request) = requests.get(index).copied() else {
+                        break;
+                    };
+                    if !window_matches_identity(request.identity) {
+                        continue;
+                    }
+
+                    let (small_icon, large_icon) =
+                        fetch_window_icons(request.identity.hwnd(), request.is_hung);
+                    if window_matches_identity(request.identity) {
+                        results.push(TaskIconResult {
+                            identity: request.identity,
+                            small_icon: small_icon as isize,
+                            large_icon: large_icon as isize,
+                        });
+                    } else {
+                        if !small_icon.is_null() {
+                            destroy_icon_handle(small_icon);
+                        }
+                        if !large_icon.is_null() {
+                            destroy_icon_handle(large_icon);
+                        }
+                    }
+                }
+                results
+            }));
+        }
+
+        let mut results = Vec::with_capacity(requests.len());
+        let mut worker_failed = false;
+        for worker in workers {
+            match worker.join() {
+                Ok(mut worker_results) => results.append(&mut worker_results),
+                Err(_) => worker_failed = true,
+            }
+        }
+        if worker_failed {
+            Err(windows_sys::Win32::Foundation::ERROR_GEN_FAILURE)
+        } else {
+            Ok(results)
+        }
+    })
+}
+
+fn io_error_code(error: std::io::Error) -> u32 {
+    error
+        .raw_os_error()
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(windows_sys::Win32::Foundation::ERROR_GEN_FAILURE)
 }
 
 fn collect_tasks_current_winsta_worker(main_hwnd: HWND) -> TaskWorkerResult {
@@ -1352,17 +1547,22 @@ fn collect_tasks_current_winsta_worker(main_hwnd: HWND) -> TaskWorkerResult {
             tasks: &mut tasks as *mut Vec<WorkerTaskEntry>,
             seen_tasks: &mut seen_tasks as *mut HashSet<TaskIdentity>,
             bitness_by_pid: &mut bitness_by_pid as *mut HashMap<u32, bool>,
-            process_identities: &mut process_identities as *mut HashMap<u32, ProcIdentity>,
+            process_identities: &mut process_identities
+                as *mut HashMap<u32, Result<ProcIdentity, u32>>,
+            error: None,
             main_hwnd,
             winstation,
             desktop,
         };
-        if EnumDesktopWindows(
+        let enumerated = EnumDesktopWindows(
             desktop_handle,
             Some(enum_window_proc),
             &mut context as *mut WindowEnumContext as LPARAM,
-        ) == 0
-        {
+        );
+        if let Some(error) = context.error {
+            return Err(error);
+        }
+        if enumerated == 0 {
             return Err(last_error_or_gen_failure());
         }
         Ok(tasks)
@@ -1374,7 +1574,8 @@ struct WindowEnumContext {
     tasks: *mut Vec<WorkerTaskEntry>,
     seen_tasks: *mut HashSet<TaskIdentity>,
     bitness_by_pid: *mut HashMap<u32, bool>,
-    process_identities: *mut HashMap<u32, ProcIdentity>,
+    process_identities: *mut HashMap<u32, Result<ProcIdentity, u32>>,
+    error: Option<u32>,
     main_hwnd: HWND,
     winstation: String,
     desktop: String,
@@ -1402,13 +1603,29 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         return 1;
     }
     let process_identities = &mut *context.process_identities;
-    let process = if let Some(identity) = process_identities.get(&pid).copied() {
+    let process_result = if let Some(identity) = process_identities.get(&pid).copied() {
         identity
     } else {
-        let identity = query_process_identity_for_pid(pid).unwrap_or(ProcIdentity::pid_only(pid));
+        let identity = query_process_identity_for_pid(pid);
         process_identities.insert(pid, identity);
         identity
     };
+    let process = match process_result {
+        Ok(identity) => identity,
+        Err(error) => {
+            if !window_still_has_identity(hwnd, pid, thread_id) {
+                return 1;
+            }
+            context.error = Some(error);
+            // Returning FALSE stops EnumDesktopWindows. The caller reads `context.error`
+            // instead of relying on GetLastError, which callbacks are not required to set.
+            return 0;
+        }
+    };
+    if !process.is_verified() {
+        context.error = Some(windows_sys::Win32::Foundation::ERROR_INVALID_DATA);
+        return 0;
+    }
     let identity = TaskIdentity {
         hwnd: hwnd as isize,
         process,
@@ -1419,12 +1636,19 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         return 1;
     }
     let bitness_by_pid = &mut *context.bitness_by_pid;
-    let is_32_bit = if pid == 0 {
-        false
-    } else if let Some(&cached) = bitness_by_pid.get(&pid) {
+    let is_32_bit = if let Some(&cached) = bitness_by_pid.get(&pid) {
         cached
     } else {
-        let detected = is_32_bit_process_pid(pid);
+        let detected = match is_32_bit_process_pid(pid) {
+            Ok(detected) => detected,
+            Err(error) => {
+                if !window_still_has_identity(hwnd, pid, thread_id) {
+                    return 1;
+                }
+                context.error = Some(error);
+                return 0;
+            }
+        };
         bitness_by_pid.insert(pid, detected);
         detected
     };
@@ -1436,10 +1660,17 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         winstation: context.winstation.clone(),
         desktop: context.desktop.clone(),
         is_hung: IsHungAppWindow(hwnd) != 0,
-        small_icon: 0,
-        large_icon: 0,
     });
     1
+}
+
+unsafe fn window_still_has_identity(hwnd: HWND, pid: u32, thread_id: u32) -> bool {
+    if IsWindow(hwnd) == 0 {
+        return false;
+    }
+    let mut current_pid = 0u32;
+    let current_thread_id = GetWindowThreadProcessId(hwnd, &mut current_pid);
+    current_thread_id == thread_id && current_pid == pid
 }
 
 unsafe fn window_title(hwnd: HWND) -> String {
@@ -1620,26 +1851,52 @@ fn compare_tasks(
     }
 }
 
-fn add_icon(imagelist: HIMAGELIST, icon: HICON, default_icon: HICON) -> usize {
-    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
-    unsafe {
-        // 自己复制得到的图标句柄在加入 ImageList 后就可以释放；
-        // 默认图标是共享资源，不应在这里销毁。
-        let uses_default_icon = icon.is_null();
-        let icon_handle = if uses_default_icon {
-            default_icon
-        } else {
-            icon
-        };
-        let index = ImageList_ReplaceIcon(imagelist, -1, icon_handle);
-        if !uses_default_icon {
-            destroy_icon_handle(icon);
+fn add_icon_pair(
+    small_imagelist: HIMAGELIST,
+    large_imagelist: HIMAGELIST,
+    small_icon: HICON,
+    large_icon: HICON,
+) -> Result<(usize, usize), u32> {
+    let small_index = match append_owned_icon(small_imagelist, small_icon) {
+        Ok(index) => index,
+        Err(error) => {
+            destroy_icon_handle(large_icon);
+            return Err(error);
         }
-        if index < 0 {
-            0
-        } else {
-            index as usize
+    };
+    match append_owned_icon(large_imagelist, large_icon) {
+        Ok(large_index) => Ok((small_index, large_index)),
+        Err(error) => {
+            if small_index > 0
+                && unsafe { ImageList_Remove(small_imagelist, small_index as i32) } == 0
+            {
+                let rollback_error = unsafe { GetLastError() };
+                record_win32_error(
+                    "task small icon rollback",
+                    if rollback_error == 0 {
+                        ERROR_GEN_FAILURE
+                    } else {
+                        rollback_error
+                    },
+                );
+            }
+            Err(error)
         }
+    }
+}
+
+fn append_owned_icon(imagelist: HIMAGELIST, icon: HICON) -> Result<usize, u32> {
+    // Index 0 is the shared default icon; a null custom icon explicitly selects that index.
+    if icon.is_null() {
+        return Ok(0);
+    }
+    let index = unsafe { ImageList_ReplaceIcon(imagelist, -1, icon) };
+    destroy_icon_handle(icon);
+    if index < 0 {
+        let error = unsafe { GetLastError() };
+        Err(if error == 0 { ERROR_GEN_FAILURE } else { error })
+    } else {
+        Ok(index as usize)
     }
 }
 
@@ -1667,74 +1924,92 @@ fn adjusted_icon_index(index: usize, removed_indices: &[usize]) -> usize {
     index.saturating_sub(removed_before)
 }
 
-fn thread_spawn_error(error: std::io::Error) -> u32 {
-    error
-        .raw_os_error()
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(ERROR_NOT_ENOUGH_MEMORY)
-}
-
 // 将工作线程采集的 WorkerTaskEntry 转换为 UI 线程的 TaskEntry。
-// small_icon / large_icon 是 ImageList 中的索引而非原始 HICON。
 impl TaskEntry {
-    fn from_worker(
-        mut worker: WorkerTaskEntry,
-        small_icon: usize,
-        large_icon: usize,
-        pass_count: u64,
-    ) -> Self {
-        let title = std::mem::take(&mut worker.title);
-        let winstation = std::mem::take(&mut worker.winstation);
-        let desktop = std::mem::take(&mut worker.desktop);
+    fn from_worker(worker: WorkerTaskEntry, pass_count: u64) -> Self {
+        let WorkerTaskEntry {
+            identity,
+            title,
+            is_32_bit,
+            winstation,
+            desktop,
+            is_hung,
+        } = worker;
+        let display_title = append_32_bit_suffix(&title, is_32_bit).into_owned();
         Self {
-            identity: worker.identity,
+            identity,
             title_lower: title.to_lowercase(),
             title,
-            is_32_bit: worker.is_32_bit,
+            display_title,
+            is_32_bit,
             winstation_lower: winstation.to_lowercase(),
             winstation,
             desktop_lower: desktop.to_lowercase(),
             desktop,
-            is_hung: worker.is_hung,
-            small_icon,
-            large_icon,
+            is_hung,
+            small_icon: 0,
+            large_icon: 0,
+            icons_loaded: false,
             pass_count,
             dirty_columns: DirtyTaskColumns::all(),
         }
     }
 }
 
-fn update_task_entry(task: &mut TaskEntry, worker: &WorkerTaskEntry, pass_count: u64) {
+fn update_task_entry(
+    task: &mut TaskEntry,
+    worker: &WorkerTaskEntry,
+    pass_count: u64,
+) -> DirtyTaskColumns {
     // 增量更新只标记真正变化的列，这样详细视图刷新时能减少不必要重绘。
     task.pass_count = pass_count;
+    let mut changed = DirtyTaskColumns::default();
 
     if task.winstation != worker.winstation {
         task.winstation.clone_from(&worker.winstation);
         task.winstation_lower = worker.winstation.to_lowercase();
-        task.dirty_columns.mark(TaskColumnId::Winstation);
+        mark_task_column_changed(task, &mut changed, TaskColumnId::Winstation);
     }
     if task.desktop != worker.desktop {
         task.desktop.clone_from(&worker.desktop);
         task.desktop_lower = worker.desktop.to_lowercase();
-        task.dirty_columns.mark(TaskColumnId::Desktop);
+        mark_task_column_changed(task, &mut changed, TaskColumnId::Desktop);
     }
-    if task.title != worker.title {
+    let title_changed = task.title != worker.title;
+    let bitness_changed = task.is_32_bit != worker.is_32_bit;
+    if title_changed {
         task.title.clone_from(&worker.title);
         task.title_lower = worker.title.to_lowercase();
-        task.dirty_columns.mark(TaskColumnId::Name);
     }
-    if task.is_32_bit != worker.is_32_bit {
+    if bitness_changed {
         task.is_32_bit = worker.is_32_bit;
-        task.dirty_columns.mark(TaskColumnId::Name);
+    }
+    if title_changed || bitness_changed {
+        task.display_title = append_32_bit_suffix(&task.title, task.is_32_bit).into_owned();
+        mark_task_column_changed(task, &mut changed, TaskColumnId::Name);
     }
     if task.is_hung != worker.is_hung {
         task.is_hung = worker.is_hung;
-        task.dirty_columns.mark(TaskColumnId::Status);
+        mark_task_column_changed(task, &mut changed, TaskColumnId::Status);
     }
+
+    changed
+}
+
+fn mark_task_column_changed(
+    task: &mut TaskEntry,
+    changed: &mut DirtyTaskColumns,
+    column_id: TaskColumnId,
+) {
+    task.dirty_columns.mark(column_id);
+    changed.mark(column_id);
 }
 
 fn window_matches_identity(identity: TaskIdentity) -> bool {
     unsafe {
+        if !identity.process.is_verified() {
+            return false;
+        }
         let hwnd = identity.hwnd();
         if IsWindow(hwnd) == 0 {
             return false;
@@ -1746,9 +2021,7 @@ fn window_matches_identity(identity: TaskIdentity) -> bool {
             return false;
         }
 
-        !identity.process.is_verified()
-            || query_process_identity_for_pid(process_id)
-                .is_ok_and(|current| current == identity.process)
+        query_process_identity_for_pid(process_id).is_ok_and(|current| current == identity.process)
     }
 }
 
@@ -1768,7 +2041,6 @@ fn last_error_or_gen_failure() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::channel;
 
     #[test]
     fn normalize_removed_icon_indices_keeps_sorted_unique_non_default_indices() {
@@ -1799,16 +2071,13 @@ mod tests {
 
     #[test]
     fn failed_task_worker_keeps_the_previous_pass_state() {
-        let (sender, receiver) = channel::<TaskWorkerResult>();
         let mut state = TaskPageState {
-            worker_result_receiver: Some(receiver),
             collection_in_flight: true,
             pass_count: 9,
             ..TaskPageState::default()
         };
-        sender.send(Err(5)).unwrap();
 
-        state.drain_worker_results();
+        state.apply_task_worker_result(Err(5));
 
         assert!(!state.collection_in_flight);
         assert_eq!(state.pass_count, 9);

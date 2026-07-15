@@ -89,7 +89,7 @@ fn build_task_view_popup() -> Option<PopupMenu> {
 fn build_task_context_popup() -> Option<PopupMenu> {
     // 任务页右键菜单仍然保持老 Task Manager 的命令顺序。
     let mut menu = PopupMenu::new()?;
-    for (index, (command_id, key)) in [
+    for (command_id, key) in [
         (IDM_TASK_SWITCHTO, TextKey::SwitchTo),
         (IDM_TASK_BRINGTOFRONT, TextKey::BringToFront),
         (0, TextKey::TaskManager),
@@ -104,7 +104,6 @@ fn build_task_context_popup() -> Option<PopupMenu> {
     ]
     .iter()
     .copied()
-    .enumerate()
     {
         if command_id == 0 {
             if !append_separator(&mut menu) {
@@ -112,7 +111,6 @@ fn build_task_context_popup() -> Option<PopupMenu> {
             }
             continue;
         }
-        let _ = index;
         if !append_item(&mut menu, command_id, key) {
             return None;
         }
@@ -341,7 +339,7 @@ pub fn build_main_menu(resource_id: u16, processor_count: usize) -> Option<HMENU
     Some(menu)
 }
 
-pub fn build_popup_menu(resource_id: u16, processor_count: usize) -> Option<HMENU> {
+pub fn build_popup_menu(resource_id: u16) -> Option<HMENU> {
     let menu = match resource_id {
         IDR_TASK_CONTEXT => build_task_context_popup()?.into_raw(),
         IDR_TASKVIEW => build_task_view_popup()?.into_raw(),
@@ -349,7 +347,6 @@ pub fn build_popup_menu(resource_id: u16, processor_count: usize) -> Option<HMEN
         IDR_TRAYMENU => build_tray_popup()?.into_raw(),
         _ => return None,
     };
-    sanitize_task_manager_menu(menu, processor_count);
     Some(menu)
 }
 

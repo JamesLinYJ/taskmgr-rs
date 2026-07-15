@@ -5,11 +5,10 @@ use std::collections::HashMap;
 use std::mem::zeroed;
 use std::ptr::null_mut;
 use std::slice;
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
-use std::thread::{self, JoinHandle};
+use std::sync::mpsc::TryRecvError;
 use std::time::Instant;
 
-use windows_sys::Win32::Foundation::{ERROR_NOT_ENOUGH_MEMORY, HWND, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, DrawTextW,
     FillRect, GetDC, GetStockObject, InvalidateRect, LineTo, MapWindowPoints, MoveToEx, ReleaseDC,
@@ -30,14 +29,15 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, CreateWindowExW, DeferWindowPos, DestroyWindow, EndDeferWindowPos,
-    GetClientRect, GetDialogBaseUnits, GetDlgItem, GetScrollInfo, GetSystemMetrics, PostMessageW,
-    SendMessageW, SetWindowTextW, ShowWindow, BS_OWNERDRAW, HDWP, HMENU, SB_BOTTOM, SB_CTL,
-    SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP,
-    SCROLLINFO, SIF_ALL, SIF_PAGE, SIF_POS, SIF_RANGE, SM_CXVSCROLL, SWP_HIDEWINDOW,
-    SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WHEEL_DELTA, WM_GETFONT, WM_SETFONT,
-    WM_SETREDRAW, WS_CHILD, WS_DISABLED, WS_EX_CLIENTEDGE, WS_EX_NOPARENTNOTIFY,
+    GetClientRect, GetDialogBaseUnits, GetDlgItem, GetScrollInfo, GetSystemMetrics, SendMessageW,
+    SetWindowTextW, ShowWindow, BS_OWNERDRAW, HDWP, HMENU, SB_BOTTOM, SB_CTL, SB_LINEDOWN,
+    SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SCROLLINFO,
+    SIF_ALL, SIF_PAGE, SIF_POS, SIF_RANGE, SM_CXVSCROLL, SWP_HIDEWINDOW, SWP_NOACTIVATE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WHEEL_DELTA, WM_GETFONT, WM_SETFONT, WM_SETREDRAW,
+    WS_CHILD, WS_DISABLED, WS_EX_CLIENTEDGE, WS_EX_NOPARENTNOTIFY,
 };
 
+use crate::background_worker::BackgroundWorker;
 use crate::chart_renderer::{ChartColor, ChartFrame, ChartRenderer};
 use crate::language::{adapter_state, network_column_titles};
 use crate::options::Options;
@@ -80,11 +80,6 @@ type NetworkWorkerResult = Result<Vec<RawAdapterEntry>, u32>;
 struct NetworkWorkerCompletion {
     sampled_at: Instant,
     result: NetworkWorkerResult,
-}
-
-enum NetworkWorkerCommand {
-    Collect { notify_hwnd: isize },
-    Shutdown,
 }
 
 struct HistoryBuffer {
@@ -207,9 +202,7 @@ pub struct NetworkPageState {
     cached_graph_bitmap_old: HGDIOBJ,
     cached_graph_width: i32,
     cached_graph_height: i32,
-    worker_sender: Option<Sender<NetworkWorkerCommand>>,
-    worker_result_receiver: Option<Receiver<NetworkWorkerCompletion>>,
-    worker_thread: Option<JoinHandle<()>>,
+    worker: Option<BackgroundWorker<(), NetworkWorkerCompletion>>,
     collection_in_flight: bool,
     refresh_requested: bool,
     last_refresh_error: Option<u32>,
@@ -270,54 +263,23 @@ impl NetworkPageState {
     }
 
     fn start_worker_thread(&mut self) -> Result<(), u32> {
-        if self.worker_sender.is_some() {
+        if self.worker.is_some() {
             return Ok(());
         }
 
-        let (command_sender, command_receiver) = channel::<NetworkWorkerCommand>();
-        let (result_sender, result_receiver) = channel::<NetworkWorkerCompletion>();
-        let worker = thread::Builder::new()
-            .name("rtaskmgr-network-sampler".to_string())
-            .spawn(move || {
-                while let Ok(command) = command_receiver.recv() {
-                    match command {
-                        NetworkWorkerCommand::Collect { notify_hwnd } => {
-                            let result = unsafe { NetworkPageState::collect_adapters() };
-                            let completion = NetworkWorkerCompletion {
-                                sampled_at: Instant::now(),
-                                result,
-                            };
-                            if result_sender.send(completion).is_ok() {
-                                unsafe {
-                                    PostMessageW(
-                                        notify_hwnd as HWND,
-                                        PWM_NET_WORKER_COMPLETE,
-                                        0,
-                                        0,
-                                    );
-                                }
-                            }
-                        }
-                        NetworkWorkerCommand::Shutdown => break,
-                    }
-                }
-            })
-            .map_err(thread_spawn_error)?;
-
-        self.worker_sender = Some(command_sender);
-        self.worker_result_receiver = Some(result_receiver);
-        self.worker_thread = Some(worker);
+        self.worker = Some(BackgroundWorker::spawn(
+            "rtaskmgr-network-sampler",
+            PWM_NET_WORKER_COMPLETE,
+            |()| NetworkWorkerCompletion {
+                sampled_at: Instant::now(),
+                result: unsafe { NetworkPageState::collect_adapters() },
+            },
+        )?);
         Ok(())
     }
 
     fn stop_worker_thread(&mut self) {
-        if let Some(sender) = self.worker_sender.take() {
-            let _ = sender.send(NetworkWorkerCommand::Shutdown);
-        }
-        if let Some(worker) = self.worker_thread.take() {
-            let _ = worker.join();
-        }
-        self.worker_result_receiver = None;
+        self.worker = None;
         self.collection_in_flight = false;
         self.refresh_requested = false;
     }
@@ -475,10 +437,9 @@ impl NetworkPageState {
         };
 
         let target_rect = frame.bounds();
-        let scale_top = graph_scale_top_value(scale_max);
         let zoom = graph_zoom(scale_max);
         frame.clear_black();
-        let plot_left = draw_scale_gpu(&frame, &target_rect, scale_top);
+        let plot_left = draw_scale_gpu(&frame, &target_rect);
         let plot_rect = RECT {
             left: (target_rect.left + plot_left).min(target_rect.right),
             top: target_rect.top,
@@ -529,7 +490,6 @@ impl NetworkPageState {
         let mut parent_rect = zeroed::<RECT>();
         let (def_spacing, top_spacing) = layout_spacing();
         let mut graph_rect = zeroed::<RECT>();
-        let mut graph_dim_rect = zeroed::<RECT>();
         let mut need_scrollbar = false;
 
         self.graphs_per_page = 0;
@@ -607,14 +567,7 @@ impl NetworkPageState {
         for index in 0..self.graphs.len() {
             if index < self.graphs_per_page {
                 let frame = &self.graphs[index];
-                hdwp = size_graph(
-                    hdwp,
-                    frame,
-                    &graph_rect,
-                    &mut graph_dim_rect,
-                    def_spacing,
-                    top_spacing,
-                );
+                hdwp = size_graph(hdwp, frame, &graph_rect, def_spacing, top_spacing);
                 graph_rect.top += graph_rect.bottom;
             } else {
                 let frame = &self.graphs[index];
@@ -674,7 +627,6 @@ impl NetworkPageState {
             SetScrollInfo(scrollbar, SB_CTL, &scroll_info, 1);
         }
 
-        let _ = graph_dim_rect;
         self.label_graphs();
     }
 
@@ -751,18 +703,13 @@ impl NetworkPageState {
     }
 
     unsafe fn schedule_collection(&mut self) {
-        let Some(sender) = self.worker_sender.as_ref() else {
+        let Some(worker) = self.worker.as_ref() else {
             self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
             return;
         };
 
-        if sender
-            .send(NetworkWorkerCommand::Collect {
-                notify_hwnd: self.hwnd as isize,
-            })
-            .is_err()
-        {
-            self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
+        if let Err(error) = worker.submit((), self.hwnd) {
+            self.set_refresh_error(error);
             return;
         }
         self.collection_in_flight = true;
@@ -770,8 +717,8 @@ impl NetworkPageState {
 
     unsafe fn drain_worker_results(&mut self) {
         loop {
-            let result = match self.worker_result_receiver.as_ref() {
-                Some(receiver) => receiver.try_recv(),
+            let result = match self.worker.as_ref() {
+                Some(worker) => worker.try_recv(),
                 None => return,
             };
 
@@ -788,8 +735,7 @@ impl NetworkPageState {
                 }
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
-                    self.worker_result_receiver = None;
-                    self.worker_sender = None;
+                    self.worker = None;
                     self.collection_in_flight = false;
                     self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
                     return;
@@ -1266,7 +1212,6 @@ unsafe fn size_graph(
     mut hdwp: HDWP,
     graph: &NetworkGraphControl,
     rect: &RECT,
-    dim_rect: &mut RECT,
     def_spacing: i32,
     top_spacing: i32,
 ) -> HDWP {
@@ -1289,13 +1234,6 @@ unsafe fn size_graph(
     let top = rect.top + top_spacing;
     let right = left + graph_width;
     let bottom = top + graph_height;
-    *dim_rect = RECT {
-        left,
-        top,
-        right,
-        bottom,
-    };
-
     DeferWindowPos(
         hdwp,
         graph.graph_hwnd,
@@ -1352,13 +1290,6 @@ fn scrollbar_width() -> i32 {
 
 fn push_history(history: &mut HistoryBuffer, value: u8) {
     history.push(value);
-}
-
-fn thread_spawn_error(error: std::io::Error) -> u32 {
-    error
-        .raw_os_error()
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(ERROR_NOT_ENOUGH_MEMORY)
 }
 
 fn adapter_row_texts(adapter: &NetworkAdapterEntry) -> [&str; 4] {
@@ -1574,8 +1505,7 @@ unsafe fn draw_scale(hdc: HDC, rect: &RECT, max_scale_value: u32) -> i32 {
     scale_width + 3
 }
 
-fn draw_scale_gpu(frame: &ChartFrame<'_>, rect: &RECT, max_scale_value: u32) -> i32 {
-    let _ = max_scale_value;
+fn draw_scale_gpu(frame: &ChartFrame<'_>, rect: &RECT) -> i32 {
     let scale_width = 44;
     let divider_x = rect.left + scale_width;
 

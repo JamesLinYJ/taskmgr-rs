@@ -1,6 +1,7 @@
 // 性能页实现。
 // 该模块负责采样系统级 CPU/内存指标，并绘制经典任务管理器里的折线图、
 // 数值面板和状态快照。
+use std::cell::Cell;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 
@@ -162,6 +163,7 @@ pub struct PerformancePageState {
     graph_bitmap_height: i32,
     last_cpu_refresh_error: Option<i32>,
     last_system_refresh_error: Option<u32>,
+    last_meter_draw_error: Cell<Option<u32>>,
 }
 
 impl PerformancePageState {
@@ -1098,6 +1100,10 @@ impl PerformancePageState {
 
             let black = GetStockObject(BLACK_BRUSH) as HBRUSH;
             let old = SelectObject(hdc, black as HGDIOBJ);
+            if old.is_null() || old as isize == -1 {
+                self.record_meter_draw_error(last_error_or_gen_failure());
+                return false;
+            }
             Rectangle(hdc, rect.left, rect.top, rect.right, rect.bottom);
 
             let units = GetDialogBaseUnits() as usize;
@@ -1106,6 +1112,7 @@ impl PerformancePageState {
             let bar_height = rect.bottom - rect.top - (current_font_height(hdc) + def_spacing * 3);
             if bar_height <= 0 {
                 SelectObject(hdc, old);
+                self.last_meter_draw_error.set(None);
                 return true;
             }
 
@@ -1125,7 +1132,8 @@ impl PerformancePageState {
             let hdc_mem = CreateCompatibleDC(hdc);
             if hdc_mem.is_null() {
                 SelectObject(hdc, old);
-                return true;
+                self.record_meter_draw_error(last_error_or_gen_failure());
+                return false;
             }
 
             let target_lit = ((i32::from(lit_percent) * bar_height) / 100).max(0);
@@ -1134,7 +1142,7 @@ impl PerformancePageState {
             let lit_pixels = bar_height - unlit_pixels;
             let lit_only_pixels = (lit_pixels - target_red).max(0);
 
-            self.blit_meter_strip(
+            let mut draw_result = self.blit_meter_strip(
                 hdc,
                 hdc_mem,
                 self.strip_unlit_bitmap,
@@ -1142,8 +1150,8 @@ impl PerformancePageState {
                 def_spacing,
                 bar_height - lit_pixels,
             );
-            if lit_only_pixels > 0 {
-                self.blit_meter_strip(
+            if draw_result.is_ok() && lit_only_pixels > 0 {
+                draw_result = self.blit_meter_strip(
                     hdc,
                     hdc_mem,
                     self.strip_lit_bitmap,
@@ -1152,8 +1160,8 @@ impl PerformancePageState {
                     lit_only_pixels,
                 );
             }
-            if target_red > 0 {
-                self.blit_meter_strip(
+            if draw_result.is_ok() && target_red > 0 {
+                draw_result = self.blit_meter_strip(
                     hdc,
                     hdc_mem,
                     self.strip_lit_red_bitmap,
@@ -1165,7 +1173,22 @@ impl PerformancePageState {
 
             DeleteDC(hdc_mem);
             SelectObject(hdc, old);
-            true
+            match draw_result {
+                Ok(()) => {
+                    self.last_meter_draw_error.set(None);
+                    true
+                }
+                Err(error) => {
+                    self.record_meter_draw_error(error);
+                    false
+                }
+            }
+        }
+    }
+
+    fn record_meter_draw_error(&self, error: u32) {
+        if self.last_meter_draw_error.replace(Some(error)) != Some(error) {
+            record_win32_error("performance bitmap meter drawing", error);
         }
     }
 
@@ -1177,20 +1200,24 @@ impl PerformancePageState {
         x: i32,
         start_y: i32,
         height: i32,
-    ) {
+    ) -> Result<(), u32> {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 条形位图按固定高度平铺，直到覆盖目标像素高度。
             if bitmap.is_null() || height <= 0 {
-                return;
+                return Ok(());
             }
 
             let old_bitmap = SelectObject(hdc_mem, bitmap as HGDIOBJ);
+            if old_bitmap.is_null() || old_bitmap as isize == -1 {
+                return Err(last_error_or_gen_failure());
+            }
             let mut remaining = height;
             let mut offset = 0;
+            let mut result = Ok(());
             while remaining > 0 {
                 let chunk = remaining.min(STRIP_HEIGHT);
-                BitBlt(
+                if BitBlt(
                     hdc,
                     x,
                     start_y + offset,
@@ -1200,11 +1227,16 @@ impl PerformancePageState {
                     0,
                     0,
                     SRCCOPY,
-                );
+                ) == 0
+                {
+                    result = Err(last_error_or_gen_failure());
+                    break;
+                }
                 remaining -= chunk;
                 offset += chunk;
             }
             SelectObject(hdc_mem, old_bitmap);
+            result
         }
     }
 

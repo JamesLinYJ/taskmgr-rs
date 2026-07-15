@@ -6,12 +6,11 @@ use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
 use std::slice;
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
-use std::thread::{self, JoinHandle};
+use std::sync::mpsc::TryRecvError;
 
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_INVALID_PARAMETER,
-    ERROR_NOT_ENOUGH_MEMORY, HWND, LPARAM, RECT, WPARAM,
+    GetLastError, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_INVALID_PARAMETER, HWND, LPARAM,
+    RECT, WPARAM,
 };
 
 use windows_sys::Win32::System::RemoteDesktop::{
@@ -31,12 +30,13 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EndDialog, GetClientRect,
     GetDialogBaseUnits, GetDlgItem, GetWindowTextLengthW, GetWindowTextW, MessageBoxW,
-    PostMessageW, SendMessageW, TrackPopupMenuEx, HMENU, IDCANCEL, IDOK, IDYES, MB_DEFBUTTON2,
-    MB_ICONERROR, MB_ICONEXCLAMATION, MB_ICONINFORMATION, MB_OK, MB_TOPMOST, MB_YESNO,
-    MF_BYCOMMAND, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_UNCHECKED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, TPM_RETURNCMD, WM_COMMAND, WM_INITDIALOG, WM_SETREDRAW,
+    SendMessageW, TrackPopupMenuEx, HMENU, IDCANCEL, IDOK, IDYES, MB_DEFBUTTON2, MB_ICONERROR,
+    MB_ICONEXCLAMATION, MB_ICONINFORMATION, MB_OK, MB_TOPMOST, MB_YESNO, MF_BYCOMMAND, MF_CHECKED,
+    MF_DISABLED, MF_GRAYED, MF_UNCHECKED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    TPM_RETURNCMD, WM_COMMAND, WM_INITDIALOG, WM_SETREDRAW,
 };
 
+use crate::background_worker::BackgroundWorker;
 use crate::dialog_templates::dialog_box;
 use crate::language::{
     localize_dialog, session_state, text, user_column_titles, user_session_column_title, TextKey,
@@ -86,11 +86,6 @@ struct UserSessionEntry {
 
 type UserWorkerResult = Result<Vec<UserSessionSnapshot>, u32>;
 
-enum UserWorkerCommand {
-    Collect { notify_hwnd: isize },
-    Shutdown,
-}
-
 #[derive(Default)]
 struct MessageDialogResult {
     // 发消息对话框退出后，把标题和正文一起打包回调用点。
@@ -109,9 +104,7 @@ pub struct UserPageState {
     sessions: Vec<UserSessionEntry>,
     sort_column: usize,
     sort_ascending: bool,
-    worker_sender: Option<Sender<UserWorkerCommand>>,
-    worker_result_receiver: Option<Receiver<UserWorkerResult>>,
-    worker_thread: Option<JoinHandle<()>>,
+    worker: Option<BackgroundWorker<(), UserWorkerResult>>,
     collection_in_flight: bool,
     refresh_requested: bool,
     last_refresh_error: Option<u32>,
@@ -164,50 +157,20 @@ impl UserPageState {
     }
 
     fn start_worker_thread(&mut self) -> Result<(), u32> {
-        if self.worker_sender.is_some() {
+        if self.worker.is_some() {
             return Ok(());
         }
 
-        let (command_sender, command_receiver) = channel::<UserWorkerCommand>();
-        let (result_sender, result_receiver) = channel::<UserWorkerResult>();
-        let worker = thread::Builder::new()
-            .name("rtaskmgr-user-sampler".to_string())
-            .spawn(move || {
-                while let Ok(command) = command_receiver.recv() {
-                    match command {
-                        UserWorkerCommand::Collect { notify_hwnd } => {
-                            let result = collect_user_sessions();
-                            if result_sender.send(result).is_ok() {
-                                unsafe {
-                                    PostMessageW(
-                                        notify_hwnd as HWND,
-                                        PWM_USER_WORKER_COMPLETE,
-                                        0,
-                                        0,
-                                    );
-                                }
-                            }
-                        }
-                        UserWorkerCommand::Shutdown => break,
-                    }
-                }
-            })
-            .map_err(thread_spawn_error)?;
-
-        self.worker_sender = Some(command_sender);
-        self.worker_result_receiver = Some(result_receiver);
-        self.worker_thread = Some(worker);
+        self.worker = Some(BackgroundWorker::spawn(
+            "rtaskmgr-user-sampler",
+            PWM_USER_WORKER_COMPLETE,
+            |()| collect_user_sessions(),
+        )?);
         Ok(())
     }
 
     fn stop_worker_thread(&mut self) {
-        if let Some(sender) = self.worker_sender.take() {
-            let _ = sender.send(UserWorkerCommand::Shutdown);
-        }
-        if let Some(worker) = self.worker_thread.take() {
-            let _ = worker.join();
-        }
-        self.worker_result_receiver = None;
+        self.worker = None;
         self.collection_in_flight = false;
         self.refresh_requested = false;
     }
@@ -335,7 +298,7 @@ impl UserPageState {
                 return;
             }
 
-            let Some(popup) = build_popup_menu(IDR_USER_CONTEXT, usize::MAX) else {
+            let Some(popup) = build_popup_menu(IDR_USER_CONTEXT) else {
                 return;
             };
 
@@ -401,17 +364,12 @@ impl UserPageState {
     }
 
     fn schedule_collection(&mut self) {
-        let Some(sender) = self.worker_sender.as_ref() else {
+        let Some(worker) = self.worker.as_ref() else {
             self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
             return;
         };
-        if sender
-            .send(UserWorkerCommand::Collect {
-                notify_hwnd: self.hwnd as isize,
-            })
-            .is_err()
-        {
-            self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
+        if let Err(error) = worker.submit((), self.hwnd) {
+            self.set_refresh_error(error);
             return;
         }
         self.collection_in_flight = true;
@@ -419,31 +377,32 @@ impl UserPageState {
 
     fn drain_worker_results(&mut self) {
         loop {
-            let result = match self.worker_result_receiver.as_ref() {
-                Some(receiver) => receiver.try_recv(),
+            let result = match self.worker.as_ref() {
+                Some(worker) => worker.try_recv(),
                 None => return,
             };
 
             match result {
-                Ok(result) => {
-                    self.collection_in_flight = false;
-                    match result {
-                        Ok(sessions) => {
-                            self.last_refresh_error = None;
-                            self.apply_session_snapshot(sessions);
-                        }
-                        Err(error) => self.set_refresh_error(error),
-                    }
-                }
+                Ok(result) => self.apply_user_worker_result(result),
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
-                    self.worker_result_receiver = None;
-                    self.worker_sender = None;
+                    self.worker = None;
                     self.collection_in_flight = false;
                     self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
                     return;
                 }
             }
+        }
+    }
+
+    fn apply_user_worker_result(&mut self, result: UserWorkerResult) {
+        self.collection_in_flight = false;
+        match result {
+            Ok(sessions) => {
+                self.last_refresh_error = None;
+                self.apply_session_snapshot(sessions);
+            }
+            Err(error) => self.set_refresh_error(error),
         }
     }
 
@@ -1144,13 +1103,6 @@ fn win32_error_or_gen_failure(error: u32) -> u32 {
     }
 }
 
-fn thread_spawn_error(error: std::io::Error) -> u32 {
-    error
-        .raw_os_error()
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(ERROR_NOT_ENOUGH_MEMORY)
-}
-
 fn query_session_string(session_id: u32, info_class: i32) -> Result<String, u32> {
     // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
@@ -1352,11 +1304,8 @@ mod tests {
         let mut state = UserPageState::default();
         state.sessions.push(entry(expected.clone()));
         state.collection_in_flight = true;
-        let (sender, receiver) = channel::<UserWorkerResult>();
-        sender.send(Err(1722)).unwrap();
-        state.worker_result_receiver = Some(receiver);
 
-        state.drain_worker_results();
+        state.apply_user_worker_result(Err(1722));
 
         assert_eq!(state.sessions.len(), 1);
         assert_eq!(state.sessions[0].identity, expected);

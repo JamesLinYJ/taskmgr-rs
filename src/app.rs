@@ -7,9 +7,13 @@ use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut, NonNull};
 use std::sync::OnceLock;
 
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
+};
+use windows::Win32::UI::Shell::{IShellDispatch, Shell};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, FreeLibrary, ERROR_ALREADY_EXISTS, ERROR_GEN_FAILURE, ERROR_TIMEOUT, HANDLE,
-    HINSTANCE, HMODULE, HWND, LPARAM, POINT, RECT, TRUE, WAIT_ABANDONED, WAIT_OBJECT_0,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_GEN_FAILURE, ERROR_INVALID_PARAMETER, ERROR_TIMEOUT,
+    HANDLE, HINSTANCE, HWND, LPARAM, POINT, RECT, TRUE, WAIT_ABANDONED, WAIT_OBJECT_0,
     WAIT_TIMEOUT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
@@ -18,7 +22,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     DCX_INTERSECTRGN, LOGPIXELSX,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
-use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
 };
@@ -72,14 +76,13 @@ use crate::procpage::ProcIdentity;
 use crate::resource::*;
 use crate::winutil::{
     call_window_proc, destroy_icon_handle, destroy_menu_handle, enable_debug_privilege,
-    format_resource_string, height, hiword, loword, process_is_elevated, record_win32_error,
-    sanitize_task_manager_menu, set_dialog_msg_result, set_style, set_window_userdata_ptr,
-    to_wide_null, width, window_userdata_non_null,
+    format_resource_string, height, hiword, loword, process_is_elevated, record_hresult_error,
+    record_win32_error, sanitize_task_manager_menu, set_dialog_msg_result, set_style,
+    set_window_userdata_ptr, to_wide_null, width, window_userdata_non_null,
 };
 
 const STARTUP_MUTEX_NAME: &str = "NTShell Taskman Startup Mutex";
 const FINDME_TIMEOUT: u32 = 10_000;
-const RUN_DIALOG_CALC_DIRECTORY: u32 = 0x0000_0004;
 static FRAME_BASE_WNDPROC: OnceLock<
     Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> isize>,
 > = OnceLock::new();
@@ -92,6 +95,27 @@ const RDW_INVALIDATE: u32 = 0x0001;
 const RDW_ERASE: u32 = 0x0004;
 const RDW_UPDATENOW: u32 = 0x0100;
 const RDW_FRAME: u32 = 0x0400;
+
+struct ComApartment;
+
+impl ComApartment {
+    fn initialize() -> Result<Self, i32> {
+        // The main window thread owns this apartment for the duration of the system Run request.
+        let result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        if result.is_ok() {
+            Ok(Self)
+        } else {
+            Err(result.0)
+        }
+    }
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        // Every successful CoInitializeEx call, including S_FALSE, requires a matching call.
+        unsafe { CoUninitialize() };
+    }
+}
 
 unsafe extern "system" {
     fn RedrawWindow(hwnd: HWND, lprcupdate: *const RECT, hrgnupdate: HANDLE, flags: u32) -> i32;
@@ -249,27 +273,11 @@ unsafe extern "system" fn perf_frame_wndproc(
                 // receives the original message parameters unchanged.
                 unsafe { call_window_proc(Some(base_wndproc), hwnd, msg, wparam, lparam) }
             } else {
-                // 安全性: fallback default window processing for the current message.
+                // 安全性: use the standard default processor if class registration has not run.
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
         }
     }
-}
-
-type RunFileDialogFn =
-    unsafe extern "system" fn(HWND, HICON, *const u16, *const u16, *const u16, u32) -> i32;
-
-fn load_run_file_dialog(shell32: HMODULE) -> Option<RunFileDialogFn> {
-    // 安全性: `shell32` is a module handle returned by `LoadLibraryW`.
-    // Ordinal 61 is the only way to import `RunFileDlg` from shell32 — it is not
-    // exported by name. This ordinal has been stable on all Windows versions since
-    // Windows 2000 and is the same mechanism the original Task Manager uses.
-    let proc_address = unsafe { GetProcAddress(shell32, 61usize as *const u8) }?;
-    // 安全性: ordinal 61 in shell32 exports `RunFileDlg` with this callback signature
-    // on all Win32 platform variants supported by this application.
-    Some(unsafe {
-        std::mem::transmute::<unsafe extern "system" fn() -> isize, RunFileDialogFn>(proc_address)
-    })
 }
 
 impl App {
@@ -330,7 +338,15 @@ impl App {
             self.release_startup_mutex();
             return 1;
         }
-        self.stats.processor_count = self.query_processor_count();
+        self.stats.processor_count = match self.query_processor_count() {
+            Ok(count) => count,
+            Err(error) => {
+                record_win32_error("processor group count", error);
+                self.cleanup_failed_startup();
+                self.release_startup_mutex();
+                return 1;
+            }
+        };
 
         self.main_hwnd = create_dialog(
             self.hinstance,
@@ -371,8 +387,26 @@ impl App {
         // 安全性: the main HWND is live after successful dialog creation.
         unsafe { ShowWindow(self.main_hwnd, SW_SHOW) };
         self.release_startup_mutex();
-        // Defer icon loading to after first paint so the window appears instantly.
-        unsafe { PostMessageW(self.main_hwnd, PWM_DEFERREDINIT, 0, 0) };
+        // Queue every hidden page independently so their first layout/sample can overlap. The
+        // tray/icon work stays deferred until after those lightweight warm-up requests.
+        unsafe {
+            for page_index in 0..self.pages.len() {
+                if PostMessageW(self.main_hwnd, PWM_PREWARM_PAGE, page_index, 0) == 0 {
+                    let error = windows_sys::Win32::Foundation::GetLastError();
+                    record_win32_error(
+                        "page prewarm message",
+                        if error == 0 { ERROR_GEN_FAILURE } else { error },
+                    );
+                }
+            }
+            if PostMessageW(self.main_hwnd, PWM_DEFERREDINIT, 0, 0) == 0 {
+                let error = windows_sys::Win32::Foundation::GetLastError();
+                record_win32_error(
+                    "deferred initialization message",
+                    if error == 0 { ERROR_GEN_FAILURE } else { error },
+                );
+            }
+        }
 
         // 安全性: message loop runs on the UI thread; `message` is a valid MSG buffer for all
         // synchronous Win32 message APIs used inside the loop.
@@ -620,9 +654,15 @@ impl App {
         Ok(())
     }
 
-    fn query_processor_count(&self) -> usize {
+    fn query_processor_count(&self) -> Result<usize, u32> {
         // 统计所有 processor groups，避免 64+ CPU 机器被旧 SYSTEM_INFO 视角截断。
-        unsafe { (GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) as usize).max(1) }
+        let count = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
+        if count == 0 {
+            let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            Err(if error == 0 { ERROR_GEN_FAILURE } else { error })
+        } else {
+            Ok(count as usize)
+        }
     }
 
     fn on_init_dialog(&mut self, hwnd: HWND) -> isize {
@@ -717,6 +757,10 @@ impl App {
                 );
             }
 
+            // Configure every already-created page once while it is hidden. First activation then
+            // only swaps the menu and presents a prepared control tree.
+            self.apply_options_to_pages();
+
             self.update_menu_states();
             if self.options.current_page < 0 {
                 self.options.current_page = 0;
@@ -728,8 +772,8 @@ impl App {
                 self.options.current_page as usize,
                 0,
             );
-            if !self.activate_page(self.options.current_page as usize) {
-                self.initialization_error = Some(ERROR_GEN_FAILURE);
+            if let Err(error) = self.activate_page(self.options.current_page as usize) {
+                self.initialization_error = Some(error);
                 return 0;
             }
 
@@ -777,13 +821,16 @@ impl App {
             }
 
             let hdc = GetDC(null_mut());
-            let pixels_per_inch = if hdc.is_null() {
-                96
-            } else {
-                let dpi = GetDeviceCaps(hdc, LOGPIXELSX as i32).max(96);
-                ReleaseDC(null_mut(), hdc);
-                dpi
-            };
+            if hdc.is_null() {
+                let error = windows_sys::Win32::Foundation::GetLastError();
+                return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+            }
+            let pixels_per_inch = GetDeviceCaps(hdc, LOGPIXELSX as i32);
+            ReleaseDC(null_mut(), hdc);
+            if pixels_per_inch <= 0 {
+                let error = windows_sys::Win32::Foundation::GetLastError();
+                return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+            }
 
             let parts = [
                 pixels_per_inch,
@@ -844,7 +891,9 @@ impl App {
                 return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
             }
 
-            let _ = FRAME_BASE_WNDPROC.set(button_class.lpfnWndProc);
+            if FRAME_BASE_WNDPROC.set(button_class.lpfnWndProc).is_err() {
+                return Err(ERROR_ALREADY_EXISTS);
+            }
             button_class.hInstance = self.hinstance;
             button_class.lpfnWndProc = Some(perf_frame_wndproc);
             let class_name = to_wide_null(PERF_FRAME_CLASS_NAME);
@@ -863,53 +912,53 @@ impl App {
         unsafe { SetWindowTextW(self.main_hwnd, title.as_ptr()) };
     }
 
-    fn activate_page(&mut self, index: usize) -> bool {
+    fn activate_page(&mut self, index: usize) -> Result<(), u32> {
         // 切页不仅是隐藏/显示子对话框，还要同步菜单、页面选项和尺寸布局。
         // 如果新页面激活失败，会尽量恢复上一个页面，避免主窗口进入空白状态。
         if index >= self.pages.len() {
-            return false;
+            return Err(ERROR_INVALID_PARAMETER);
         }
 
         let previous_page = self.options.current_page;
         let switching_pages = previous_page >= 0 && previous_page as usize != index;
 
-        if self.pages[index]
-            .activate(
-                self.hinstance,
-                self.main_hwnd,
-                &self.options,
-                self.stats.processor_count,
-                self.menu.current_menu_mut(),
-            )
-            .is_ok()
-        {
-            if switching_pages {
-                self.pages[previous_page as usize].deactivate(&mut self.options);
-            }
-            self.options.current_page = index as i32;
-            self.update_menu_states();
-            self.size_active_page();
-            self.refresh_active_page(true);
-            self.refresh_summary_stats();
-            self.refresh_tray_icon();
-            self.refresh_status_bar();
-            self.pages[index].show_and_focus();
-            true
-        } else {
-            if switching_pages {
-                let previous_index = previous_page as usize;
-                self.options.current_page = previous_page;
-                // 安全性: retrieves and updates the tab control owned by the main window.
-                let tabs_hwnd = unsafe { GetDlgItem(self.main_hwnd, IDC_TABS) };
-                if !tabs_hwnd.is_null() {
-                    // 安全性: tab control HWND was returned by GetDlgItem and the message is
-                    // synchronous.
-                    unsafe { SendMessageW(tabs_hwnd, TCM_SETCURSEL, previous_index, 0) };
+        match self.pages[index].activate(
+            self.hinstance,
+            self.main_hwnd,
+            &self.options,
+            self.stats.processor_count,
+            self.menu.current_menu_mut(),
+        ) {
+            Ok(()) => {
+                if switching_pages {
+                    self.pages[previous_page as usize].deactivate(&mut self.options);
                 }
+                self.options.current_page = index as i32;
                 self.update_menu_states();
                 self.size_active_page();
+                self.refresh_active_page(true);
+                self.refresh_summary_stats();
+                self.refresh_tray_icon();
+                self.refresh_status_bar();
+                self.pages[index].show_and_focus();
+                Ok(())
             }
-            false
+            Err(error) => {
+                if switching_pages {
+                    let previous_index = previous_page as usize;
+                    self.options.current_page = previous_page;
+                    // 安全性: retrieves and updates the tab control owned by the main window.
+                    let tabs_hwnd = unsafe { GetDlgItem(self.main_hwnd, IDC_TABS) };
+                    if !tabs_hwnd.is_null() {
+                        // 安全性: tab control HWND was returned by GetDlgItem and the message is
+                        // synchronous.
+                        unsafe { SendMessageW(tabs_hwnd, TCM_SETCURSEL, previous_index, 0) };
+                    }
+                    self.update_menu_states();
+                    self.size_active_page();
+                }
+                Err(if error == 0 { ERROR_GEN_FAILURE } else { error })
+            }
         }
     }
 
@@ -1355,9 +1404,9 @@ impl App {
         }
     }
 
-    fn load_popup_menu(&self, resource_id: u16) -> HMENU {
+    fn load_popup_menu(&self, resource_id: u16) -> Option<HMENU> {
         // 弹出菜单构造也统一复用运行时菜单系统。
-        build_popup_menu(resource_id, self.stats.processor_count).unwrap_or(null_mut())
+        build_popup_menu(resource_id)
     }
 
     fn on_tray_notification(&mut self, lparam: LPARAM) {
@@ -1367,8 +1416,7 @@ impl App {
                 self.show_running_instance()
             }
             WM_RBUTTONDOWN => {
-                let popup = self.load_popup_menu(IDR_TRAYMENU);
-                if !popup.is_null() {
+                if let Some(popup) = self.load_popup_menu(IDR_TRAYMENU) {
                     // 安全性: popup menu is valid until destroyed below; cursor/menu APIs are
                     // synchronous and target this app's main window.
                     let command = unsafe {
@@ -1512,49 +1560,24 @@ impl App {
         }
     }
 
-    fn show_run_dialog(&self) -> bool {
-        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    fn show_run_dialog(&self) -> Result<(), i32> {
+        let _apartment = ComApartment::initialize()?;
+        let shell: IShellDispatch = unsafe { CoCreateInstance(&Shell, None, CLSCTX_ALL) }
+            .map_err(|error| error.code().0)?;
+        // IShellDispatch::FileRun is the documented Shell automation API for the system dialog.
+        unsafe { shell.FileRun() }.map_err(|error| error.code().0)
+    }
+
+    fn show_hresult_failure(&self, title: &str, error: i32) {
+        let title = to_wide_null(title);
+        let body = to_wide_null(&format!("HRESULT: 0x{:08X}", error as u32));
         unsafe {
-            // 新建任务对话框复用 shell32 导出的 RunFileDlg，
-            // 这样能得到与系统一致的“运行”体验，而不是自造一个近似实现。
-            let shell32_name = to_wide_null("shell32.dll");
-            let shell32 = LoadLibraryW(shell32_name.as_ptr());
-            if shell32.is_null() {
-                return false;
-            }
-
-            let run_file_dlg = match load_run_file_dialog(shell32) {
-                Some(run_file_dlg) => run_file_dlg,
-                None => {
-                    FreeLibrary(shell32);
-                    return false;
-                }
-            };
-
-            let mut current_dir =
-                to_wide_null(&env::current_dir().unwrap_or_default().to_string_lossy());
-            let mut title = to_wide_null(text(TextKey::RunTitle));
-            let mut prompt = to_wide_null(text(TextKey::RunPrompt));
-            let icon =
-                load_icon_resource(MAIN_ICON_RESOURCE, 0, 0, LR_DEFAULTCOLOR | LR_DEFAULTSIZE);
-
-            let shown = if !icon.is_null() {
-                run_file_dlg(
-                    self.main_hwnd,
-                    icon,
-                    current_dir.as_mut_ptr(),
-                    title.as_mut_ptr(),
-                    prompt.as_mut_ptr(),
-                    RUN_DIALOG_CALC_DIRECTORY,
-                );
-                destroy_icon_handle(icon);
-                true
-            } else {
-                false
-            };
-
-            FreeLibrary(shell32);
-            shown
+            MessageBoxW(
+                self.main_hwnd,
+                body.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONSTOP,
+            );
         }
     }
 
@@ -1610,10 +1633,7 @@ impl App {
                     self.update_menu_states();
                 }
                 IDM_NOTITLE => {
-                    self.options.set_no_title(!self.options.no_title());
-                    self.apply_options_to_pages();
-                    self.update_menu_states();
-                    self.size_active_page();
+                    self.toggle_no_title_mode();
                 }
                 IDM_KERNELTIMES => {
                     self.options.set_kernel_times(!self.options.kernel_times());
@@ -1690,7 +1710,7 @@ impl App {
                 | IDM_PROC_BELOWNORMAL
                 | IDM_PROC_LOW => {
                     if self.options.current_page == PROC_PAGE as i32 {
-                        let _ = self.pages[PROC_PAGE]
+                        self.pages[PROC_PAGE]
                             .handle_process_command(command_id, Some(&mut self.options));
                     } else {
                         MessageBeep(0);
@@ -1707,7 +1727,10 @@ impl App {
                     }
                 }
                 IDM_RUN => {
-                    let _ = self.show_run_dialog();
+                    if let Err(error) = self.show_run_dialog() {
+                        record_hresult_error("system Run dialog", error);
+                        self.show_hresult_failure(text(TextKey::RunTitle), error);
+                    }
                 }
                 IDM_HELP => {
                     self.show_help(hwnd);
@@ -1731,7 +1754,10 @@ impl App {
 
             let tabs_hwnd = GetDlgItem(self.main_hwnd, IDC_TABS);
             SendMessageW(tabs_hwnd, TCM_SETCURSEL, next_index, 0);
-            let _ = self.activate_page(next_index);
+            if let Err(error) = self.activate_page(next_index) {
+                record_win32_error("page activation", error);
+                MessageBeep(0);
+            }
         }
     }
 
@@ -1775,7 +1801,14 @@ impl App {
                 let Ok(selected) = usize::try_from(selected) else {
                     return 0;
                 };
-                return isize::from(self.activate_page(selected));
+                return match self.activate_page(selected) {
+                    Ok(()) => 1,
+                    Err(error) => {
+                        record_win32_error("page activation", error);
+                        MessageBeep(0);
+                        0
+                    }
+                };
             }
 
             0
@@ -1793,11 +1826,13 @@ impl App {
             }
 
             SendMessageW(tabs_hwnd, TCM_SETCURSEL, PROC_PAGE, 0);
-            if self.activate_page(PROC_PAGE) {
-                isize::from(self.pages[PROC_PAGE].find_process(identity))
-            } else {
-                MessageBeep(0);
-                0
+            match self.activate_page(PROC_PAGE) {
+                Ok(()) => isize::from(self.pages[PROC_PAGE].find_process(identity)),
+                Err(error) => {
+                    record_win32_error("process page activation", error);
+                    MessageBeep(0);
+                    0
+                }
             }
         }
     }
@@ -1820,7 +1855,9 @@ impl App {
             }
 
             self.update_tray(NIM_DELETE, null_mut(), "");
-            let _ = self.options.save();
+            if let Err(error) = self.options.save() {
+                record_win32_error("saving options", error);
+            }
 
             if !self.menu.current_menu().is_null() {
                 SetMenu(self.main_hwnd, null_mut());
@@ -1961,20 +1998,22 @@ unsafe extern "system" fn main_window_proc(
                         destroy_icon_handle(old_owned_icon);
                     }
                     application.main_icon = icon;
+                } else {
+                    let error = windows_sys::Win32::Foundation::GetLastError();
+                    record_win32_error(
+                        "main window icon loading",
+                        if error == 0 { ERROR_GEN_FAILURE } else { error },
+                    );
                 }
                 if let Some(first_icon) = application.tray.first_icon() {
                     application.update_tray(NIM_ADD, first_icon, "");
                 }
-                PostMessageW(hwnd, PWM_PREWARM_PAGE, 0, 0);
             }
             0
         }
         PWM_PREWARM_PAGE => {
             let page_index = wparam;
             application.prewarm_page(page_index);
-            if page_index + 1 < application.pages.len() {
-                unsafe { PostMessageW(hwnd, PWM_PREWARM_PAGE, page_index + 1, 0) };
-            }
             0
         }
         WM_GETMINMAXINFO => {

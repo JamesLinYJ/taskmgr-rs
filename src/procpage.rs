@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::cmp::Ordering;
 
 // 进程页实现。
@@ -6,8 +5,8 @@ use std::cmp::Ordering;
 // 并处理结束进程、调试、设置优先级和亲和性等操作。
 //
 // 线程模型：
-//   ProcWorkerCommand 工作线程在后台执行 collect_process_entries() 采样，
-//   UI 线程通过 mpsc channel 提交命令，worker 完成后投递页面消息异步提交结果。
+//   BackgroundWorker 工作线程在后台执行 collect_process_entries() 采样，
+//   UI 线程提交请求，worker 完成后投递页面消息异步提交结果。
 //
 // 缓存失效策略：
 //   previous_samples (HashMap) 在 refresh_processes 末尾整体替换为当轮采样值，
@@ -18,20 +17,20 @@ use std::mem::{size_of, zeroed};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::slice;
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_INVALID_PARAMETER,
-    ERROR_NOT_ENOUGH_MEMORY, ERROR_NO_MORE_FILES, FILETIME, HANDLE, HINSTANCE, HWND,
+    CloseHandle, GetLastError, LocalFree, ERROR_FILE_NOT_FOUND, ERROR_GEN_FAILURE,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_DATA, ERROR_INVALID_PARAMETER, ERROR_NONE_MAPPED,
+    ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, FILETIME, HANDLE, HINSTANCE, HWND,
     INVALID_HANDLE_VALUE, LPARAM, POINT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::MapWindowPoints;
+use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{
-    GetLengthSid, GetTokenInformation, IsValidSid, IsWellKnownSid, LookupAccountSidW,
-    TokenSessionId, TokenUser, WinLocalServiceSid, WinLocalSystemSid, WinNetworkServiceSid,
-    SID_NAME_USE, TOKEN_QUERY, TOKEN_USER,
+    GetLengthSid, IsValidSid, IsWellKnownSid, LookupAccountSidW, WinLocalServiceSid,
+    WinLocalSystemSid, WinNetworkServiceSid, SID_NAME_USE,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -45,15 +44,14 @@ use windows_sys::Win32::System::Registry::{
     REG_EXPAND_SZ, REG_SZ,
 };
 use windows_sys::Win32::System::RemoteDesktop::{
-    ProcessIdToSessionId, WTSEnumerateProcessesW, WTSFreeMemory, WTS_CURRENT_SERVER_HANDLE,
-    WTS_PROCESS_INFOW,
+    WTSEnumerateProcessesW, WTSFreeMemory, WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW,
 };
 use windows_sys::Win32::System::SystemInformation::{
     GetSystemTimeAsFileTime, GetWindowsDirectoryW,
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetPriorityClass, GetProcessAffinityMask, GetProcessHandleCount,
-    GetProcessTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, SetPriorityClass,
+    GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, SetPriorityClass,
     SetProcessAffinityMask, TerminateProcess, ABOVE_NORMAL_PRIORITY_CLASS,
     BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
     PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -62,22 +60,22 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::Controls::{
     CheckDlgButton, IsDlgButtonChecked, BST_CHECKED, BST_UNCHECKED, LVCFMT_LEFT, LVCFMT_RIGHT,
-    LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_PARAM, LVIF_STATE, LVIF_TEXT,
-    LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_DELETECOLUMN, LVM_DELETEITEM,
-    LVM_ENSUREVISIBLE, LVM_GETCOLUMNWIDTH, LVM_GETITEMCOUNT, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
-    LVM_INSERTITEMW, LVM_REDRAWITEMS, LVM_SETITEMSTATE, LVM_SETITEMW, LVNI_SELECTED,
-    LVN_COLUMNCLICK, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVS_SHOWSELALWAYS, NMHDR, NMLISTVIEW,
-    NMLVDISPINFOW,
+    LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED,
+    LVIS_SELECTED, LVITEMW, LVM_DELETECOLUMN, LVM_ENSUREVISIBLE, LVM_GETCOLUMNWIDTH,
+    LVM_GETITEMCOUNT, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_REDRAWITEMS, LVM_SETITEMCOUNT,
+    LVM_SETITEMSTATE, LVNI_SELECTED, LVN_COLUMNCLICK, LVN_GETDISPINFOW, LVN_ITEMCHANGED,
+    LVSICF_NOINVALIDATEALL, LVSICF_NOSCROLL, LVS_SHOWSELALWAYS, NMHDR, NMLISTVIEW, NMLVDISPINFOW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EndDialog, GetClientRect, GetCursorPos,
-    GetDlgItem, GetWindowLongW, MessageBoxW, PostMessageW, SendMessageW, SetWindowLongW,
-    TrackPopupMenuEx, GWL_STYLE, IDCANCEL, IDOK, IDYES, MB_ICONERROR, MB_ICONEXCLAMATION, MB_OK,
-    MB_YESNO, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, TPM_RETURNCMD, WM_COMMAND,
-    WM_INITDIALOG, WM_SETREDRAW,
+    GetDlgItem, GetWindowLongW, MessageBoxW, SendMessageW, SetWindowLongW, TrackPopupMenuEx,
+    GWL_STYLE, IDCANCEL, IDOK, IDYES, MB_ICONERROR, MB_ICONEXCLAMATION, MB_OK, MB_YESNO,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, TPM_RETURNCMD, WM_COMMAND, WM_INITDIALOG,
+    WM_SETREDRAW,
 };
 
+use crate::background_worker::BackgroundWorker;
 use crate::cpu_sampler::{
     query_processor_performance, summed_processor_times, ProcessorPerformance,
 };
@@ -134,7 +132,6 @@ const COLUMN_DIALOG_IDS: [i32; NUM_COLUMN] = [
 ];
 
 const DEFAULT_MARGIN: i32 = 8;
-const TEXT_CALLBACK_WIDE: *mut u16 = -1isize as *mut u16;
 
 #[derive(Clone, Copy)]
 struct ProcessColumn {
@@ -206,6 +203,10 @@ impl DirtyColumns {
     fn any(self) -> bool {
         self.0 != 0
     }
+
+    fn contains(self, column_id: ColumnId) -> bool {
+        self.0 & Self::from_column(column_id).0 != 0
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -262,14 +263,9 @@ pub struct ProcEntry {
     priority_class: u32,
     handle_count: u32,
     thread_count: u32,
+    display_text: [String; NUM_COLUMN],
     pass_count: u64,
     dirty_columns: DirtyColumns,
-}
-
-#[derive(Default)]
-struct ProcessTokenIdentity {
-    user_name: Option<String>,
-    session_id: Option<u32>,
 }
 
 struct WtsProcessIdentity {
@@ -403,23 +399,10 @@ struct ProcWorkerCompletion {
     result: ProcWorkerResult,
 }
 
-// 工作线程命令枚举。
-// Collect:  在后台线程执行 collect_process_entries()，结果写入持久结果队列。
-// Shutdown: 通知线程退出主循环，配合 join 保证安全回收。
-//
-// 线程生命周期：
-//   1. initialize() -> start_worker_thread() 创建线程 + channel。
-//   2. 每轮 timer_event() -> refresh_processes() 发送 Collect 命令后立即返回。
-//   3. destroy() -> stop_worker_thread() 发送 Shutdown -> join 线程。
-//   线程内无限循环 recv()，遇到 Shutdown 才 break。
-enum ProcWorkerCommand {
-    Collect {
-        previous_samples: Arc<HashMap<ProcIdentity, PreviousProcSample>>,
-        total_delta: u64,
-        system_time: u64,
-        notify_hwnd: isize,
-    },
-    Shutdown,
+struct ProcWorkerRequest {
+    previous_samples: Arc<HashMap<ProcIdentity, PreviousProcSample>>,
+    total_delta: u64,
+    system_time: u64,
 }
 
 pub struct ProcessPageState {
@@ -442,11 +425,10 @@ pub struct ProcessPageState {
     processor_count: usize,
     system_processor_info: Vec<ProcessorPerformance>,
     debugger_path: Option<String>,
+    debugger_error: Option<u32>,
     strings: ProcessStrings,
     pass_count: u64,
-    worker_sender: Option<Sender<ProcWorkerCommand>>,
-    worker_result_receiver: Option<Receiver<ProcWorkerCompletion>>,
-    worker_thread: Option<JoinHandle<()>>,
+    worker: Option<BackgroundWorker<ProcWorkerRequest, ProcWorkerCompletion>>,
     collection_in_flight: bool,
     refresh_requested: bool,
     inflight_previous_samples: Option<Arc<HashMap<ProcIdentity, PreviousProcSample>>>,
@@ -474,11 +456,10 @@ impl Default for ProcessPageState {
             processor_count: 1,
             system_processor_info: Vec::new(),
             debugger_path: None,
+            debugger_error: None,
             strings: ProcessStrings::default(),
             pass_count: 0,
-            worker_sender: None,
-            worker_result_receiver: None,
-            worker_thread: None,
+            worker: None,
             collection_in_flight: false,
             refresh_requested: false,
             inflight_previous_samples: None,
@@ -488,64 +469,26 @@ impl Default for ProcessPageState {
 }
 
 impl ProcessPageState {
-    // 创建工作线程和 mpsc channel。如果线程已存在则直接返回（幂等）。
-    // 工作线程循环接收 ProcWorkerCommand，遇到 Shutdown 才退出。
+    // 创建持久采样线程。线程与通道的配对释放由 BackgroundWorker 统一负责。
     fn start_worker_thread(&mut self) -> Result<(), u32> {
-        if self.worker_sender.is_some() {
+        if self.worker.is_some() {
             return Ok(());
         }
-        let (tx, rx) = channel::<ProcWorkerCommand>();
-        let (result_tx, result_rx) = channel::<ProcWorkerCompletion>();
-        let worker = thread::Builder::new()
-            .name("rtaskmgr-process-sampler".to_string())
-            .spawn(move || {
-                while let Ok(command) = rx.recv() {
-                    match command {
-                        ProcWorkerCommand::Collect {
-                            previous_samples,
-                            total_delta,
-                            system_time,
-                            notify_hwnd,
-                        } => {
-                            let result =
-                                unsafe { collect_process_entries(&previous_samples, total_delta) };
-                            if result_tx
-                                .send(ProcWorkerCompletion {
-                                    system_time,
-                                    result,
-                                })
-                                .is_ok()
-                            {
-                                unsafe {
-                                    PostMessageW(
-                                        notify_hwnd as HWND,
-                                        PWM_PROC_WORKER_COMPLETE,
-                                        0,
-                                        0,
-                                    );
-                                }
-                            }
-                        }
-                        ProcWorkerCommand::Shutdown => break,
-                    }
-                }
-            })
-            .map_err(thread_spawn_error)?;
-        self.worker_sender = Some(tx);
-        self.worker_result_receiver = Some(result_rx);
-        self.worker_thread = Some(worker);
+        self.worker = Some(BackgroundWorker::spawn(
+            "rtaskmgr-process-sampler",
+            PWM_PROC_WORKER_COMPLETE,
+            |request: ProcWorkerRequest| ProcWorkerCompletion {
+                system_time: request.system_time,
+                result: unsafe {
+                    collect_process_entries(&request.previous_samples, request.total_delta)
+                },
+            },
+        )?);
         Ok(())
     }
 
-    // 发送 Shutdown 命令并等待工作线程退出。清理线程句柄和 channel。
     fn stop_worker_thread(&mut self) {
-        if let Some(sender) = self.worker_sender.take() {
-            let _ = sender.send(ProcWorkerCommand::Shutdown);
-        }
-        if let Some(worker) = self.worker_thread.take() {
-            let _ = worker.join();
-        }
-        self.worker_result_receiver = None;
+        self.worker = None;
         self.collection_in_flight = false;
         self.refresh_requested = false;
         self.inflight_previous_samples = None;
@@ -571,7 +514,17 @@ impl ProcessPageState {
         self.hwnd_page = hwnd_page;
         self.main_hwnd = main_hwnd;
         self.load_strings();
-        self.debugger_path = load_debugger_path();
+        match load_debugger_path() {
+            Ok(path) => {
+                self.debugger_path = path;
+                self.debugger_error = None;
+            }
+            Err(error) => {
+                self.debugger_path = None;
+                self.debugger_error = Some(error);
+                record_win32_error("debugger configuration", error);
+            }
+        }
 
         let list_hwnd = self.list_hwnd();
         if list_hwnd.is_null() {
@@ -913,24 +866,7 @@ impl ProcessPageState {
 
         self.selected_identity = Some(self.entries[index].identity);
         let list_hwnd = self.list_hwnd();
-        for item_index in 0..self.entries.len() {
-            let mut item = LVITEMW {
-                stateMask: LVIS_SELECTED | LVIS_FOCUSED,
-                state: if item_index == index {
-                    LVIS_SELECTED | LVIS_FOCUSED
-                } else {
-                    0
-                },
-                ..zeroed()
-            };
-            SendMessageW(
-                list_hwnd,
-                LVM_SETITEMSTATE,
-                item_index,
-                &mut item as *mut _ as LPARAM,
-            );
-        }
-        SendMessageW(list_hwnd, LVM_ENSUREVISIBLE, index, 0);
+        self.set_list_selection(list_hwnd, Some(index));
         self.update_ui_state();
         true
     }
@@ -998,21 +934,20 @@ impl ProcessPageState {
             };
         let total_delta = system_total.saturating_sub(self.previous_system_time);
         let previous_samples = Arc::new(std::mem::take(&mut self.previous_samples));
-        let Some(sender) = self.worker_sender.as_ref() else {
+        let Some(worker) = self.worker.as_ref() else {
             self.previous_samples = unwrap_previous_samples(previous_samples);
             self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
             return;
         };
 
-        let command = ProcWorkerCommand::Collect {
+        let request = ProcWorkerRequest {
             previous_samples: Arc::clone(&previous_samples),
             total_delta,
             system_time: system_total,
-            notify_hwnd: self.hwnd_page as isize,
         };
-        if sender.send(command).is_err() {
+        if let Err(error) = worker.submit(request, self.hwnd_page) {
             self.previous_samples = unwrap_previous_samples(previous_samples);
-            self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
+            self.set_refresh_error(error);
             return;
         }
 
@@ -1022,8 +957,8 @@ impl ProcessPageState {
 
     unsafe fn drain_worker_results(&mut self) {
         loop {
-            let result = match self.worker_result_receiver.as_ref() {
-                Some(receiver) => receiver.try_recv(),
+            let result = match self.worker.as_ref() {
+                Some(worker) => worker.try_recv(),
                 None => return,
             };
 
@@ -1031,8 +966,7 @@ impl ProcessPageState {
                 Ok(completion) => self.apply_worker_completion(completion),
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
-                    self.worker_result_receiver = None;
-                    self.worker_sender = None;
+                    self.worker = None;
                     self.collection_in_flight = false;
                     if let Some(samples) = self.inflight_previous_samples.take() {
                         self.previous_samples = unwrap_previous_samples(samples);
@@ -1070,6 +1004,7 @@ impl ProcessPageState {
     ) {
         let previous_selection = self.current_selected_identity().or(self.selected_identity);
         let current_pass = self.pass_count;
+        let mut sort_dirty = false;
         let mut existing_by_identity = HashMap::with_capacity(self.entries.len());
         for (index, entry) in self.entries.iter_mut().enumerate() {
             existing_by_identity.insert(entry.identity, index);
@@ -1078,14 +1013,18 @@ impl ProcessPageState {
         for snapshot in entries {
             if let Some(&index) = existing_by_identity.get(&snapshot.identity) {
                 let existing = &mut self.entries[index];
-                update_process_entry(existing, &snapshot, current_pass);
+                let changed = update_process_entry(existing, &snapshot, current_pass);
+                sort_dirty |= changed.contains(self.sort_column);
             } else {
                 self.entries.push(snapshot.with_pass_count(current_pass));
+                sort_dirty = true;
             }
         }
 
-        self.remove_stale_entries(current_pass);
-        self.resort_entries();
+        sort_dirty |= self.remove_stale_entries(current_pass);
+        if sort_dirty {
+            self.resort_entries();
+        }
         self.previous_samples = next_samples;
         self.previous_system_time = system_time;
         let requested_selection = self
@@ -1119,18 +1058,27 @@ impl ProcessPageState {
         });
     }
 
-    fn remove_stale_entries(&mut self, current_pass: u64) {
+    fn remove_stale_entries(&mut self, current_pass: u64) -> bool {
+        let previous_len = self.entries.len();
         self.entries
             .retain(|entry| entry.pass_count == current_pass);
+        previous_len != self.entries.len()
     }
 
     unsafe fn rebuild_listview(&mut self) {
-        // 这里优先复用现有行，只在身份变化时替换整行，以减少闪烁和选择状态丢失。
+        // 进程列表使用 LVS_OWNERDATA；刷新只更新虚拟项数量和索引映射，
+        // 不再为每个进程创建、删除或移动 Win32 ListView 项。
         let list_hwnd = self.list_hwnd();
+        if list_hwnd.is_null() {
+            return;
+        }
         let selected_identity = self.selected_identity;
-        let mut selected_index = None;
+        let selected_index = selected_identity.and_then(|identity| {
+            self.entries
+                .iter()
+                .position(|entry| entry.identity == identity)
+        });
         let existing_count = SendMessageW(list_hwnd, LVM_GETITEMCOUNT, 0, 0) as usize;
-        let common_count = existing_count.min(self.entries.len());
         let structure_changed = existing_count != self.entries.len();
         let order_changed = self.displayed_identities.len() != self.entries.len()
             || self
@@ -1145,56 +1093,32 @@ impl ProcessPageState {
         }
 
         let mut dirty_rows = DirtyRowRange::default();
-
-        for index in 0..common_count {
-            let entry = &self.entries[index];
-
-            let item_state = if selected_identity == Some(entry.identity) {
-                selected_index = Some(index);
-                LVIS_SELECTED | LVIS_FOCUSED
-            } else {
-                0
-            };
-
-            if self.displayed_identities.get(index).copied() != Some(entry.identity) {
-                self.replace_row(list_hwnd, index, entry, item_state);
-                self.entries[index].dirty_columns = DirtyColumns::default();
-                dirty_rows.mark(index);
-            } else if entry.dirty_columns.any() {
-                self.entries[index].dirty_columns = DirtyColumns::default();
+        for (index, entry) in self.entries.iter_mut().enumerate() {
+            if entry.dirty_columns.any() {
+                entry.dirty_columns = DirtyColumns::default();
                 dirty_rows.mark(index);
             }
         }
 
         if structure_changed {
-            let mut remaining_count = existing_count;
-            while remaining_count > self.entries.len() {
-                remaining_count -= 1;
-                SendMessageW(list_hwnd, LVM_DELETEITEM, remaining_count, 0);
-            }
+            SendMessageW(
+                list_hwnd,
+                LVM_SETITEMCOUNT,
+                self.entries.len(),
+                (LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL) as LPARAM,
+            );
+        }
 
-            for index in common_count..self.entries.len() {
-                let entry = &self.entries[index];
-                let item_state = if selected_identity == Some(entry.identity) {
-                    selected_index = Some(index);
-                    LVIS_SELECTED | LVIS_FOCUSED
-                } else {
-                    0
-                };
-                self.insert_row(list_hwnd, index, entry, item_state);
-                self.entries[index].dirty_columns = DirtyColumns::default();
-                dirty_rows.mark(index);
-            }
-        }
         if bulk_update {
+            self.set_list_selection(list_hwnd, selected_index);
             finish_list_view_update(list_hwnd);
+        } else {
+            dirty_rows.redraw(list_hwnd, self.entries.len());
         }
+
         self.displayed_identities.clear();
         self.displayed_identities
             .extend(self.entries.iter().map(|entry| entry.identity));
-        if !bulk_update {
-            dirty_rows.redraw(list_hwnd, self.entries.len());
-        }
 
         if selected_index.is_none() {
             self.selected_identity = None;
@@ -1203,40 +1127,30 @@ impl ProcessPageState {
         self.update_ui_state();
     }
 
-    unsafe fn insert_row(&self, list_hwnd: HWND, index: usize, entry: &ProcEntry, item_state: u32) {
+    unsafe fn set_list_selection(&self, list_hwnd: HWND, selected_index: Option<usize>) {
+        // Clearing all virtual item states is one ListView operation instead of an O(n) loop.
         let mut item = LVITEMW {
-            mask: LVIF_TEXT | LVIF_PARAM | LVIF_STATE,
-            iItem: index as i32,
-            iSubItem: 0,
-            pszText: TEXT_CALLBACK_WIDE,
-            cchTextMax: 0,
-            lParam: entry.pid as isize,
             stateMask: LVIS_SELECTED | LVIS_FOCUSED,
-            state: item_state,
+            state: 0,
             ..zeroed()
         };
-        SendMessageW(list_hwnd, LVM_INSERTITEMW, 0, &mut item as *mut _ as LPARAM);
-    }
+        SendMessageW(
+            list_hwnd,
+            LVM_SETITEMSTATE,
+            usize::MAX,
+            &mut item as *mut _ as LPARAM,
+        );
 
-    unsafe fn replace_row(
-        &self,
-        list_hwnd: HWND,
-        index: usize,
-        entry: &ProcEntry,
-        item_state: u32,
-    ) {
-        let mut item = LVITEMW {
-            mask: LVIF_TEXT | LVIF_PARAM | LVIF_STATE,
-            iItem: index as i32,
-            iSubItem: 0,
-            pszText: TEXT_CALLBACK_WIDE,
-            cchTextMax: 0,
-            lParam: entry.pid as isize,
-            stateMask: LVIS_SELECTED | LVIS_FOCUSED,
-            state: item_state,
-            ..zeroed()
-        };
-        SendMessageW(list_hwnd, LVM_SETITEMW, 0, &mut item as *mut _ as LPARAM);
+        if let Some(index) = selected_index {
+            item.state = LVIS_SELECTED | LVIS_FOCUSED;
+            SendMessageW(
+                list_hwnd,
+                LVM_SETITEMSTATE,
+                index,
+                &mut item as *mut _ as LPARAM,
+            );
+            SendMessageW(list_hwnd, LVM_ENSUREVISIBLE, index, 0);
+        }
     }
 
     unsafe fn fill_display_info(&self, item: &mut LVITEMW) {
@@ -1259,13 +1173,12 @@ impl ProcessPageState {
         };
 
         let text = column_text(entry, column_id, &self.strings);
-        copy_text_to_callback_buffer(item.pszText, item.cchTextMax as usize, &text);
+        copy_text_to_callback_buffer(item.pszText, item.cchTextMax as usize, text);
     }
 
     // 销毁现有列并按照 active_columns 重建所有列头。列宽优先从 options 读取，否则用默认值。
     unsafe fn setup_columns(&self, options: &Options) {
         let list_hwnd = self.list_hwnd();
-        SendMessageW(list_hwnd, LVM_DELETEALLITEMS, 0, 0);
         while SendMessageW(list_hwnd, LVM_DELETECOLUMN, 0, 0) != 0 {}
 
         for (index, column_id) in self.active_columns.iter().enumerate() {
@@ -1292,6 +1205,15 @@ impl ProcessPageState {
                 LVM_INSERTCOLUMNW,
                 index,
                 &mut lv_column as *mut _ as LPARAM,
+            );
+        }
+
+        if !self.entries.is_empty() {
+            SendMessageW(
+                list_hwnd,
+                LVM_REDRAWITEMS,
+                0,
+                self.entries.len().saturating_sub(1) as LPARAM,
             );
         }
     }
@@ -1513,7 +1435,11 @@ impl ProcessPageState {
     // 以 AeDebug 注册表配置的调试器启动并附加到目标进程。命令行传 -p <pid>。
     unsafe fn attach_debugger(&mut self, identity: ProcIdentity) -> bool {
         let Some(debugger_path) = self.debugger_path.as_ref() else {
-            self.show_failure_message(&self.strings.cant_debug, 2);
+            let error = match self.debugger_error {
+                Some(error) => error,
+                None => ERROR_FILE_NOT_FOUND,
+            };
+            self.show_failure_message(&self.strings.cant_debug, error);
             return false;
         };
 
@@ -1899,14 +1825,19 @@ unsafe fn apply_selected_columns(hwnd: HWND, options: &mut Options) {
     }
 }
 
-unsafe fn load_debugger_path() -> Option<String> {
+unsafe fn load_debugger_path() -> Result<Option<String>, u32> {
     // 进程页的“调试”命令依赖 AeDebug 注册表配置。
     // 这里只提取真正的可执行文件路径，过滤掉旧式 drwtsn32 之类的无效值。
     let mut key: HKEY = null_mut();
     let key_name = to_wide_null("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug");
     let value_name = to_wide_null("Debugger");
-    if RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_name.as_ptr(), 0, KEY_READ, &mut key) != 0 {
-        return None;
+    let open_status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_name.as_ptr(), 0, KEY_READ, &mut key);
+    if open_status != 0 {
+        return if open_status == ERROR_FILE_NOT_FOUND || open_status == ERROR_PATH_NOT_FOUND {
+            Ok(None)
+        } else {
+            Err(open_status)
+        };
     }
 
     let mut value_size = 0u32;
@@ -1919,8 +1850,17 @@ unsafe fn load_debugger_path() -> Option<String> {
         &mut value_size,
     );
     if size_status != 0 || value_size < 2 {
-        RegCloseKey(key);
-        return None;
+        let close_status = RegCloseKey(key);
+        if close_status != 0 {
+            return Err(close_status);
+        }
+        return if size_status == ERROR_FILE_NOT_FOUND {
+            Ok(None)
+        } else if size_status != 0 {
+            Err(size_status)
+        } else {
+            Err(ERROR_INVALID_DATA)
+        };
     }
 
     let mut buffer = vec![0u16; (value_size as usize / size_of::<u16>()).max(2)];
@@ -1933,10 +1873,17 @@ unsafe fn load_debugger_path() -> Option<String> {
         buffer.as_mut_ptr() as *mut u8,
         &mut value_size,
     );
-    RegCloseKey(key);
+    let close_status = RegCloseKey(key);
+    if close_status != 0 {
+        return Err(close_status);
+    }
 
     if status != 0 || value_size < 2 || !(value_type == REG_SZ || value_type == REG_EXPAND_SZ) {
-        return None;
+        return Err(if status != 0 {
+            status
+        } else {
+            ERROR_INVALID_DATA
+        });
     }
 
     let length = buffer
@@ -1944,8 +1891,10 @@ unsafe fn load_debugger_path() -> Option<String> {
         .position(|value| *value == 0)
         .unwrap_or(buffer.len());
     let raw = String::from_utf16_lossy(&buffer[..length]);
-    let executable = normalize_debugger_command(&raw, value_type)?;
-    Path::new(&executable).is_file().then_some(executable)
+    let Some(executable) = normalize_debugger_command(&raw, value_type)? else {
+        return Ok(None);
+    };
+    Ok(Path::new(&executable).is_file().then_some(executable))
 }
 
 // 引用命令行参数。只在包含空格、制表符或引号时加引号，并正确处理反斜杠转义。
@@ -2000,8 +1949,17 @@ fn extract_first_command_token(command_line: &str) -> String {
 }
 
 // 将 AeDebug 注册表值规范化：展开环境变量后提取可执行文件路径，过滤无效调试器。
-fn normalize_debugger_command(command_line: &str, value_type: u32) -> Option<String> {
-    normalize_debugger_command_with(command_line, value_type, expand_environment_variables)
+fn normalize_debugger_command(command_line: &str, value_type: u32) -> Result<Option<String>, u32> {
+    let expanded = if value_type == REG_EXPAND_SZ {
+        expand_environment_variables(command_line)?
+    } else {
+        command_line.to_string()
+    };
+    Ok(normalize_debugger_command_with(
+        &expanded,
+        REG_SZ,
+        str::to_string,
+    ))
 }
 
 fn normalize_debugger_command_with<F>(
@@ -2031,75 +1989,25 @@ where
 
 // 展开字符串中的环境变量（如 %SystemRoot%）。
 // 使用 Win32 ExpandEnvironmentStringsW API，正确处理 WOW64 重定向和 %% 转义。
-fn expand_environment_variables(command_line: &str) -> String {
+fn expand_environment_variables(command_line: &str) -> Result<String, u32> {
     // 安全性: the Win32 ExpandEnvironmentStringsW API reads the process environment block
     // maintained by the kernel, which handles system-variable edge cases (WOW64 redirections,
     // %% escaping, variable-length limits) correctly.
     let wide_input = to_wide_null(command_line);
     let required = unsafe { ExpandEnvironmentStringsW(wide_input.as_ptr(), null_mut(), 0) };
     if required == 0 {
-        return command_line.to_string();
+        let error = unsafe { GetLastError() };
+        return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
     }
     let mut buffer = vec![0u16; required as usize];
     let written =
         unsafe { ExpandEnvironmentStringsW(wide_input.as_ptr(), buffer.as_mut_ptr(), required) };
     if written == 0 || written > required {
-        return command_line.to_string();
+        let error = unsafe { GetLastError() };
+        return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
     }
     let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
-    String::from_utf16_lossy(&buffer[..len])
-}
-
-// 从进程令牌查询用户名和 SessionId。令牌是进程账户身份的权威来源；每个字段
-// 独立用 Option 表示，避免把合法的 Session 0 和查询失败混为一谈。
-unsafe fn query_process_identity(
-    process_handle: HANDLE,
-    account_cache: &mut HashMap<Vec<u8>, String>,
-) -> ProcessTokenIdentity {
-    let mut identity = ProcessTokenIdentity::default();
-    let mut token: HANDLE = null_mut();
-    if OpenProcessToken(process_handle, TOKEN_QUERY, &mut token) == 0 || token.is_null() {
-        return identity;
-    }
-
-    let mut session_id = 0u32;
-    let mut session_bytes = size_of::<u32>() as u32;
-    if GetTokenInformation(
-        token,
-        TokenSessionId,
-        &mut session_id as *mut _ as *mut _,
-        session_bytes,
-        &mut session_bytes,
-    ) != 0
-    {
-        identity.session_id = Some(session_id);
-    }
-
-    let mut required = 0u32;
-    let _ = GetTokenInformation(token, TokenUser, null_mut(), 0, &mut required);
-    if required == 0 {
-        CloseHandle(token);
-        return identity;
-    }
-
-    let mut buffer = vec![0u8; required as usize];
-    if GetTokenInformation(
-        token,
-        TokenUser,
-        buffer.as_mut_ptr() as *mut _,
-        required,
-        &mut required,
-    ) != 0
-    {
-        let token_user = std::ptr::read_unaligned(buffer.as_ptr() as *const TOKEN_USER);
-        let user_name = lookup_account_name_from_sid_cached(token_user.User.Sid, account_cache);
-        if !user_name.is_empty() {
-            identity.user_name = Some(user_name);
-        }
-    }
-
-    CloseHandle(token);
-    identity
+    Ok(String::from_utf16_lossy(&buffer[..len]))
 }
 
 // 检查 SID 是否为已知服务帐户（SYSTEM、LOCAL SERVICE、NETWORK SERVICE），返回对应名称。
@@ -2117,38 +2025,19 @@ fn well_known_service_name(sid: *mut core::ffi::c_void) -> Option<String> {
     }
 }
 
-// 将进程令牌中的用户名、SessionId 和 32-bit 标记合并进 ProcEntry，并把成功查询
-// 的字段返回给 WTS 兜底校验逻辑。
-unsafe fn merge_process_identity(
-    entry: &mut ProcEntry,
-    process_handle: HANDLE,
-    account_cache: &mut HashMap<Vec<u8>, String>,
-) -> ProcessTokenIdentity {
-    let identity = query_process_identity(process_handle, account_cache);
-    if let Some(user_name) = identity.user_name.as_ref() {
-        entry.user_name.clone_from(user_name);
-        entry.user_name_lower = entry.user_name.to_lowercase();
-    }
-    if let Some(session_id) = identity.session_id {
-        entry.session_id = Some(session_id);
-    }
-    entry.is_32_bit = is_32_bit_process_handle(process_handle);
-    identity
-}
-
 // 通过 LookupAccountSidW 将 SID 解析为经典 Task Manager 风格的账户名。
-unsafe fn lookup_account_name_from_sid(sid: *mut core::ffi::c_void) -> String {
-    if sid.is_null() {
-        return String::new();
+unsafe fn lookup_account_name_from_sid(sid: *mut core::ffi::c_void) -> Result<Option<String>, u32> {
+    if sid.is_null() || IsValidSid(sid) == 0 {
+        return Ok(None);
     }
     if let Some(name) = well_known_service_name(sid) {
-        return name;
+        return Ok(Some(name));
     }
 
     let mut name_len = 0u32;
     let mut domain_len = 0u32;
     let mut sid_use = 0 as SID_NAME_USE;
-    let _ = LookupAccountSidW(
+    if LookupAccountSidW(
         null_mut(),
         sid,
         null_mut(),
@@ -2156,54 +2045,82 @@ unsafe fn lookup_account_name_from_sid(sid: *mut core::ffi::c_void) -> String {
         null_mut(),
         &mut domain_len,
         &mut sid_use,
-    );
-
-    if name_len != 0 {
-        let mut name = vec![0u16; name_len as usize];
-        let mut domain = vec![0u16; domain_len as usize];
-        let domain_ptr = if domain.is_empty() {
-            null_mut()
-        } else {
-            domain.as_mut_ptr()
-        };
-        if LookupAccountSidW(
-            null_mut(),
-            sid,
-            name.as_mut_ptr(),
-            &mut name_len,
-            domain_ptr,
-            &mut domain_len,
-            &mut sid_use,
-        ) != 0
-        {
-            let available = (name_len as usize).min(name.len());
-            let length = name[..available]
-                .iter()
-                .position(|value| *value == 0)
-                .unwrap_or(available);
-            return String::from_utf16_lossy(&name[..length]);
+    ) == 0
+    {
+        let error = GetLastError();
+        if error == ERROR_NONE_MAPPED {
+            return sid_string(sid).map(Some);
+        }
+        if error != ERROR_INSUFFICIENT_BUFFER {
+            return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
         }
     }
 
-    String::new()
+    if name_len == 0 {
+        return Err(ERROR_INVALID_DATA);
+    }
+
+    let mut name = vec![0u16; name_len as usize];
+    let mut domain = vec![0u16; domain_len as usize];
+    let domain_ptr = if domain.is_empty() {
+        null_mut()
+    } else {
+        domain.as_mut_ptr()
+    };
+    if LookupAccountSidW(
+        null_mut(),
+        sid,
+        name.as_mut_ptr(),
+        &mut name_len,
+        domain_ptr,
+        &mut domain_len,
+        &mut sid_use,
+    ) == 0
+    {
+        let error = GetLastError();
+        if error == ERROR_NONE_MAPPED {
+            return sid_string(sid).map(Some);
+        }
+        return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+    }
+
+    let available = (name_len as usize).min(name.len());
+    let length = name[..available]
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(available);
+    Ok(Some(String::from_utf16_lossy(&name[..length])))
 }
 
 unsafe fn lookup_account_name_from_sid_cached(
     sid: *mut core::ffi::c_void,
     account_cache: &mut HashMap<Vec<u8>, String>,
-) -> String {
+) -> Result<Option<String>, u32> {
     let cache_key = sid_cache_key(sid);
     if let Some(name) = cache_key.as_ref().and_then(|key| account_cache.get(key)) {
-        return name.clone();
+        return Ok(Some(name.clone()));
     }
 
-    let name = lookup_account_name_from_sid(sid);
-    if !name.is_empty() {
-        if let Some(cache_key) = cache_key {
-            account_cache.insert(cache_key, name.clone());
-        }
+    let name = lookup_account_name_from_sid(sid)?;
+    if let (Some(cache_key), Some(name)) = (cache_key, name.as_ref()) {
+        account_cache.insert(cache_key, name.clone());
     }
-    name
+    Ok(name)
+}
+
+unsafe fn sid_string(sid: *mut core::ffi::c_void) -> Result<String, u32> {
+    let mut string_sid = null_mut::<u16>();
+    if ConvertSidToStringSidW(sid, &mut string_sid) == 0 || string_sid.is_null() {
+        let error = GetLastError();
+        return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+    }
+
+    let value = widestr_ptr_to_string(string_sid);
+    if !LocalFree(string_sid as _).is_null() {
+        let error = GetLastError();
+        return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+    }
+    Ok(value)
 }
 
 unsafe fn sid_cache_key(sid: *mut core::ffi::c_void) -> Option<Vec<u8>> {
@@ -2248,6 +2165,7 @@ unsafe fn collect_process_identity_map(
     }
 
     let mut identities = HashMap::with_capacity(count as usize);
+    let mut collection_error = None;
     let processes = slice::from_raw_parts(process_info, count as usize);
     for process in processes {
         let pid = process.ProcessId;
@@ -2257,8 +2175,13 @@ unsafe fn collect_process_identity_map(
         let user_name = if pid == 0 {
             Some("SYSTEM".to_string())
         } else {
-            let name = lookup_account_name_from_sid_cached(process.pUserSid, account_cache);
-            (!name.is_empty()).then_some(name)
+            match lookup_account_name_from_sid_cached(process.pUserSid, account_cache) {
+                Ok(name) => name,
+                Err(error) => {
+                    collection_error = Some(error);
+                    break;
+                }
+            }
         };
         identities.insert(
             pid,
@@ -2271,7 +2194,10 @@ unsafe fn collect_process_identity_map(
     }
 
     WTSFreeMemory(process_info as _);
-    Ok(identities)
+    match collection_error {
+        Some(error) => Err(error),
+        None => Ok(identities),
+    }
 }
 
 fn merge_wts_process_identity(entry: &mut ProcEntry, wts_identity: Option<&WtsProcessIdentity>) {
@@ -2303,11 +2229,6 @@ fn wts_identity_matches(
 ) -> bool {
     wts_identity.image_name_lower == image_name_lower
         && session_id.is_none_or(|session_id| session_id == wts_identity.session_id)
-}
-
-unsafe fn query_process_session_id(pid: u32) -> Option<u32> {
-    let mut session_id = 0u32;
-    (ProcessIdToSessionId(pid, &mut session_id) != 0).then_some(session_id)
 }
 
 // 从 Options 中解析当前激活的列列表，过滤无效列 ID。
@@ -2401,43 +2322,19 @@ fn column_text<'a>(
     entry: &'a ProcEntry,
     column_id: ColumnId,
     strings: &'a ProcessStrings,
-) -> Cow<'a, str> {
-    // 所有列表文本都统一从这里派生，便于保持格式一致，
-    // 也方便 owner-data 回调按列生成内容。
+) -> &'a str {
+    // 快照线程已缓存可变展示值；owner-data 绘制回调只借用，不在 UI 热路径分配。
     match column_id {
-        ColumnId::ImageName => append_32_bit_suffix(&entry.image_name, entry.is_32_bit),
-        ColumnId::Pid => Cow::Owned(entry.pid.to_string()),
-        ColumnId::Username => Cow::Borrowed(entry.user_name.as_str()),
-        ColumnId::SessionId => Cow::Owned(
-            entry
-                .session_id
-                .map(|session_id| session_id.to_string())
-                .unwrap_or_default(),
-        ),
-        ColumnId::Cpu => Cow::Owned(format!("{:02} %", entry.cpu)),
-        ColumnId::CpuTime => Cow::Owned(format_elapsed_time(entry.display_cpu_time_100ns)),
-        ColumnId::MemUsage => Cow::Owned(format_kilobytes(entry.mem_usage_kb)),
-        ColumnId::MemUsageDiff => Cow::Owned(format_signed_kilobytes(entry.mem_diff_kb)),
-        ColumnId::PageFaults => Cow::Owned(entry.page_faults.to_string()),
-        ColumnId::PageFaultsDiff => Cow::Owned(entry.page_faults_diff.to_string()),
-        ColumnId::CommitCharge => Cow::Owned(format_kilobytes(entry.commit_charge_kb)),
-        ColumnId::PagedPool => Cow::Owned(format_kilobytes(entry.paged_pool_kb)),
-        ColumnId::NonPagedPool => Cow::Owned(format_kilobytes(entry.nonpaged_pool_kb)),
         ColumnId::BasePriority => match entry.priority_class {
-            value if value == IDLE_PRIORITY_CLASS => Cow::Borrowed(&strings.priority_low),
-            value if value == BELOW_NORMAL_PRIORITY_CLASS => {
-                Cow::Borrowed(&strings.priority_below_normal)
-            }
-            value if value == HIGH_PRIORITY_CLASS => Cow::Borrowed(&strings.priority_high),
-            value if value == ABOVE_NORMAL_PRIORITY_CLASS => {
-                Cow::Borrowed(&strings.priority_above_normal)
-            }
-            value if value == REALTIME_PRIORITY_CLASS => Cow::Borrowed(&strings.priority_realtime),
-            value if value == NORMAL_PRIORITY_CLASS => Cow::Borrowed(&strings.priority_normal),
-            _ => Cow::Borrowed(&strings.priority_unknown),
+            value if value == IDLE_PRIORITY_CLASS => &strings.priority_low,
+            value if value == BELOW_NORMAL_PRIORITY_CLASS => &strings.priority_below_normal,
+            value if value == HIGH_PRIORITY_CLASS => &strings.priority_high,
+            value if value == ABOVE_NORMAL_PRIORITY_CLASS => &strings.priority_above_normal,
+            value if value == REALTIME_PRIORITY_CLASS => &strings.priority_realtime,
+            value if value == NORMAL_PRIORITY_CLASS => &strings.priority_normal,
+            _ => &strings.priority_unknown,
         },
-        ColumnId::HandleCount => Cow::Owned(entry.handle_count.to_string()),
-        ColumnId::ThreadCount => Cow::Owned(entry.thread_count.to_string()),
+        _ => &entry.display_text[column_id as usize],
     }
 }
 
@@ -2663,13 +2560,6 @@ fn unwrap_previous_samples(
     Arc::try_unwrap(samples).unwrap_or_else(|shared| (*shared).clone())
 }
 
-fn thread_spawn_error(error: std::io::Error) -> u32 {
-    error
-        .raw_os_error()
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(ERROR_NOT_ENOUGH_MEMORY)
-}
-
 // 通过 QueryFullProcessImageNameW 查询进程可执行文件的全路径。
 unsafe fn query_process_image_path(identity: ProcIdentity) -> Result<String, u32> {
     let handle = open_process_for_identity(identity, PROCESS_QUERY_LIMITED_INFORMATION)?;
@@ -2753,6 +2643,7 @@ unsafe fn collect_process_entries(
             priority_class: NORMAL_PRIORITY_CLASS,
             handle_count: 0,
             thread_count,
+            display_text: std::array::from_fn(|_| String::new()),
             pass_count: 0,
             dirty_columns: DirtyColumns::default(),
         };
@@ -2781,11 +2672,19 @@ unsafe fn collect_process_entries(
         };
 
         if !info_handle.is_null() {
-            let token_identity =
-                merge_process_identity(&mut entry, info_handle, &mut account_cache);
-            if token_identity.session_id.is_none() {
-                entry.session_id = query_process_session_id(pid);
-            }
+            entry.is_32_bit = match is_32_bit_process_handle(info_handle) {
+                Ok(is_32_bit) => is_32_bit,
+                Err(error) => {
+                    if !memory_handle.is_null() {
+                        CloseHandle(memory_handle);
+                    }
+                    if !query_handle.is_null() {
+                        CloseHandle(query_handle);
+                    }
+                    CloseHandle(snapshot);
+                    return Err(error);
+                }
+            };
             let mut creation = zeroed::<FILETIME>();
             let mut exit = zeroed::<FILETIME>();
             let mut kernel = zeroed::<FILETIME>();
@@ -2878,14 +2777,14 @@ unsafe fn collect_process_entries(
 
     CloseHandle(snapshot);
 
-    let required_wts_pids = entries
+    let snapshot_pids = entries
         .iter()
-        .filter(|entry| entry.user_name.is_empty() || entry.session_id.is_none())
         .map(|entry| entry.pid)
         .collect::<HashSet<_>>();
-    let identities = collect_process_identity_map(&required_wts_pids, &mut account_cache)?;
+    let identities = collect_process_identity_map(&snapshot_pids, &mut account_cache)?;
     for entry in &mut entries {
         merge_wts_process_identity(entry, identities.get(&entry.pid));
+        entry.rebuild_display_text();
     }
 
     Ok((entries, next_samples))
@@ -2936,6 +2835,37 @@ unsafe fn window_rect_relative_to_page(hwnd: HWND, page_hwnd: HWND) -> RECT {
 }
 
 impl ProcEntry {
+    fn rebuild_display_text(&mut self) {
+        self.display_text[ColumnId::ImageName as usize] =
+            append_32_bit_suffix(&self.image_name, self.is_32_bit).into_owned();
+        self.display_text[ColumnId::Pid as usize] = self.pid.to_string();
+        self.display_text[ColumnId::Username as usize].clone_from(&self.user_name);
+        self.display_text[ColumnId::SessionId as usize] = self
+            .session_id
+            .map(|session_id| session_id.to_string())
+            .unwrap_or_default();
+        self.display_text[ColumnId::Cpu as usize] = format!("{:02} %", self.cpu);
+        self.display_text[ColumnId::CpuTime as usize] =
+            format_elapsed_time(self.display_cpu_time_100ns);
+        self.display_text[ColumnId::MemUsage as usize] = format_kilobytes(self.mem_usage_kb);
+        self.display_text[ColumnId::MemUsageDiff as usize] =
+            format_signed_kilobytes(self.mem_diff_kb);
+        self.display_text[ColumnId::PageFaults as usize] = self.page_faults.to_string();
+        self.display_text[ColumnId::PageFaultsDiff as usize] = self.page_faults_diff.to_string();
+        self.display_text[ColumnId::CommitCharge as usize] =
+            format_kilobytes(self.commit_charge_kb);
+        self.display_text[ColumnId::PagedPool as usize] = format_kilobytes(self.paged_pool_kb);
+        self.display_text[ColumnId::NonPagedPool as usize] =
+            format_kilobytes(self.nonpaged_pool_kb);
+        self.display_text[ColumnId::HandleCount as usize] = self.handle_count.to_string();
+        self.display_text[ColumnId::ThreadCount as usize] = self.thread_count.to_string();
+    }
+
+    fn copy_display_column_from(&mut self, snapshot: &Self, column_id: ColumnId) {
+        self.display_text[column_id as usize]
+            .clone_from(&snapshot.display_text[column_id as usize]);
+    }
+
     fn with_pass_count(mut self, pass_count: u64) -> Self {
         self.pass_count = pass_count;
         self.dirty_columns = DirtyColumns::all();
@@ -2943,84 +2873,118 @@ impl ProcEntry {
     }
 }
 
-fn update_process_entry(entry: &mut ProcEntry, snapshot: &ProcEntry, pass_count: u64) {
+fn update_process_entry(
+    entry: &mut ProcEntry,
+    snapshot: &ProcEntry,
+    pass_count: u64,
+) -> DirtyColumns {
     // 增量更新时只给真正变更的列打脏标记，
     // 后续 ListView 才能做到“只重绘必要行/列”。
     entry.pass_count = pass_count;
+    let mut changed = DirtyColumns::default();
 
-    if entry.image_name != snapshot.image_name {
+    let image_name_changed = entry.image_name != snapshot.image_name;
+    let bitness_changed = entry.is_32_bit != snapshot.is_32_bit;
+    if image_name_changed {
         entry.image_name.clone_from(&snapshot.image_name);
         entry.image_name_lower = snapshot.image_name_lower.clone();
-        entry.dirty_columns.mark(ColumnId::ImageName);
     }
-    if entry.is_32_bit != snapshot.is_32_bit {
+    if bitness_changed {
         entry.is_32_bit = snapshot.is_32_bit;
-        entry.dirty_columns.mark(ColumnId::ImageName);
+    }
+    if image_name_changed || bitness_changed {
+        entry.copy_display_column_from(snapshot, ColumnId::ImageName);
+        mark_process_column_changed(entry, &mut changed, ColumnId::ImageName);
     }
     if entry.pid != snapshot.pid {
         entry.pid = snapshot.pid;
-        entry.dirty_columns.mark(ColumnId::Pid);
+        entry.copy_display_column_from(snapshot, ColumnId::Pid);
+        mark_process_column_changed(entry, &mut changed, ColumnId::Pid);
     }
     if entry.user_name != snapshot.user_name {
         entry.user_name.clone_from(&snapshot.user_name);
         entry.user_name_lower = snapshot.user_name_lower.clone();
-        entry.dirty_columns.mark(ColumnId::Username);
+        entry.copy_display_column_from(snapshot, ColumnId::Username);
+        mark_process_column_changed(entry, &mut changed, ColumnId::Username);
     }
     if entry.session_id != snapshot.session_id {
         entry.session_id = snapshot.session_id;
-        entry.dirty_columns.mark(ColumnId::SessionId);
+        entry.copy_display_column_from(snapshot, ColumnId::SessionId);
+        mark_process_column_changed(entry, &mut changed, ColumnId::SessionId);
     }
     if entry.cpu != snapshot.cpu {
         entry.cpu = snapshot.cpu;
-        entry.dirty_columns.mark(ColumnId::Cpu);
+        entry.copy_display_column_from(snapshot, ColumnId::Cpu);
+        mark_process_column_changed(entry, &mut changed, ColumnId::Cpu);
     }
     if entry.cpu_time_100ns != snapshot.cpu_time_100ns {
         entry.cpu_time_100ns = snapshot.cpu_time_100ns;
     }
     if entry.display_cpu_time_100ns != snapshot.display_cpu_time_100ns {
         entry.display_cpu_time_100ns = snapshot.display_cpu_time_100ns;
-        entry.dirty_columns.mark(ColumnId::CpuTime);
+        entry.copy_display_column_from(snapshot, ColumnId::CpuTime);
+        mark_process_column_changed(entry, &mut changed, ColumnId::CpuTime);
     }
     if entry.mem_usage_kb != snapshot.mem_usage_kb {
         entry.mem_usage_kb = snapshot.mem_usage_kb;
-        entry.dirty_columns.mark(ColumnId::MemUsage);
+        entry.copy_display_column_from(snapshot, ColumnId::MemUsage);
+        mark_process_column_changed(entry, &mut changed, ColumnId::MemUsage);
     }
     if entry.mem_diff_kb != snapshot.mem_diff_kb {
         entry.mem_diff_kb = snapshot.mem_diff_kb;
-        entry.dirty_columns.mark(ColumnId::MemUsageDiff);
+        entry.copy_display_column_from(snapshot, ColumnId::MemUsageDiff);
+        mark_process_column_changed(entry, &mut changed, ColumnId::MemUsageDiff);
     }
     if entry.page_faults != snapshot.page_faults {
         entry.page_faults = snapshot.page_faults;
-        entry.dirty_columns.mark(ColumnId::PageFaults);
+        entry.copy_display_column_from(snapshot, ColumnId::PageFaults);
+        mark_process_column_changed(entry, &mut changed, ColumnId::PageFaults);
     }
     if entry.page_faults_diff != snapshot.page_faults_diff {
         entry.page_faults_diff = snapshot.page_faults_diff;
-        entry.dirty_columns.mark(ColumnId::PageFaultsDiff);
+        entry.copy_display_column_from(snapshot, ColumnId::PageFaultsDiff);
+        mark_process_column_changed(entry, &mut changed, ColumnId::PageFaultsDiff);
     }
     if entry.commit_charge_kb != snapshot.commit_charge_kb {
         entry.commit_charge_kb = snapshot.commit_charge_kb;
-        entry.dirty_columns.mark(ColumnId::CommitCharge);
+        entry.copy_display_column_from(snapshot, ColumnId::CommitCharge);
+        mark_process_column_changed(entry, &mut changed, ColumnId::CommitCharge);
     }
     if entry.paged_pool_kb != snapshot.paged_pool_kb {
         entry.paged_pool_kb = snapshot.paged_pool_kb;
-        entry.dirty_columns.mark(ColumnId::PagedPool);
+        entry.copy_display_column_from(snapshot, ColumnId::PagedPool);
+        mark_process_column_changed(entry, &mut changed, ColumnId::PagedPool);
     }
     if entry.nonpaged_pool_kb != snapshot.nonpaged_pool_kb {
         entry.nonpaged_pool_kb = snapshot.nonpaged_pool_kb;
-        entry.dirty_columns.mark(ColumnId::NonPagedPool);
+        entry.copy_display_column_from(snapshot, ColumnId::NonPagedPool);
+        mark_process_column_changed(entry, &mut changed, ColumnId::NonPagedPool);
     }
     if entry.priority_class != snapshot.priority_class {
         entry.priority_class = snapshot.priority_class;
-        entry.dirty_columns.mark(ColumnId::BasePriority);
+        mark_process_column_changed(entry, &mut changed, ColumnId::BasePriority);
     }
     if entry.handle_count != snapshot.handle_count {
         entry.handle_count = snapshot.handle_count;
-        entry.dirty_columns.mark(ColumnId::HandleCount);
+        entry.copy_display_column_from(snapshot, ColumnId::HandleCount);
+        mark_process_column_changed(entry, &mut changed, ColumnId::HandleCount);
     }
     if entry.thread_count != snapshot.thread_count {
         entry.thread_count = snapshot.thread_count;
-        entry.dirty_columns.mark(ColumnId::ThreadCount);
+        entry.copy_display_column_from(snapshot, ColumnId::ThreadCount);
+        mark_process_column_changed(entry, &mut changed, ColumnId::ThreadCount);
     }
+
+    changed
+}
+
+fn mark_process_column_changed(
+    entry: &mut ProcEntry,
+    changed: &mut DirtyColumns,
+    column_id: ColumnId,
+) {
+    entry.dirty_columns.mark(column_id);
+    changed.mark(column_id);
 }
 
 #[cfg(test)]
@@ -3129,7 +3093,7 @@ mod tests {
     }
 
     #[test]
-    fn wts_fallback_rejects_stale_image_or_session() {
+    fn wts_identity_source_rejects_stale_image_or_session() {
         let identity = WtsProcessIdentity {
             user_name: Some("SYSTEM".to_string()),
             session_id: 0,

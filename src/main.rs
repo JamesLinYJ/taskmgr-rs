@@ -6,6 +6,7 @@
 mod app;
 mod app_controllers;
 mod assets;
+mod background_worker;
 mod chart_renderer;
 mod cpu_sampler;
 mod dialog_templates;

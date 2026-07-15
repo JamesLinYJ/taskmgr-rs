@@ -3,7 +3,7 @@
 //! 再交给 Win32 的 `CreateDialogIndirectParamW` / `DialogBoxIndirectParamW` 创建。
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM};
-use windows_sys::Win32::UI::Controls::{LVS_REPORT, LVS_SINGLESEL};
+use windows_sys::Win32::UI::Controls::{LVS_OWNERDATA, LVS_REPORT, LVS_SINGLESEL};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateDialogIndirectParamW, DialogBoxIndirectParamW, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON,
     BS_GROUPBOX, BS_OWNERDRAW, ES_AUTOVSCROLL, ES_MULTILINE, SBS_VERT, WS_BORDER, WS_CAPTION,
@@ -404,7 +404,13 @@ fn build_process_dialog() -> DialogSpec<'static> {
                 class_name: "SysListView32",
                 text: "List2",
                 id: IDC_PROCLIST as u16,
-                style: WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL,
+                style: WS_CHILD
+                    | WS_VISIBLE
+                    | WS_BORDER
+                    | WS_TABSTOP
+                    | LVS_REPORT
+                    | LVS_SINGLESEL
+                    | LVS_OWNERDATA,
                 ex_style: 0,
                 x: 9,
                 y: 9,
@@ -866,9 +872,10 @@ pub fn dialog_box(
 mod tests {
     use super::{dialog_spec, DialogTemplateBuilder};
     use crate::resource::{
-        IDD_AFFINITY, IDD_MAINWND, IDD_MESSAGE, IDD_NETPAGE, IDD_PERFPAGE, IDD_PROCPAGE,
-        IDD_SELECTPROCCOLS, IDD_TASKPAGE, IDD_USERSPAGE,
+        IDC_NICTOTALS, IDC_PROCLIST, IDC_TASKLIST, IDD_AFFINITY, IDD_MAINWND, IDD_MESSAGE,
+        IDD_NETPAGE, IDD_PERFPAGE, IDD_PROCPAGE, IDD_SELECTPROCCOLS, IDD_TASKPAGE, IDD_USERSPAGE,
     };
+    use windows_sys::Win32::UI::Controls::LVS_OWNERDATA;
 
     #[test]
     fn generated_dialog_templates_are_dword_aligned() {
@@ -889,6 +896,25 @@ mod tests {
                 (template.as_ptr() as usize) % std::mem::align_of::<u32>(),
                 0
             );
+        }
+    }
+
+    #[test]
+    fn only_the_process_list_uses_owner_data_storage() {
+        let cases = [
+            (IDD_PROCPAGE, IDC_PROCLIST, true),
+            (IDD_TASKPAGE, IDC_TASKLIST, false),
+            (IDD_NETPAGE, IDC_NICTOTALS, false),
+        ];
+
+        for (dialog_id, control_id, expected) in cases {
+            let spec = dialog_spec(dialog_id).unwrap();
+            let control = spec
+                .controls
+                .iter()
+                .find(|control| control.id == control_id as u16)
+                .unwrap();
+            assert_eq!((control.style & LVS_OWNERDATA) != 0, expected);
         }
     }
 }

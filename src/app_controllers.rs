@@ -7,12 +7,16 @@
 //! - MenuController：菜单弹出/跟踪状态机
 //! - WindowModeController：无标题模式与置顶模式
 
+use std::cell::Cell;
 use std::mem::{size_of, zeroed};
-use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Foundation::{
+    GetLastError, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_INVALID_STATE, HWND,
+};
 use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{HICON, HMENU, LR_DEFAULTCOLOR, LR_DEFAULTSIZE};
 
@@ -22,7 +26,9 @@ use crate::cpu_sampler::{
 };
 use crate::perfpage::PerformanceSnapshot;
 use crate::resource::PWM_TRAYICON;
-use crate::winutil::{destroy_icon_handle, format_resource_string, to_wide_null};
+use crate::winutil::{
+    destroy_icon_handle, format_resource_string, record_win32_error, to_wide_null,
+};
 
 const NOTIFY_ICON_TIP_CAPACITY: usize = 128;
 
@@ -39,6 +45,7 @@ pub struct RuntimeStatsController {
     previous_kernel: u64,
     previous_user: u64,
     processor_info: Vec<ProcessorPerformance>,
+    last_refresh_error: Option<u32>,
 }
 
 impl RuntimeStatsController {
@@ -48,57 +55,67 @@ impl RuntimeStatsController {
         self.mem_limit_kb = snapshot.mem_limit_kb;
         self.process_count = snapshot.process_count;
         self.processor_count = snapshot.processor_count;
+        self.last_refresh_error = None;
     }
 
     pub fn refresh_runtime_stats(&mut self) {
-        // 安全性: all Win32 calls write into initialized local output buffers.
-        unsafe {
-            if query_processor_performance(self.processor_count.max(1), &mut self.processor_info)
-                .is_ok()
-                && !self.processor_info.is_empty()
-            {
-                let processor_count_changed = self.processor_count != self.processor_info.len();
-                self.processor_count = self.processor_info.len();
-                let (idle_value, kernel_value, user_value) =
-                    summed_processor_times(&self.processor_info);
-
-                if processor_count_changed {
-                    self.previous_idle = 0;
-                    self.previous_kernel = 0;
-                    self.previous_user = 0;
+        match self.collect_runtime_stats() {
+            Ok(()) => self.last_refresh_error = None,
+            Err(error) => {
+                if self.last_refresh_error != Some(error) {
+                    record_win32_error("runtime stats refresh", error);
                 }
-
-                if self.previous_idle != 0 {
-                    let delta_idle = idle_value.saturating_sub(self.previous_idle);
-                    let delta_total = kernel_value
-                        .saturating_sub(self.previous_kernel)
-                        .saturating_add(user_value.saturating_sub(self.previous_user));
-
-                    if delta_total != 0 {
-                        let active_ticks = delta_total.saturating_sub(delta_idle);
-                        self.cpu_usage =
-                            ((active_ticks.saturating_mul(100)) / delta_total).min(100) as u8;
-                    }
-                }
-
-                self.previous_idle = idle_value;
-                self.previous_kernel = kernel_value;
-                self.previous_user = user_value;
+                self.last_refresh_error = Some(error);
             }
+        }
+    }
 
-            let mut memory = MEMORYSTATUSEX {
-                dwLength: size_of::<MEMORYSTATUSEX>() as u32,
-                ..zeroed()
-            };
-            if GlobalMemoryStatusEx(&mut memory) != 0 {
-                self.mem_usage_kb = memory.ullTotalPhys.saturating_sub(memory.ullAvailPhys) / 1024;
-                self.mem_limit_kb = memory.ullTotalPhys / 1024;
+    fn collect_runtime_stats(&mut self) -> Result<(), u32> {
+        // Query every component into local storage first. A failed component leaves the previous
+        // coherent summary untouched instead of mixing values from different refreshes.
+        let mut processor_info = Vec::with_capacity(self.processor_info.len().max(1));
+        query_processor_performance(self.processor_count.max(1), &mut processor_info)
+            .map_err(|status| status as u32)?;
+        if processor_info.is_empty() {
+            return Err(ERROR_INVALID_DATA);
+        }
+
+        let mut memory = unsafe { zeroed::<MEMORYSTATUSEX>() };
+        memory.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut memory) } == 0 {
+            return Err(last_error_or_gen_failure());
+        }
+        let process_count = process_count()?;
+
+        let processor_count_changed = self.processor_count != processor_info.len();
+        let (idle_value, kernel_value, user_value) = summed_processor_times(&processor_info);
+        let (previous_idle, previous_kernel, previous_user) = if processor_count_changed {
+            (0, 0, 0)
+        } else {
+            (self.previous_idle, self.previous_kernel, self.previous_user)
+        };
+        let mut cpu_usage = self.cpu_usage;
+        if previous_idle != 0 {
+            let delta_idle = idle_value.saturating_sub(previous_idle);
+            let delta_total = kernel_value
+                .saturating_sub(previous_kernel)
+                .saturating_add(user_value.saturating_sub(previous_user));
+            if delta_total != 0 {
+                let active_ticks = delta_total.saturating_sub(delta_idle);
+                cpu_usage = ((active_ticks.saturating_mul(100)) / delta_total).min(100) as u8;
             }
         }
 
-        if let Some(process_count) = process_count() {
-            self.process_count = process_count;
-        }
+        self.cpu_usage = cpu_usage;
+        self.mem_usage_kb = memory.ullTotalPhys.saturating_sub(memory.ullAvailPhys) / 1024;
+        self.mem_limit_kb = memory.ullTotalPhys / 1024;
+        self.process_count = process_count;
+        self.processor_count = processor_info.len();
+        self.previous_idle = idle_value;
+        self.previous_kernel = kernel_value;
+        self.previous_user = user_value;
+        self.processor_info = processor_info;
+        Ok(())
     }
 }
 
@@ -106,12 +123,16 @@ impl RuntimeStatsController {
 /// 管理 12 级 CPU 占用图标和通知区域提示文本。
 pub struct TrayController {
     icons: Vec<HICON>,
+    registered: Cell<bool>,
+    last_error: Cell<Option<u32>>,
 }
 
 impl Default for TrayController {
     fn default() -> Self {
         Self {
             icons: Vec::with_capacity(TRAY_ICON_RESOURCES.len()),
+            registered: Cell::new(false),
+            last_error: Cell::new(None),
         }
     }
 }
@@ -145,6 +166,14 @@ impl TrayController {
     }
 
     pub fn update_tray(&self, main_hwnd: HWND, command: u32, icon: HICON, tip: &str) {
+        if command == NIM_DELETE && !self.registered.get() {
+            return;
+        }
+        if command == NIM_MODIFY && !self.registered.get() {
+            self.record_tray_error(ERROR_INVALID_STATE);
+            return;
+        }
+
         // 安全性: `NOTIFYICONDATAW` is a Win32 POD struct where zero-initialization is valid.
         let mut data = unsafe { zeroed::<NOTIFYICONDATAW>() };
         data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
@@ -163,7 +192,24 @@ impl TrayController {
         }
 
         // 安全性: `data` is fully initialized for Shell_NotifyIconW and lives through the call.
-        unsafe { Shell_NotifyIconW(command, &data) };
+        if unsafe { Shell_NotifyIconW(command, &data) } == 0 {
+            let error = unsafe { GetLastError() };
+            self.record_tray_error(if error == 0 { ERROR_GEN_FAILURE } else { error });
+            return;
+        }
+
+        if command == NIM_ADD {
+            self.registered.set(true);
+        } else if command == NIM_DELETE {
+            self.registered.set(false);
+        }
+        self.last_error.set(None);
+    }
+
+    fn record_tray_error(&self, error: u32) {
+        if self.last_error.replace(Some(error)) != Some(error) {
+            record_win32_error("notification area icon update", error);
+        }
     }
 
     pub fn refresh_icon(&self, main_hwnd: HWND, cpu_usage: u8, fmt_cpu: &str) {
@@ -291,12 +337,21 @@ impl WindowModeController {
     }
 }
 
-fn process_count() -> Option<u32> {
+fn process_count() -> Result<u32, u32> {
     let mut perf = unsafe { zeroed::<PERFORMANCE_INFORMATION>() };
     perf.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
     if unsafe { K32GetPerformanceInfo(&mut perf, perf.cb) } == 0 {
-        return None;
+        return Err(last_error_or_gen_failure());
     }
 
-    Some(perf.ProcessCount)
+    Ok(perf.ProcessCount)
+}
+
+fn last_error_or_gen_failure() -> u32 {
+    let error = unsafe { GetLastError() };
+    if error == 0 {
+        ERROR_GEN_FAILURE
+    } else {
+        error
+    }
 }

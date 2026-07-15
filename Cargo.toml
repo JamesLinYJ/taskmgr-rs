@@ -16,9 +16,9 @@ OriginalFilename = "taskmgr.exe"
 CompanyName = "JamesLinYJ"
 LegalCopyright = "GNU General Public License v2.0"
 
-# 发布配置偏向生成体积更小、更接近系统工具风格的可执行文件。
+# 任务管理器的采样、排序和绘图都在长期热路径上，发布构建优先运行效率。
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
@@ -37,6 +37,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Environment",
@@ -60,6 +61,8 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
 ] }
 windows-numerics = "0.3.1"
 

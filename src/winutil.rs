@@ -11,8 +11,8 @@ use std::ptr::NonNull;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, SetLastError, ERROR_NOT_ALL_ASSIGNED, HANDLE, HWND,
-    INVALID_HANDLE_VALUE, LPARAM, RECT, WPARAM,
+    CloseHandle, GetLastError, SetLastError, ERROR_GEN_FAILURE, ERROR_INVALID_HANDLE,
+    ERROR_NOT_ALL_ASSIGNED, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     CombineRgn, CreateRectRgn, CreateSolidBrush, DeleteObject, FillRgn, GetSysColor,
@@ -75,6 +75,15 @@ pub fn destroy_icon_handle(icon: HICON) {
 pub fn record_win32_error(component: &str, error: u32) {
     let message = to_wide_null(&format!(
         "rtaskmgr: {component} failed with Win32 error {error}\r\n"
+    ));
+    // 安全性: `message` is null-terminated and remains alive for the synchronous call.
+    unsafe { OutputDebugStringW(message.as_ptr()) };
+}
+
+pub fn record_hresult_error(component: &str, error: i32) {
+    let message = to_wide_null(&format!(
+        "rtaskmgr: {component} failed with HRESULT 0x{:08X}\r\n",
+        error as u32
     ));
     // 安全性: `message` is null-terminated and remains alive for the synchronous call.
     unsafe { OutputDebugStringW(message.as_ptr()) };
@@ -302,10 +311,21 @@ pub fn format_resource_string(template: &str, values: &[String]) -> String {
     rendered
 }
 
-fn set_window_long_ptr_value(hwnd: HWND, index: i32, value: isize) -> isize {
+fn set_window_long_ptr_value(hwnd: HWND, index: i32, value: isize) -> Result<isize, u32> {
     // 安全性: the caller supplies the target HWND/index/value tuple; this helper performs the
-    // raw Win32 slot write and returns the previous value without creating references.
-    unsafe { SetWindowLongPtrW(hwnd, index, value as _) as isize }
+    // raw Win32 slot write and returns the previous value without creating references. A zero
+    // previous value is valid, so LastError must be cleared before the call.
+    unsafe {
+        SetLastError(0);
+        let previous = SetWindowLongPtrW(hwnd, index, value as _) as isize;
+        if previous == 0 {
+            let error = GetLastError();
+            if error != 0 {
+                return Err(error);
+            }
+        }
+        Ok(previous)
+    }
 }
 
 fn get_window_long_ptr_value(hwnd: HWND, index: i32) -> isize {
@@ -315,7 +335,9 @@ fn get_window_long_ptr_value(hwnd: HWND, index: i32) -> isize {
 }
 
 pub fn set_window_userdata(hwnd: HWND, value: isize) {
-    let _ = set_window_long_ptr_value(hwnd, GWLP_USERDATA, value);
+    if let Err(error) = set_window_long_ptr_value(hwnd, GWLP_USERDATA, value) {
+        record_win32_error("window user-data update", error);
+    }
 }
 
 pub fn get_window_userdata(hwnd: HWND) -> isize {
@@ -335,11 +357,15 @@ pub fn window_userdata_non_null<T>(hwnd: HWND) -> Option<NonNull<T>> {
 }
 
 pub fn set_style(hwnd: HWND, style: u32) {
-    let _ = set_window_long_ptr_value(hwnd, GWL_STYLE, style as isize);
+    if let Err(error) = set_window_long_ptr_value(hwnd, GWL_STYLE, style as isize) {
+        record_win32_error("window style update", error);
+    }
 }
 
 pub fn set_dialog_msg_result(hwnd: HWND, value: isize) {
-    let _ = set_window_long_ptr_value(hwnd, DWLP_MSGRESULT as i32, value);
+    if let Err(error) = set_window_long_ptr_value(hwnd, DWLP_MSGRESULT as i32, value) {
+        record_win32_error("dialog message result update", error);
+    }
 }
 
 pub fn width(rect: &RECT) -> i32 {
@@ -446,21 +472,31 @@ pub fn finish_list_view_update(hwnd: HWND) {
     finish_list_view_update_internal(hwnd, true);
 }
 
-pub fn is_32_bit_process_handle(handle: HANDLE) -> bool {
+pub fn is_32_bit_process_handle(handle: HANDLE) -> Result<bool, u32> {
     if handle.is_null() {
-        return false;
+        return Err(ERROR_INVALID_HANDLE);
     }
 
     let mut wow64 = 0;
     // 安全性: `handle` is checked non-null and only queried; `wow64` is a valid out parameter.
-    unsafe { IsWow64Process(handle, &raw mut wow64) != 0 && wow64 != 0 }
+    if unsafe { IsWow64Process(handle, &raw mut wow64) } == 0 {
+        let error = unsafe { GetLastError() };
+        Err(if error == 0 { ERROR_GEN_FAILURE } else { error })
+    } else {
+        Ok(wow64 != 0)
+    }
 }
 
-pub fn is_32_bit_process_pid(pid: u32) -> bool {
+pub fn is_32_bit_process_pid(pid: u32) -> Result<bool, u32> {
     // 只为了查询位数时，打开最低限度的查询句柄即可，减少权限失败的概率。
-    // 安全性: opening a process for query-only access; failure is represented as `None`.
-    OwnedHandle::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })
-        .is_some_and(|handle| is_32_bit_process_handle(handle.as_raw()))
+    // 安全性: opening a process for query-only access; the owned wrapper closes it on return.
+    let Some(handle) =
+        OwnedHandle::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })
+    else {
+        let error = unsafe { GetLastError() };
+        return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+    };
+    is_32_bit_process_handle(handle.as_raw())
 }
 
 pub fn append_32_bit_suffix(label: &str, is_32_bit: bool) -> Cow<'_, str> {
