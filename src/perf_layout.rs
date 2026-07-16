@@ -96,26 +96,31 @@ pub fn compute_perf_layout(
         bottom: mem_top + spacing.top_spacing + graph_height,
     };
 
-    let mut pane_total_width = (parent_rect.right - parent_rect.left)
-        - (anchors.cpu_history_frame.left - parent_rect.left)
-        - spacing.def_spacing * 2
-        - spacing.inner_spacing * 3;
-    pane_total_width = pane_total_width.max(0);
-
+    let pane_area_left = anchors.cpu_history_frame.left + spacing.inner_spacing * 2;
+    let pane_area_top = anchors.cpu_history_frame.top + spacing.top_spacing;
+    let pane_area_width =
+        (parent_rect.right - spacing.def_spacing * 2 - spacing.inner_spacing * 2 - pane_area_left)
+            .max(0);
     let mut cpu_pane_rects = Vec::with_capacity(pane_count);
     if pane_count > 0 {
-        let mut pane_width = pane_total_width - pane_count as i32 * spacing.inner_spacing;
-        pane_width = (pane_width / pane_count as i32).max(0);
+        let grid = choose_pane_grid(
+            pane_count,
+            pane_area_width,
+            graph_height,
+            spacing.inner_spacing,
+        );
 
         for pane_index in 0..pane_count {
-            let left = anchors.cpu_history_frame.left
-                + spacing.inner_spacing * (pane_index as i32 + 2)
-                + pane_width * pane_index as i32;
+            let row = pane_index / grid.columns;
+            let column = pane_index % grid.columns;
+            let (x, width) =
+                partition_extent(pane_area_width, grid.columns, column, spacing.inner_spacing);
+            let (y, height) = partition_extent(graph_height, grid.rows, row, spacing.inner_spacing);
             cpu_pane_rects.push(RECT {
-                left,
-                top: anchors.cpu_history_frame.top + spacing.top_spacing,
-                right: left + pane_width,
-                bottom: anchors.cpu_history_frame.top + spacing.top_spacing + graph_height,
+                left: pane_area_left + x,
+                top: pane_area_top + y,
+                right: pane_area_left + x + width,
+                bottom: pane_area_top + y + height,
             });
         }
     }
@@ -160,6 +165,60 @@ pub fn next_graph_surface_extent(current: i32, required: i32, quantum: i32) -> i
 
 fn rect_width(rect: RECT) -> i32 {
     rect.right - rect.left
+}
+
+#[derive(Clone, Copy)]
+struct PaneGrid {
+    columns: usize,
+    rows: usize,
+}
+
+fn choose_pane_grid(count: usize, width: i32, height: i32, gap: i32) -> PaneGrid {
+    let mut best = PaneGrid {
+        columns: 1,
+        rows: count.max(1),
+    };
+    let mut best_score = i64::MAX;
+
+    for columns in 1..=count.max(1) {
+        let rows = count.div_ceil(columns).max(1);
+        let usable_width = width - gap.saturating_mul(columns.saturating_sub(1) as i32);
+        let usable_height = height - gap.saturating_mul(rows.saturating_sub(1) as i32);
+        if usable_width <= 0 || usable_height <= 0 {
+            continue;
+        }
+
+        let pane_width = usable_width / columns as i32;
+        let pane_height = usable_height / rows as i32;
+        if pane_width <= 0 || pane_height <= 0 {
+            continue;
+        }
+
+        let longer_side = i64::from(pane_width.max(pane_height));
+        let aspect_error = i64::from((pane_width - pane_height).abs()) * 1024 / longer_side;
+        let unused_slots = columns * rows - count;
+        let score = aspect_error + unused_slots as i64 * 32;
+        if score < best_score
+            || (score == best_score && unused_slots < best.columns * best.rows - count)
+        {
+            best = PaneGrid { columns, rows };
+            best_score = score;
+        }
+    }
+
+    best
+}
+
+fn partition_extent(total: i32, parts: usize, index: usize, gap: i32) -> (i32, i32) {
+    let parts = parts.max(1);
+    let usable = (total - gap.saturating_mul(parts.saturating_sub(1) as i32)).max(0);
+    let base = usable / parts as i32;
+    let remainder = usable % parts as i32;
+    let index = index.min(parts - 1) as i32;
+    let extra_before = index.min(remainder);
+    let start = index * (base + gap) + extra_before;
+    let size = base + i32::from(index < remainder);
+    (start, size)
 }
 
 #[cfg(test)]
@@ -221,5 +280,38 @@ mod tests {
 
         assert_eq!(layout.mem_graph_rect.left, layout.mem_frame_rect.left + 6);
         assert_eq!(layout.mem_graph_rect.right, layout.mem_frame_rect.right - 6);
+    }
+
+    #[test]
+    fn many_cpu_panes_form_a_non_overlapping_grid() {
+        let layout = compute_perf_layout(
+            rect(0, 0, 800, 400),
+            sample_anchors(),
+            sample_spacing(),
+            32,
+            false,
+        );
+
+        assert_eq!(layout.cpu_pane_rects.len(), 32);
+        assert!(
+            layout
+                .cpu_pane_rects
+                .iter()
+                .map(|rect| rect.top)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1
+        );
+        for (index, pane) in layout.cpu_pane_rects.iter().enumerate() {
+            assert!(pane.right > pane.left);
+            assert!(pane.bottom > pane.top);
+            for other in &layout.cpu_pane_rects[index + 1..] {
+                let overlaps = pane.left < other.right
+                    && pane.right > other.left
+                    && pane.top < other.bottom
+                    && pane.bottom > other.top;
+                assert!(!overlaps);
+            }
+        }
     }
 }

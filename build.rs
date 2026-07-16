@@ -9,6 +9,9 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[allow(dead_code)]
+#[path = "src/resource.rs"]
+mod resource;
 #[path = "src/text_key_parser.rs"]
 mod text_key_parser;
 use text_key_parser::parse_text_keys_from_source;
@@ -59,21 +62,21 @@ const MENU_STATUS_HELP_KEYS: &[(&str, &str)] = &[
     ),
 ];
 
-const EMBEDDED_ICON_RESOURCES: &[(&str, &str)] = &[
-    ("APP_MAIN_ICON", "main.ico"),
-    ("APP_DEFAULT_ICON", "default.ico"),
-    ("APP_TRAY_0_ICON", "tray0.ico"),
-    ("APP_TRAY_1_ICON", "tray1.ico"),
-    ("APP_TRAY_2_ICON", "tray2.ico"),
-    ("APP_TRAY_3_ICON", "tray3.ico"),
-    ("APP_TRAY_4_ICON", "tray4.ico"),
-    ("APP_TRAY_5_ICON", "tray5.ico"),
-    ("APP_TRAY_6_ICON", "tray6.ico"),
-    ("APP_TRAY_7_ICON", "tray7.ico"),
-    ("APP_TRAY_8_ICON", "tray8.ico"),
-    ("APP_TRAY_9_ICON", "tray9.ico"),
-    ("APP_TRAY_10_ICON", "tray10.ico"),
-    ("APP_TRAY_11_ICON", "tray11.ico"),
+const EMBEDDED_ICON_RESOURCES: &[(u16, &str)] = &[
+    (resource::IDI_MAIN, "main.ico"),
+    (resource::IDI_DEFAULT, "default.ico"),
+    (resource::IDI_TRAY0, "tray0.ico"),
+    (resource::IDI_TRAY1, "tray1.ico"),
+    (resource::IDI_TRAY2, "tray2.ico"),
+    (resource::IDI_TRAY3, "tray3.ico"),
+    (resource::IDI_TRAY4, "tray4.ico"),
+    (resource::IDI_TRAY5, "tray5.ico"),
+    (resource::IDI_TRAY6, "tray6.ico"),
+    (resource::IDI_TRAY7, "tray7.ico"),
+    (resource::IDI_TRAY8, "tray8.ico"),
+    (resource::IDI_TRAY9, "tray9.ico"),
+    (resource::IDI_TRAY10, "tray10.ico"),
+    (resource::IDI_TRAY11, "tray11.ico"),
 ];
 
 const EMBEDDED_BITMAP_RESOURCES: &[(&str, &str)] = &[
@@ -103,7 +106,6 @@ fn main() {
     let profile = env::var("PROFILE").unwrap_or_default();
 
     let mut resources = winres::WindowsResource::new();
-    resources.set_icon("main.ico");
     append_embedded_assets(&mut resources);
     if let Err(error) = resources.compile() {
         panic!("failed to compile Windows icon resources: {error}");
@@ -129,9 +131,9 @@ fn main() {
 fn append_embedded_assets(resources: &mut winres::WindowsResource) {
     let mut rc_content = String::new();
 
-    for (resource_name, file_name) in EMBEDDED_ICON_RESOURCES {
+    for (resource_id, file_name) in EMBEDDED_ICON_RESOURCES {
         println!("cargo:rerun-if-changed={file_name}");
-        writeln!(rc_content, "{resource_name} ICON \"{file_name}\"").unwrap();
+        writeln!(rc_content, "{resource_id} ICON \"{file_name}\"").unwrap();
     }
 
     for (resource_name, file_name) in EMBEDDED_BITMAP_RESOURCES {
@@ -175,22 +177,18 @@ fn generate_localization() {
         let locale_path = localization_dir.join(format!("{locale_name}.toml"));
         let source = fs::read_to_string(&locale_path)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", locale_path.display()));
-        let value = source
-            .parse::<toml::Value>()
+        let table = toml::from_str::<toml::Table>(&source)
             .unwrap_or_else(|error| panic!("invalid TOML in {}: {error}", locale_path.display()));
-        let table = value
-            .as_table()
-            .unwrap_or_else(|| panic!("{} must contain a TOML table", locale_path.display()));
 
         let text = read_string_table(
-            table,
+            &table,
             "text",
             &text_keys,
             &locale_path,
             RejectStyle::TextKey,
         );
         let menu_status_help = read_string_table(
-            table,
+            &table,
             "menu_status_help",
             &menu_keys,
             &locale_path,

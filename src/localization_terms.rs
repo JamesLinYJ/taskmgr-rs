@@ -1,4 +1,4 @@
-use crate::language::{text, TextKey};
+use crate::language::{TextKey, text};
 
 // 多处复用的术语集中在这里，避免不同页面使用不一致的翻译。
 

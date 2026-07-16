@@ -11,43 +11,47 @@ use std::ptr::NonNull;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, SetLastError, ERROR_GEN_FAILURE, ERROR_INVALID_HANDLE,
-    ERROR_NOT_ALL_ASSIGNED, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, RECT, WPARAM,
+    CloseHandle, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_INVALID_HANDLE,
+    ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, RECT,
+    SetLastError, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    CombineRgn, CreateRectRgn, CreateSolidBrush, DeleteObject, FillRgn, GetSysColor,
-    InvalidateRect, MapWindowPoints, SetRectRgn, COLOR_WINDOW, HBRUSH, HDC, HRGN, RGN_DIFF, RGN_OR,
+    COLOR_WINDOW, CombineRgn, CreateRectRgn, CreateSolidBrush, DeleteObject, FillRgn, GetSysColor,
+    HBRUSH, HDC, HRGN, InvalidateRect, MapWindowPoints, RGN_DIFF, RGN_OR, SetRectRgn,
 };
 use windows_sys::Win32::Security::{
-    AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, TokenElevation,
-    LUID_AND_ATTRIBUTES, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES,
-    TOKEN_ELEVATION, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    AdjustTokenPrivileges, GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+    SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION,
+    TOKEN_PRIVILEGES, TOKEN_QUERY, TokenElevation,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows_sys::Win32::System::RemoteDesktop::WTSFreeMemory;
-use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, IsWow64Process, OpenProcess, OpenProcessToken,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+use windows_sys::Win32::System::SystemInformation::{
+    IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM, IMAGE_FILE_MACHINE_ARM64,
+    IMAGE_FILE_MACHINE_ARMNT, IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_IA64,
+    IMAGE_FILE_MACHINE_THUMB, IMAGE_FILE_MACHINE_UNKNOWN,
 };
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, IsWow64Process2, OpenProcessToken};
 use windows_sys::Win32::UI::Controls::{
-    LVIR_BOUNDS, LVM_GETCOUNTPERPAGE, LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETTOPINDEX,
+    HDN_BEGINDRAG, HDN_ENDDRAG, LVIR_BOUNDS, LVM_GETCOUNTPERPAGE, LVM_GETITEMCOUNT,
+    LVM_GETITEMRECT, LVM_GETTOPINDEX, LVS_EX_HEADERDRAGDROP, NMHEADERW,
 };
 use windows_sys::Win32::UI::Shell::{
     DefSubclassProc, GetWindowSubclass, RemoveWindowSubclass, SetWindowSubclass,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, DeleteMenu, DestroyIcon, DestroyMenu, EnableMenuItem, GetClientRect,
-    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, SendMessageW, SetWindowLongPtrW,
-    DWLP_MSGRESULT, GWLP_USERDATA, GWL_STYLE, HICON, HMENU, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED,
-    SM_CXEDGE, WM_ERASEBKGND, WM_NCDESTROY, WM_SETREDRAW, WM_SYSCOLORCHANGE, WNDPROC,
+    CallWindowProcW, DWLP_MSGRESULT, DeleteMenu, DestroyIcon, EnableMenuItem, GWL_STYLE,
+    GWLP_USERDATA, GetClientRect, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HICON, HMENU,
+    MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, SM_CXEDGE, SendMessageW, SetWindowLongPtrW, WM_ERASEBKGND,
+    WM_NCDESTROY, WM_NOTIFY, WM_SETREDRAW, WM_SYSCOLORCHANGE, WNDPROC,
 };
 
-use crate::language::{text, TextKey};
-use crate::resource::{IDM_ALLCPUS, IDM_MULTIGRAPH, IDM_RUN, STATIC_CPU_GRAPH_COUNT};
+use crate::language::{TextKey, text};
+use crate::resource::{IDM_ALLCPUS, IDM_MULTIGRAPH, IDM_RUN};
 
 const REST_NORUN: u32 = 0x0000_0001;
 const LVM_SETEXTENDEDLISTVIEWSTYLE: u32 = 0x1036;
-const LVS_EX_DOUBLEBUFFER: usize = 0x0001_0000;
+const LVS_EX_DOUBLEBUFFER: u32 = 0x0001_0000;
 const LIST_VIEW_SUBCLASS_ID: usize = 0x5254_4D47;
 
 pub struct OwnedHandle {
@@ -56,13 +60,6 @@ pub struct OwnedHandle {
 
 pub struct OwnedWtsMemory<T> {
     ptr: *mut T,
-}
-
-pub fn destroy_menu_handle(menu: HMENU) {
-    if !menu.is_null() {
-        // 安全性: callers pass a raw menu handle they own and want to release.
-        unsafe { DestroyMenu(menu) };
-    }
 }
 
 pub fn destroy_icon_handle(icon: HICON) {
@@ -74,7 +71,7 @@ pub fn destroy_icon_handle(icon: HICON) {
 
 pub fn record_win32_error(component: &str, error: u32) {
     let message = to_wide_null(&format!(
-        "rtaskmgr: {component} failed with Win32 error {error}\r\n"
+        "taskmgr-rs: {component} failed with Win32 error {error}\r\n"
     ));
     // 安全性: `message` is null-terminated and remains alive for the synchronous call.
     unsafe { OutputDebugStringW(message.as_ptr()) };
@@ -82,7 +79,7 @@ pub fn record_win32_error(component: &str, error: u32) {
 
 pub fn record_hresult_error(component: &str, error: i32) {
     let message = to_wide_null(&format!(
-        "rtaskmgr: {component} failed with HRESULT 0x{:08X}\r\n",
+        "taskmgr-rs: {component} failed with HRESULT 0x{:08X}\r\n",
         error as u32
     ));
     // 安全性: `message` is null-terminated and remains alive for the synchronous call.
@@ -91,7 +88,7 @@ pub fn record_hresult_error(component: &str, error: i32) {
 
 pub fn record_ntstatus_error(component: &str, status: i32) {
     let message = to_wide_null(&format!(
-        "rtaskmgr: {component} failed with NTSTATUS 0x{:08X}\r\n",
+        "taskmgr-rs: {component} failed with NTSTATUS 0x{:08X}\r\n",
         status as u32
     ));
     // 安全性: `message` is null-terminated and remains alive for the synchronous call.
@@ -134,11 +131,7 @@ pub fn enable_debug_privilege() -> Result<(), u32> {
         }
 
         let error = GetLastError();
-        if error == 0 {
-            Ok(())
-        } else {
-            Err(error)
-        }
+        if error == 0 { Ok(()) } else { Err(error) }
     }
 }
 
@@ -404,7 +397,7 @@ pub fn sanitize_task_manager_menu(menu: HMENU, processor_count: usize) {
             menu,
             u32::from(IDM_MULTIGRAPH),
             MF_BYCOMMAND
-                | if processor_count <= 1 || processor_count > STATIC_CPU_GRAPH_COUNT {
+                | if processor_count <= 1 {
                     MF_GRAYED
                 } else {
                     MF_ENABLED
@@ -422,11 +415,12 @@ pub fn subclass_list_view(hwnd: HWND) {
     // 安全性: all operations target a live ListView HWND supplied by the caller; ComCtl32 keeps
     // the boxed state pointer as subclass ref-data until WM_NCDESTROY.
     unsafe {
+        let extended_styles = LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP;
         SendMessageW(
             hwnd,
             LVM_SETEXTENDEDLISTVIEWSTYLE,
-            LVS_EX_DOUBLEBUFFER,
-            LVS_EX_DOUBLEBUFFER as isize,
+            extended_styles as usize,
+            extended_styles as isize,
         );
 
         let mut existing_ref_data = 0usize;
@@ -477,26 +471,33 @@ pub fn is_32_bit_process_handle(handle: HANDLE) -> Result<bool, u32> {
         return Err(ERROR_INVALID_HANDLE);
     }
 
-    let mut wow64 = 0;
-    // 安全性: `handle` is checked non-null and only queried; `wow64` is a valid out parameter.
-    if unsafe { IsWow64Process(handle, &raw mut wow64) } == 0 {
+    let mut process_machine = IMAGE_FILE_MACHINE_UNKNOWN;
+    let mut native_machine = IMAGE_FILE_MACHINE_UNKNOWN;
+    // 安全性: `handle` is checked non-null and both machine values are valid out parameters.
+    if unsafe { IsWow64Process2(handle, &mut process_machine, &mut native_machine) } == 0 {
         let error = unsafe { GetLastError() };
         Err(if error == 0 { ERROR_GEN_FAILURE } else { error })
     } else {
-        Ok(wow64 != 0)
+        process_machine_is_32_bit(process_machine, native_machine).ok_or(ERROR_INVALID_DATA)
     }
 }
 
-pub fn is_32_bit_process_pid(pid: u32) -> Result<bool, u32> {
-    // 只为了查询位数时，打开最低限度的查询句柄即可，减少权限失败的概率。
-    // 安全性: opening a process for query-only access; the owned wrapper closes it on return.
-    let Some(handle) =
-        OwnedHandle::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })
-    else {
-        let error = unsafe { GetLastError() };
-        return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+fn process_machine_is_32_bit(process_machine: u16, native_machine: u16) -> Option<bool> {
+    let effective_machine = if process_machine == IMAGE_FILE_MACHINE_UNKNOWN {
+        native_machine
+    } else {
+        process_machine
     };
-    is_32_bit_process_handle(handle.as_raw())
+    match effective_machine {
+        IMAGE_FILE_MACHINE_I386
+        | IMAGE_FILE_MACHINE_ARM
+        | IMAGE_FILE_MACHINE_ARMNT
+        | IMAGE_FILE_MACHINE_THUMB => Some(true),
+        IMAGE_FILE_MACHINE_AMD64 | IMAGE_FILE_MACHINE_ARM64 | IMAGE_FILE_MACHINE_IA64 => {
+            Some(false)
+        }
+        _ => None,
+    }
 }
 
 pub fn append_32_bit_suffix(label: &str, is_32_bit: bool) -> Cow<'_, str> {
@@ -626,6 +627,18 @@ unsafe extern "system" fn list_view_wnd_proc(
                 }
             }
         }
+        WM_NOTIFY if lparam != 0 => {
+            let header = unsafe { &*(lparam as *const NMHEADERW) };
+            if header.hdr.code == HDN_BEGINDRAG && header.iItem == 0 {
+                return 1;
+            }
+            if header.hdr.code == HDN_ENDDRAG
+                && !header.pitem.is_null()
+                && unsafe { (*header.pitem).iOrder } == 0
+            {
+                return 1;
+            }
+        }
         WM_NCDESTROY => {
             unsafe {
                 RemoveWindowSubclass(hwnd, Some(list_view_wnd_proc), LIST_VIEW_SUBCLASS_ID);
@@ -668,17 +681,52 @@ pub fn copy_text_to_callback_buffer(buffer: *mut u16, capacity: usize, text: &st
 }
 
 pub unsafe fn widestr_ptr_to_string(ptr: *const u16) -> String {
-    // 安全性: 调用方必须传入有效的、以 NUL 结尾的 UTF-16 字符串指针。
-    // 函数最多读取 MAX_WIDE_CHARS 个编码单元后停止。
-    {
-        if ptr.is_null() {
-            return String::new();
+    unsafe {
+        // 安全性: 调用方必须传入有效的、以 NUL 结尾的 UTF-16 字符串指针。
+        // 函数最多读取 MAX_WIDE_CHARS 个编码单元后停止。
+        {
+            if ptr.is_null() {
+                return String::new();
+            }
+            const MAX_WIDE_CHARS: usize = 32 * 1024;
+            let mut length = 0usize;
+            while length < MAX_WIDE_CHARS && *ptr.add(length) != 0 {
+                length += 1;
+            }
+            String::from_utf16_lossy(std::slice::from_raw_parts(ptr, length))
         }
-        const MAX_WIDE_CHARS: usize = 32 * 1024;
-        let mut length = 0usize;
-        while length < MAX_WIDE_CHARS && *ptr.add(length) != 0 {
-            length += 1;
-        }
-        String::from_utf16_lossy(std::slice::from_raw_parts(ptr, length))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::process_machine_is_32_bit;
+    use windows_sys::Win32::System::SystemInformation::{
+        IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_ARMNT,
+        IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_UNKNOWN,
+    };
+
+    #[test]
+    fn process_machine_width_distinguishes_emulation_from_bitness() {
+        assert_eq!(
+            process_machine_is_32_bit(IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_AMD64),
+            Some(true)
+        );
+        assert_eq!(
+            process_machine_is_32_bit(IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64),
+            Some(false)
+        );
+        assert_eq!(
+            process_machine_is_32_bit(IMAGE_FILE_MACHINE_UNKNOWN, IMAGE_FILE_MACHINE_ARM64),
+            Some(false)
+        );
+        assert_eq!(
+            process_machine_is_32_bit(IMAGE_FILE_MACHINE_ARMNT, IMAGE_FILE_MACHINE_ARM64),
+            Some(true)
+        );
+        assert_eq!(
+            process_machine_is_32_bit(0xffff, IMAGE_FILE_MACHINE_ARM64),
+            None
+        );
     }
 }

@@ -3,10 +3,10 @@
 
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetDlgItem, SetDlgItemTextW, SetWindowTextW, IDCANCEL, IDOK,
+    GetDlgItem, IDCANCEL, IDOK, SetDlgItemTextW, SetWindowTextW,
 };
 
-use crate::language::{text, TextKey};
+use crate::language::{TextKey, text};
 use crate::resource::*;
 use crate::winutil::to_wide_null;
 

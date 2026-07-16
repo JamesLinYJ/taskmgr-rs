@@ -19,10 +19,12 @@ mod pages;
 mod perf_drawing;
 mod perf_layout;
 mod perfpage;
+mod process_identity;
 mod procpage;
 #[allow(dead_code)]
 mod resource;
 mod runtime_menu;
+mod system_sampler;
 mod taskpage;
 mod userpage;
 mod winutil;

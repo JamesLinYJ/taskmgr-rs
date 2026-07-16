@@ -9,7 +9,7 @@ pub const PERF_PAGE: usize = 2;
 pub const NET_PAGE: usize = 3;
 pub const USER_PAGE: usize = 4;
 pub const NUM_PAGES: usize = 5;
-pub const STATIC_CPU_GRAPH_COUNT: usize = 32;
+pub const TEMPLATE_CPU_GRAPH_COUNT: usize = 32;
 
 pub const MAX_COLUMN: usize = 15;
 pub const NUM_COLUMN: usize = MAX_COLUMN + 1;
@@ -24,6 +24,7 @@ pub const PWM_TASK_WORKER_COMPLETE: u32 = 0x0400 + 15;
 pub const PWM_PREWARM_PAGE: u32 = 0x0400 + 16;
 pub const PWM_NET_WORKER_COMPLETE: u32 = 0x0400 + 17;
 pub const PWM_USER_WORKER_COMPLETE: u32 = 0x0400 + 18;
+pub const PWM_SYSTEM_WORKER_COMPLETE: u32 = 0x0400 + 19;
 
 // 顶层窗口、菜单和对话框模板 ID。
 pub const IDD_MAINWND: u16 = 105;
@@ -161,7 +162,6 @@ pub const IDC_CPUGRAPH29: i32 = 1103;
 pub const IDC_CPUGRAPH30: i32 = 1104;
 pub const IDC_CPUGRAPH31: i32 = 1105;
 pub const IDC_CPUGRAPH32: i32 = 1106;
-pub const IDC_LAST_CPUGRAPH: i32 = IDC_CPUGRAPH + STATIC_CPU_GRAPH_COUNT as i32 - 1;
 pub const IDC_NICGRAPH: i32 = 2500;
 pub const IDC_NICTOTALS: i32 = 2600;
 pub const IDC_NOADAPTERS: i32 = 2603;

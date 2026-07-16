@@ -10,10 +10,10 @@ use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{HWND, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, DrawTextW,
-    FillRect, GetDC, GetStockObject, InvalidateRect, LineTo, MapWindowPoints, MoveToEx, ReleaseDC,
-    SelectObject, SetBkMode, SetDCPenColor, SetTextColor, BLACK_BRUSH, DC_PEN, DT_CALCRECT,
-    DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, HBITMAP, HBRUSH, HDC, HGDIOBJ, SRCCOPY,
+    BLACK_BRUSH, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DC_PEN, DT_CALCRECT,
+    DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, DeleteDC, DeleteObject, DrawTextW, FillRect,
+    GetDC, GetStockObject, HBITMAP, HBRUSH, HDC, HGDIOBJ, InvalidateRect, LineTo, MapWindowPoints,
+    MoveToEx, ReleaseDC, SRCCOPY, SelectObject, SetBkMode, SetDCPenColor, SetTextColor,
     TRANSPARENT,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -22,18 +22,18 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
 };
 use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows_sys::Win32::UI::Controls::{
-    SetScrollInfo, LVCFMT_LEFT, LVCFMT_RIGHT, LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH,
-    LVCOLUMNW, LVIF_PARAM, LVIF_TEXT, LVITEMW, LVM_DELETECOLUMN, LVM_DELETEITEM, LVM_GETITEMCOUNT,
+    LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW,
+    LVIF_PARAM, LVIF_TEXT, LVITEMW, LVM_DELETECOLUMN, LVM_DELETEITEM, LVM_GETITEMCOUNT,
     LVM_GETITEMW, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMW,
-    LVS_EX_FULLROWSELECT, LVS_EX_HEADERDRAGDROP, TCM_ADJUSTRECT,
+    LVS_EX_FULLROWSELECT, LVS_EX_HEADERDRAGDROP, SetScrollInfo, TCM_ADJUSTRECT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, CreateWindowExW, DeferWindowPos, DestroyWindow, EndDeferWindowPos,
-    GetClientRect, GetDialogBaseUnits, GetDlgItem, GetScrollInfo, GetSystemMetrics, SendMessageW,
-    SetWindowTextW, ShowWindow, BS_OWNERDRAW, HDWP, HMENU, SB_BOTTOM, SB_CTL, SB_LINEDOWN,
-    SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SCROLLINFO,
-    SIF_ALL, SIF_PAGE, SIF_POS, SIF_RANGE, SM_CXVSCROLL, SWP_HIDEWINDOW, SWP_NOACTIVATE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WHEEL_DELTA, WM_GETFONT, WM_SETFONT, WM_SETREDRAW,
+    BS_OWNERDRAW, BeginDeferWindowPos, CreateWindowExW, DeferWindowPos, DestroyWindow,
+    EndDeferWindowPos, GetClientRect, GetDialogBaseUnits, GetDlgItem, GetScrollInfo,
+    GetSystemMetrics, HDWP, HMENU, SB_BOTTOM, SB_CTL, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN,
+    SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SCROLLINFO, SIF_ALL, SIF_PAGE, SIF_POS,
+    SIF_RANGE, SM_CXVSCROLL, SW_HIDE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SendMessageW, SetWindowTextW, ShowWindow, WHEEL_DELTA, WM_GETFONT, WM_SETFONT, WM_SETREDRAW,
     WS_CHILD, WS_DISABLED, WS_EX_CLIENTEDGE, WS_EX_NOPARENTNOTIFY,
 };
 
@@ -73,6 +73,29 @@ struct RawAdapterEntry {
     link_speed_bps: u64,
     bytes_sent: u64,
     bytes_received: u64,
+}
+
+struct OwnedIfTable {
+    ptr: *mut MIB_IF_TABLE2,
+}
+
+impl OwnedIfTable {
+    fn new(ptr: *mut MIB_IF_TABLE2) -> Option<Self> {
+        (!ptr.is_null()).then_some(Self { ptr })
+    }
+
+    fn as_ptr(&self) -> *mut MIB_IF_TABLE2 {
+        self.ptr
+    }
+}
+
+impl Drop for OwnedIfTable {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // 安全性: `OwnedIfTable` exclusively owns a table allocated by `GetIfTable2`.
+            unsafe { FreeMibTable(self.ptr as _) };
+        }
+    }
 }
 
 type NetworkWorkerResult = Result<Vec<RawAdapterEntry>, u32>;
@@ -219,18 +242,20 @@ impl NetworkPageState {
         main_hwnd: HWND,
         hwnd_tabs: HWND,
     ) -> Result<(), u32> {
-        // 初始化只建立控件和基础布局；当前页由激活入口采样，隐藏页由首帧后的预热消息采样。
-        self.hwnd = hwnd;
-        self.main_hwnd = main_hwnd;
-        self.hwnd_tabs = hwnd_tabs;
-        self.start_worker_thread()?;
-        let list = self.list_hwnd();
-        if !list.is_null() {
-            subclass_list_view(list);
+        unsafe {
+            // 初始化只建立控件和基础布局；当前页由激活入口采样，隐藏页由首帧后的预热消息采样。
+            self.hwnd = hwnd;
+            self.main_hwnd = main_hwnd;
+            self.hwnd_tabs = hwnd_tabs;
+            self.start_worker_thread()?;
+            let list = self.list_hwnd();
+            if !list.is_null() {
+                subclass_list_view(list);
+            }
+            self.configure_columns();
+            self.size_page();
+            Ok(())
         }
-        self.configure_columns();
-        self.size_page();
-        Ok(())
     }
 
     pub unsafe fn apply_options(&mut self, options: &Options) {
@@ -251,15 +276,17 @@ impl NetworkPageState {
     }
 
     pub unsafe fn timer_event(&mut self) {
-        // 每轮刷新都先推动网格滚动，再采样并重绘当前可见图表。
-        self.scroll_offset = (self.scroll_offset + 2) % GRAPH_GRID;
-        self.refresh();
-        self.update_graphs();
+        unsafe {
+            // 历史轴只在 worker 成功提交快照时推进，避免慢采样或失败时重绘旧数据。
+            self.refresh();
+        }
     }
 
     pub unsafe fn destroy(&mut self) {
-        self.stop_worker_thread();
-        self.destroy_graphs();
+        unsafe {
+            self.stop_worker_thread();
+            self.destroy_graphs();
+        }
     }
 
     fn start_worker_thread(&mut self) -> Result<(), u32> {
@@ -268,7 +295,7 @@ impl NetworkPageState {
         }
 
         self.worker = Some(BackgroundWorker::spawn(
-            "rtaskmgr-network-sampler",
+            "taskmgr-rs-network-sampler",
             PWM_NET_WORKER_COMPLETE,
             |()| NetworkWorkerCompletion {
                 sampled_at: Instant::now(),
@@ -285,50 +312,52 @@ impl NetworkPageState {
     }
 
     unsafe fn ensure_graph_surface(&mut self, width: i32, height: i32) -> bool {
-        if self.cached_graph_dc.is_null()
-            || width > self.cached_graph_width
-            || height > self.cached_graph_height
-        {
-            let screen_dc = GetDC(null_mut());
-            if screen_dc.is_null() {
-                return false;
-            }
-            let new_dc = CreateCompatibleDC(screen_dc);
-            let new_bitmap = CreateCompatibleBitmap(screen_dc, width, height);
-            ReleaseDC(null_mut(), screen_dc);
-            if new_dc.is_null() || new_bitmap.is_null() {
-                if !new_dc.is_null() {
-                    DeleteDC(new_dc);
+        unsafe {
+            if self.cached_graph_dc.is_null()
+                || width > self.cached_graph_width
+                || height > self.cached_graph_height
+            {
+                let screen_dc = GetDC(null_mut());
+                if screen_dc.is_null() {
+                    return false;
                 }
-                if !new_bitmap.is_null() {
+                let new_dc = CreateCompatibleDC(screen_dc);
+                let new_bitmap = CreateCompatibleBitmap(screen_dc, width, height);
+                ReleaseDC(null_mut(), screen_dc);
+                if new_dc.is_null() || new_bitmap.is_null() {
+                    if !new_dc.is_null() {
+                        DeleteDC(new_dc);
+                    }
+                    if !new_bitmap.is_null() {
+                        DeleteObject(new_bitmap as _);
+                    }
+                    return false;
+                }
+
+                let new_old = SelectObject(new_dc, new_bitmap as _);
+                if new_old.is_null() || new_old as isize == -1 {
                     DeleteObject(new_bitmap as _);
+                    DeleteDC(new_dc);
+                    return false;
                 }
-                return false;
-            }
+                if !self.cached_graph_bitmap_old.is_null() {
+                    SelectObject(self.cached_graph_dc, self.cached_graph_bitmap_old);
+                }
+                if !self.cached_graph_bitmap.is_null() {
+                    DeleteObject(self.cached_graph_bitmap as _);
+                }
+                if !self.cached_graph_dc.is_null() {
+                    DeleteDC(self.cached_graph_dc);
+                }
 
-            let new_old = SelectObject(new_dc, new_bitmap as _);
-            if new_old.is_null() || new_old as isize == -1 {
-                DeleteObject(new_bitmap as _);
-                DeleteDC(new_dc);
-                return false;
+                self.cached_graph_dc = new_dc;
+                self.cached_graph_bitmap = new_bitmap;
+                self.cached_graph_bitmap_old = new_old;
+                self.cached_graph_width = width;
+                self.cached_graph_height = height;
             }
-            if !self.cached_graph_bitmap_old.is_null() {
-                SelectObject(self.cached_graph_dc, self.cached_graph_bitmap_old);
-            }
-            if !self.cached_graph_bitmap.is_null() {
-                DeleteObject(self.cached_graph_bitmap as _);
-            }
-            if !self.cached_graph_dc.is_null() {
-                DeleteDC(self.cached_graph_dc);
-            }
-
-            self.cached_graph_dc = new_dc;
-            self.cached_graph_bitmap = new_bitmap;
-            self.cached_graph_bitmap_old = new_old;
-            self.cached_graph_width = width;
-            self.cached_graph_height = height;
+            true
         }
-        true
     }
 
     pub fn graph_pane_index(&self, control_id: i32) -> Option<usize> {
@@ -341,88 +370,90 @@ impl NetworkPageState {
     }
 
     pub unsafe fn draw_graph(&mut self, hdc: HDC, rect: RECT, pane_index: usize) {
-        // 每个图表面板都根据当前适配器的历史数据独立绘制，
-        // 但缩放规则保持一致，便于横向比较。
-        let width = (rect.right - rect.left).max(1);
-        let height = (rect.bottom - rect.top).max(1);
-        let adapter_index = pane_index.saturating_add(self.first_visible_adapter());
-        let Some(adapter) = self.adapters.get(adapter_index) else {
-            return;
-        };
+        unsafe {
+            // 每个图表面板都根据当前适配器的历史数据独立绘制，
+            // 但缩放规则保持一致，便于横向比较。
+            let width = (rect.right - rect.left).max(1);
+            let height = (rect.bottom - rect.top).max(1);
+            let adapter_index = pane_index.saturating_add(self.first_visible_adapter());
+            let Some(adapter) = self.adapters.get(adapter_index) else {
+                return;
+            };
 
-        let scale_max = adapter
-            .sent_history
-            .max_value()
-            .max(adapter.received_history.max_value())
-            .max(adapter.total_history.max_value());
+            let scale_max = adapter
+                .sent_history
+                .max_value()
+                .max(adapter.received_history.max_value())
+                .max(adapter.total_history.max_value());
 
-        if self.draw_graph_gpu(hdc, rect, adapter, scale_max) {
-            draw_graph_scale_overlay(hdc, rect, scale_max);
-            return;
-        }
-        if !self.ensure_graph_surface(width, height) {
-            return;
-        }
-        let Some(adapter) = self.adapters.get(adapter_index) else {
-            return;
-        };
+            if self.draw_graph_gpu(hdc, rect, adapter, scale_max) {
+                draw_graph_scale_overlay(hdc, rect, scale_max);
+                return;
+            }
+            if !self.ensure_graph_surface(width, height) {
+                return;
+            }
+            let Some(adapter) = self.adapters.get(adapter_index) else {
+                return;
+            };
 
-        let old_bitmap = SelectObject(self.cached_graph_dc, self.cached_graph_bitmap as _);
-        let local_rect = RECT {
-            left: 0,
-            top: 0,
-            right: width,
-            bottom: height,
-        };
+            let old_bitmap = SelectObject(self.cached_graph_dc, self.cached_graph_bitmap as _);
+            let local_rect = RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            };
 
-        let scale_top = graph_scale_top_value(scale_max);
-        let zoom = graph_zoom(scale_max);
-        fill_black(self.cached_graph_dc, &local_rect);
-        let plot_left = draw_scale(self.cached_graph_dc, &local_rect, scale_top);
-        let plot_rect = RECT {
-            left: (local_rect.left + plot_left).min(local_rect.right),
-            top: local_rect.top,
-            right: local_rect.right,
-            bottom: local_rect.bottom,
-        };
+            let scale_top = graph_scale_top_value(scale_max);
+            let zoom = graph_zoom(scale_max);
+            fill_black(self.cached_graph_dc, &local_rect);
+            let plot_left = draw_scale(self.cached_graph_dc, &local_rect, scale_top);
+            let plot_rect = RECT {
+                left: (local_rect.left + plot_left).min(local_rect.right),
+                top: local_rect.top,
+                right: local_rect.right,
+                bottom: local_rect.bottom,
+            };
 
-        if plot_rect.right > plot_rect.left {
-            draw_grid(self.cached_graph_dc, &plot_rect, self.scroll_offset, zoom);
-            draw_history(
+            if plot_rect.right > plot_rect.left {
+                draw_grid(self.cached_graph_dc, &plot_rect, self.scroll_offset, zoom);
+                draw_history(
+                    self.cached_graph_dc,
+                    &plot_rect,
+                    &adapter.total_history,
+                    rgb(0, 255, 0),
+                    zoom,
+                );
+                draw_history(
+                    self.cached_graph_dc,
+                    &plot_rect,
+                    &adapter.received_history,
+                    rgb(255, 255, 0),
+                    zoom,
+                );
+                draw_history(
+                    self.cached_graph_dc,
+                    &plot_rect,
+                    &adapter.sent_history,
+                    rgb(255, 0, 0),
+                    zoom,
+                );
+            }
+
+            BitBlt(
+                hdc,
+                rect.left,
+                rect.top,
+                width,
+                height,
                 self.cached_graph_dc,
-                &plot_rect,
-                &adapter.total_history,
-                rgb(0, 255, 0),
-                zoom,
+                0,
+                0,
+                SRCCOPY,
             );
-            draw_history(
-                self.cached_graph_dc,
-                &plot_rect,
-                &adapter.received_history,
-                rgb(255, 255, 0),
-                zoom,
-            );
-            draw_history(
-                self.cached_graph_dc,
-                &plot_rect,
-                &adapter.sent_history,
-                rgb(255, 0, 0),
-                zoom,
-            );
+            SelectObject(self.cached_graph_dc, old_bitmap);
         }
-
-        BitBlt(
-            hdc,
-            rect.left,
-            rect.top,
-            width,
-            height,
-            self.cached_graph_dc,
-            0,
-            0,
-            SRCCOPY,
-        );
-        SelectObject(self.cached_graph_dc, old_bitmap);
     }
 
     unsafe fn draw_graph_gpu(
@@ -476,230 +507,238 @@ impl NetworkPageState {
     }
 
     pub unsafe fn size_page(&mut self) {
-        // 网络页需要同时布局“多块图表 + 滚动条 + 底部列表”，
-        // 因此会先算出一页能显示多少图，再决定是否出现滚动条。
-        if self.hwnd.is_null() {
-            return;
-        }
-
-        let list = self.list_hwnd();
-        let label = GetDlgItem(self.hwnd, IDC_NOADAPTERS);
-        let scrollbar = GetDlgItem(self.hwnd, IDC_GRAPHSCROLLVERT);
-        let adapter_count = self.adapters.len();
-
-        let mut parent_rect = zeroed::<RECT>();
-        let (def_spacing, top_spacing) = layout_spacing();
-        let mut graph_rect = zeroed::<RECT>();
-        let mut need_scrollbar = false;
-
-        self.graphs_per_page = 0;
-
-        let graph_history_height = if self.no_title {
-            if self.main_hwnd.is_null() {
+        unsafe {
+            // 网络页需要同时布局“多块图表 + 滚动条 + 底部列表”，
+            // 因此会先算出一页能显示多少图，再决定是否出现滚动条。
+            if self.hwnd.is_null() {
                 return;
             }
-            GetClientRect(self.main_hwnd, &mut parent_rect);
-            (parent_rect.bottom - parent_rect.top - def_spacing).max(0)
-        } else {
-            if self.hwnd_tabs.is_null() {
-                return;
-            }
-            GetClientRect(self.hwnd_tabs, &mut parent_rect);
-            MapWindowPoints(
-                self.hwnd_tabs,
-                self.hwnd,
-                &mut parent_rect as *mut _ as _,
-                2,
-            );
-            SendMessageW(
-                self.hwnd_tabs,
-                TCM_ADJUSTRECT,
-                0,
-                &mut parent_rect as *mut _ as isize,
-            );
-            ((parent_rect.bottom - parent_rect.top - def_spacing) * 3 / 4).max(0)
-        };
 
-        if adapter_count != 0 {
-            let scrollbar_width = scrollbar_width();
-            self.graphs_per_page = graphs_per_page(graph_history_height, adapter_count);
-            self.ensure_graphs(self.graphs_per_page);
-            need_scrollbar = adapter_count > self.graphs_per_page;
-            graph_rect.left = parent_rect.left + def_spacing;
-            graph_rect.right = (parent_rect.right - parent_rect.left)
-                - def_spacing * 2
-                - if need_scrollbar {
-                    scrollbar_width + def_spacing
+            let list = self.list_hwnd();
+            let label = GetDlgItem(self.hwnd, IDC_NOADAPTERS);
+            let scrollbar = GetDlgItem(self.hwnd, IDC_GRAPHSCROLLVERT);
+            let adapter_count = self.adapters.len();
+
+            let mut parent_rect = zeroed::<RECT>();
+            let (def_spacing, top_spacing) = layout_spacing();
+            let mut graph_rect = zeroed::<RECT>();
+            let mut need_scrollbar = false;
+
+            self.graphs_per_page = 0;
+
+            let graph_history_height = if self.no_title {
+                if self.main_hwnd.is_null() {
+                    return;
+                }
+                GetClientRect(self.main_hwnd, &mut parent_rect);
+                (parent_rect.bottom - parent_rect.top - def_spacing).max(0)
+            } else {
+                if self.hwnd_tabs.is_null() {
+                    return;
+                }
+                GetClientRect(self.hwnd_tabs, &mut parent_rect);
+                MapWindowPoints(
+                    self.hwnd_tabs,
+                    self.hwnd,
+                    &mut parent_rect as *mut _ as _,
+                    2,
+                );
+                SendMessageW(
+                    self.hwnd_tabs,
+                    TCM_ADJUSTRECT,
+                    0,
+                    &mut parent_rect as *mut _ as isize,
+                );
+                ((parent_rect.bottom - parent_rect.top - def_spacing) * 3 / 4).max(0)
+            };
+
+            if adapter_count != 0 {
+                let scrollbar_width = scrollbar_width();
+                self.graphs_per_page = graphs_per_page(graph_history_height, adapter_count);
+                self.ensure_graphs(self.graphs_per_page);
+                need_scrollbar = adapter_count > self.graphs_per_page;
+                graph_rect.left = parent_rect.left + def_spacing;
+                graph_rect.right = (parent_rect.right - parent_rect.left)
+                    - def_spacing * 2
+                    - if need_scrollbar {
+                        scrollbar_width + def_spacing
+                    } else {
+                        0
+                    };
+                graph_rect.top = parent_rect.top + def_spacing;
+                graph_rect.bottom = if self.graphs_per_page > 0 {
+                    graph_history_height / self.graphs_per_page as i32
                 } else {
                     0
                 };
-            graph_rect.top = parent_rect.top + def_spacing;
-            graph_rect.bottom = if self.graphs_per_page > 0 {
-                graph_history_height / self.graphs_per_page as i32
-            } else {
-                0
-            };
-        }
-
-        let mut hdwp = BeginDeferWindowPos(10);
-        if hdwp.is_null() {
-            return;
-        }
-
-        if !scrollbar.is_null() {
-            let scrollbar_width = scrollbar_width();
-            hdwp = DeferWindowPos(
-                hdwp,
-                scrollbar,
-                null_mut(),
-                parent_rect.right - def_spacing - scrollbar_width,
-                parent_rect.top + def_spacing,
-                scrollbar_width,
-                graph_rect.bottom * self.graphs_per_page as i32,
-                if need_scrollbar {
-                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW
-                } else {
-                    SWP_HIDEWINDOW
-                },
-            );
-        }
-
-        for index in 0..self.graphs.len() {
-            if index < self.graphs_per_page {
-                let frame = &self.graphs[index];
-                hdwp = size_graph(hdwp, frame, &graph_rect, def_spacing, top_spacing);
-                graph_rect.top += graph_rect.bottom;
-            } else {
-                let frame = &self.graphs[index];
-                hdwp = hide_graph(hdwp, frame);
             }
-        }
 
-        if !list.is_null() {
-            let list_left = graph_rect.left;
-            let list_top = graph_rect.top + def_spacing;
-            let list_right = parent_rect.right - def_spacing;
-            let list_bottom = parent_rect.bottom - def_spacing;
-            hdwp = DeferWindowPos(
-                hdwp,
-                list,
-                null_mut(),
-                list_left,
-                list_top,
-                (list_right - list_left).max(0),
-                (list_bottom - list_top).max(0),
-                if adapter_count == 0 {
-                    SWP_HIDEWINDOW
+            let mut hdwp = BeginDeferWindowPos(10);
+            if hdwp.is_null() {
+                return;
+            }
+
+            if !scrollbar.is_null() {
+                let scrollbar_width = scrollbar_width();
+                hdwp = DeferWindowPos(
+                    hdwp,
+                    scrollbar,
+                    null_mut(),
+                    parent_rect.right - def_spacing - scrollbar_width,
+                    parent_rect.top + def_spacing,
+                    scrollbar_width,
+                    graph_rect.bottom * self.graphs_per_page as i32,
+                    if need_scrollbar {
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW
+                    } else {
+                        SWP_HIDEWINDOW
+                    },
+                );
+            }
+
+            for index in 0..self.graphs.len() {
+                if index < self.graphs_per_page {
+                    let frame = &self.graphs[index];
+                    hdwp = size_graph(hdwp, frame, &graph_rect, def_spacing, top_spacing);
+                    graph_rect.top += graph_rect.bottom;
                 } else {
-                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW
-                },
-            );
+                    let frame = &self.graphs[index];
+                    hdwp = hide_graph(hdwp, frame);
+                }
+            }
+
+            if !list.is_null() {
+                let list_left = graph_rect.left;
+                let list_top = graph_rect.top + def_spacing;
+                let list_right = parent_rect.right - def_spacing;
+                let list_bottom = parent_rect.bottom - def_spacing;
+                hdwp = DeferWindowPos(
+                    hdwp,
+                    list,
+                    null_mut(),
+                    list_left,
+                    list_top,
+                    (list_right - list_left).max(0),
+                    (list_bottom - list_top).max(0),
+                    if adapter_count == 0 {
+                        SWP_HIDEWINDOW
+                    } else {
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW
+                    },
+                );
+            }
+
+            if !label.is_null() {
+                hdwp = DeferWindowPos(
+                    hdwp,
+                    label,
+                    null_mut(),
+                    parent_rect.left,
+                    parent_rect.top + ((parent_rect.bottom - parent_rect.top) / 2) - 40,
+                    (parent_rect.right - parent_rect.left).max(0),
+                    (parent_rect.bottom - parent_rect.top).max(0),
+                    if adapter_count == 0 {
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW
+                    } else {
+                        SWP_HIDEWINDOW
+                    },
+                );
+            }
+
+            EndDeferWindowPos(hdwp);
+
+            if need_scrollbar && !scrollbar.is_null() {
+                let scroll_info = SCROLLINFO {
+                    cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                    fMask: SIF_RANGE | SIF_PAGE,
+                    nMin: 0,
+                    nMax: adapter_count.saturating_sub(self.graphs_per_page) as i32,
+                    nPage: 1,
+                    ..zeroed()
+                };
+                SetScrollInfo(scrollbar, SB_CTL, &scroll_info, 1);
+            }
+
+            self.label_graphs();
         }
-
-        if !label.is_null() {
-            hdwp = DeferWindowPos(
-                hdwp,
-                label,
-                null_mut(),
-                parent_rect.left,
-                parent_rect.top + ((parent_rect.bottom - parent_rect.top) / 2) - 40,
-                (parent_rect.right - parent_rect.left).max(0),
-                (parent_rect.bottom - parent_rect.top).max(0),
-                if adapter_count == 0 {
-                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW
-                } else {
-                    SWP_HIDEWINDOW
-                },
-            );
-        }
-
-        EndDeferWindowPos(hdwp);
-
-        if need_scrollbar && !scrollbar.is_null() {
-            let scroll_info = SCROLLINFO {
-                cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
-                fMask: SIF_RANGE | SIF_PAGE,
-                nMin: 0,
-                nMax: adapter_count.saturating_sub(self.graphs_per_page) as i32,
-                nPage: 1,
-                ..zeroed()
-            };
-            SetScrollInfo(scrollbar, SB_CTL, &scroll_info, 1);
-        }
-
-        self.label_graphs();
     }
 
     pub unsafe fn handle_vscroll(&mut self, wparam: WPARAM) -> isize {
-        self.handle_vscroll_steps(wparam, 1)
+        unsafe { self.handle_vscroll_steps(wparam, 1) }
     }
 
     unsafe fn handle_vscroll_steps(&mut self, wparam: WPARAM, steps: i32) -> isize {
-        let scrollbar = GetDlgItem(self.hwnd, IDC_GRAPHSCROLLVERT);
-        if scrollbar.is_null() {
-            return 0;
-        }
+        unsafe {
+            let scrollbar = GetDlgItem(self.hwnd, IDC_GRAPHSCROLLVERT);
+            if scrollbar.is_null() {
+                return 0;
+            }
 
-        let mut scroll_info = SCROLLINFO {
-            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
-            fMask: SIF_ALL,
-            ..zeroed()
-        };
-        if GetScrollInfo(scrollbar, SB_CTL, &mut scroll_info) == 0 {
-            return 0;
-        }
+            let mut scroll_info = SCROLLINFO {
+                cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                fMask: SIF_ALL,
+                ..zeroed()
+            };
+            if GetScrollInfo(scrollbar, SB_CTL, &mut scroll_info) == 0 {
+                return 0;
+            }
 
-        match i32::from(loword(wparam)) {
-            SB_BOTTOM => scroll_info.nPos = scroll_info.nMax,
-            SB_TOP => scroll_info.nPos = scroll_info.nMin,
-            SB_LINEDOWN => scroll_info.nPos += steps,
-            SB_LINEUP => scroll_info.nPos -= steps,
-            SB_PAGEDOWN => scroll_info.nPos += self.graphs_per_page as i32 * steps,
-            SB_PAGEUP => scroll_info.nPos -= self.graphs_per_page as i32 * steps,
-            SB_THUMBTRACK | SB_THUMBPOSITION => scroll_info.nPos = i32::from(hiword(wparam)),
-            _ => {}
-        }
+            match i32::from(loword(wparam)) {
+                SB_BOTTOM => scroll_info.nPos = scroll_info.nMax,
+                SB_TOP => scroll_info.nPos = scroll_info.nMin,
+                SB_LINEDOWN => scroll_info.nPos += steps,
+                SB_LINEUP => scroll_info.nPos -= steps,
+                SB_PAGEDOWN => scroll_info.nPos += self.graphs_per_page as i32 * steps,
+                SB_PAGEUP => scroll_info.nPos -= self.graphs_per_page as i32 * steps,
+                SB_THUMBTRACK | SB_THUMBPOSITION => scroll_info.nPos = i32::from(hiword(wparam)),
+                _ => {}
+            }
 
-        if scroll_info.nPos < scroll_info.nMin {
-            scroll_info.nPos = scroll_info.nMin;
-        }
-        if scroll_info.nPos > scroll_info.nMax {
-            scroll_info.nPos = scroll_info.nMax;
-        }
+            if scroll_info.nPos < scroll_info.nMin {
+                scroll_info.nPos = scroll_info.nMin;
+            }
+            if scroll_info.nPos > scroll_info.nMax {
+                scroll_info.nPos = scroll_info.nMax;
+            }
 
-        let next_first_visible = scroll_info.nPos.max(0) as usize;
-        scroll_info.fMask = SIF_POS;
-        SetScrollInfo(scrollbar, SB_CTL, &scroll_info, 1);
-        if self.first_visible_adapter != next_first_visible {
-            self.first_visible_adapter = next_first_visible;
-            self.label_graphs();
-            self.update_graphs();
+            let next_first_visible = scroll_info.nPos.max(0) as usize;
+            scroll_info.fMask = SIF_POS;
+            SetScrollInfo(scrollbar, SB_CTL, &scroll_info, 1);
+            if self.first_visible_adapter != next_first_visible {
+                self.first_visible_adapter = next_first_visible;
+                self.label_graphs();
+                self.update_graphs();
+            }
+            1
         }
-        1
     }
 
     pub unsafe fn handle_mouse_wheel(&mut self, wparam: WPARAM) -> isize {
-        // 鼠标滚轮被翻译成垂直滚动命令，保持和滚动条一致的行为。
-        let delta = i32::from(hiword(wparam) as i16);
-        if delta == 0 {
-            return 0;
-        }
+        unsafe {
+            // 鼠标滚轮被翻译成垂直滚动命令，保持和滚动条一致的行为。
+            let delta = i32::from(hiword(wparam) as i16);
+            if delta == 0 {
+                return 0;
+            }
 
-        let wheel_delta = WHEEL_DELTA as i32;
-        let step = ((delta.abs() + wheel_delta - 1) / wheel_delta).max(1);
-        let command = if delta < 0 { SB_LINEDOWN } else { SB_LINEUP };
-        self.handle_vscroll_steps(command as usize, step)
+            let wheel_delta = WHEEL_DELTA as i32;
+            let step = ((delta.abs() + wheel_delta - 1) / wheel_delta).max(1);
+            let command = if delta < 0 { SB_LINEDOWN } else { SB_LINEUP };
+            self.handle_vscroll_steps(command as usize, step)
+        }
     }
 
     unsafe fn refresh(&mut self) {
-        self.drain_worker_results();
-        if self.collection_in_flight {
-            self.refresh_requested = true;
-            return;
-        }
+        unsafe {
+            self.drain_worker_results();
+            if self.collection_in_flight {
+                self.refresh_requested = true;
+                return;
+            }
 
-        self.refresh_requested = false;
-        self.schedule_collection();
+            self.refresh_requested = false;
+            self.schedule_collection();
+        }
     }
 
     unsafe fn schedule_collection(&mut self) {
@@ -716,29 +755,31 @@ impl NetworkPageState {
     }
 
     unsafe fn drain_worker_results(&mut self) {
-        loop {
-            let result = match self.worker.as_ref() {
-                Some(worker) => worker.try_recv(),
-                None => return,
-            };
+        unsafe {
+            loop {
+                let result = match self.worker.as_ref() {
+                    Some(worker) => worker.try_recv(),
+                    None => return,
+                };
 
-            match result {
-                Ok(completion) => {
-                    self.collection_in_flight = false;
-                    match completion.result {
-                        Ok(adapters) => {
-                            self.last_refresh_error = None;
-                            self.apply_adapter_snapshot(adapters, completion.sampled_at);
+                match result {
+                    Ok(completion) => {
+                        self.collection_in_flight = false;
+                        match completion.result {
+                            Ok(adapters) => {
+                                self.last_refresh_error = None;
+                                self.apply_adapter_snapshot(adapters, completion.sampled_at);
+                            }
+                            Err(error) => self.set_refresh_error(error),
                         }
-                        Err(error) => self.set_refresh_error(error),
                     }
-                }
-                Err(TryRecvError::Empty) => return,
-                Err(TryRecvError::Disconnected) => {
-                    self.worker = None;
-                    self.collection_in_flight = false;
-                    self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
-                    return;
+                    Err(TryRecvError::Empty) => return,
+                    Err(TryRecvError::Disconnected) => {
+                        self.worker = None;
+                        self.collection_in_flight = false;
+                        self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
+                        return;
+                    }
                 }
             }
         }
@@ -752,10 +793,12 @@ impl NetworkPageState {
     }
 
     pub unsafe fn handle_worker_completion(&mut self) {
-        self.drain_worker_results();
-        if self.refresh_requested && !self.collection_in_flight {
-            self.refresh_requested = false;
-            self.schedule_collection();
+        unsafe {
+            self.drain_worker_results();
+            if self.refresh_requested && !self.collection_in_flight {
+                self.refresh_requested = false;
+                self.schedule_collection();
+            }
         }
     }
 
@@ -764,53 +807,34 @@ impl NetworkPageState {
         raw_adapters: Vec<RawAdapterEntry>,
         sampled_at: Instant,
     ) {
-        // UI 提交阶段把完整原始快照转换为列表文本和历史曲线；过程中没有系统查询。
-        let raw_adapters = collapse_raw_adapters(raw_adapters);
-        let needs_initial_layout = self.last_sample_time.is_none();
-        let previous_adapter_count = self.adapters.len();
-        let previous_adapter_order = self
-            .adapters
-            .iter()
-            .map(|adapter| adapter.key)
-            .collect::<Vec<_>>();
-        let elapsed_secs = self
-            .last_sample_time
-            .replace(sampled_at)
-            .map(|previous| sampled_at.duration_since(previous).as_secs_f64())
-            .unwrap_or(0.0);
+        unsafe {
+            // UI 提交阶段把完整原始快照转换为列表文本和历史曲线；过程中没有系统查询。
+            let raw_adapters = collapse_raw_adapters(raw_adapters);
+            let needs_initial_layout = self.last_sample_time.is_none();
+            let previous_adapter_count = self.adapters.len();
+            let previous_adapter_order = self
+                .adapters
+                .iter()
+                .map(|adapter| adapter.key)
+                .collect::<Vec<_>>();
+            let elapsed_secs = self
+                .last_sample_time
+                .replace(sampled_at)
+                .map(|previous| sampled_at.duration_since(previous).as_secs_f64())
+                .unwrap_or(0.0);
 
-        let mut previous_by_key = HashMap::with_capacity(self.adapters.len());
-        for adapter in self.adapters.drain(..) {
-            previous_by_key.insert(adapter.key, adapter);
-        }
+            let mut previous_by_key = HashMap::with_capacity(self.adapters.len());
+            for adapter in self.adapters.drain(..) {
+                previous_by_key.insert(adapter.key, adapter);
+            }
 
-        let mut adapters = Vec::with_capacity(raw_adapters.len());
-        let mut adapter_labels_changed = false;
-        for raw in raw_adapters {
-            let (mut sent_history, mut received_history, mut total_history, previous_state) =
-                if let Some(previous_adapter) = previous_by_key.remove(&raw.key) {
-                    adapter_labels_changed |= previous_adapter.name != raw.name;
-                    let NetworkAdapterEntry {
-                        name,
-                        state,
-                        link_speed,
-                        utilization,
-                        bytes_sent,
-                        bytes_received,
-                        bytes_total,
-                        current_sent,
-                        current_received,
-                        sent_history,
-                        received_history,
-                        total_history,
-                        ..
-                    } = previous_adapter;
-
-                    (
-                        sent_history,
-                        received_history,
-                        total_history,
-                        Some(PreviousAdapterState {
+            let mut adapters = Vec::with_capacity(raw_adapters.len());
+            let mut adapter_labels_changed = false;
+            for raw in raw_adapters {
+                let (mut sent_history, mut received_history, mut total_history, previous_state) =
+                    if let Some(previous_adapter) = previous_by_key.remove(&raw.key) {
+                        adapter_labels_changed |= previous_adapter.name != raw.name;
+                        let NetworkAdapterEntry {
                             name,
                             state,
                             link_speed,
@@ -820,373 +844,418 @@ impl NetworkPageState {
                             bytes_total,
                             current_sent,
                             current_received,
-                        }),
-                    )
-                } else {
-                    adapter_labels_changed = true;
-                    (
-                        HistoryBuffer::zeroed(HIST_SIZE),
-                        HistoryBuffer::zeroed(HIST_SIZE),
-                        HistoryBuffer::zeroed(HIST_SIZE),
-                        None,
-                    )
+                            sent_history,
+                            received_history,
+                            total_history,
+                            ..
+                        } = previous_adapter;
+
+                        (
+                            sent_history,
+                            received_history,
+                            total_history,
+                            Some(PreviousAdapterState {
+                                name,
+                                state,
+                                link_speed,
+                                utilization,
+                                bytes_sent,
+                                bytes_received,
+                                bytes_total,
+                                current_sent,
+                                current_received,
+                            }),
+                        )
+                    } else {
+                        adapter_labels_changed = true;
+                        (
+                            HistoryBuffer::zeroed(HIST_SIZE),
+                            HistoryBuffer::zeroed(HIST_SIZE),
+                            HistoryBuffer::zeroed(HIST_SIZE),
+                            None,
+                        )
+                    };
+                let counter_delta = adapter_counter_delta(
+                    raw.bytes_sent,
+                    raw.bytes_received,
+                    previous_state
+                        .as_ref()
+                        .map(|state| (state.current_sent, state.current_received)),
+                );
+                // A zero curve point marks an unavailable interval after first sight or counter
+                // reset; the textual value remains "-" so it is not presented as measured idle.
+                let total_delta = counter_delta.map_or(0, |delta| delta.2);
+                let sent_util = counter_delta.map_or(0, |delta| {
+                    utilization_percent_for_history(delta.0, raw.link_speed_bps, elapsed_secs)
+                });
+                let received_util = counter_delta.map_or(0, |delta| {
+                    utilization_percent_for_history(delta.1, raw.link_speed_bps, elapsed_secs)
+                });
+                let total_util = counter_delta.map_or(0, |delta| {
+                    utilization_percent_for_history(delta.2, raw.link_speed_bps, elapsed_secs)
+                });
+
+                push_history(&mut sent_history, sent_util);
+                push_history(&mut received_history, received_util);
+                push_history(&mut total_history, total_util);
+
+                let bytes_total = raw.bytes_sent.checked_add(raw.bytes_received);
+                let mut adapter = NetworkAdapterEntry {
+                    interface_index: raw.interface_index,
+                    key: raw.key,
+                    name: raw.name,
+                    state: raw.state,
+                    link_speed: format_link_speed(raw.link_speed_bps),
+                    utilization: counter_delta
+                        .map(|_| utilization_text(total_delta, raw.link_speed_bps, elapsed_secs))
+                        .unwrap_or_else(|| "-".to_string()),
+                    bytes_sent: format_counter(raw.bytes_sent),
+                    bytes_received: format_counter(raw.bytes_received),
+                    bytes_total: bytes_total
+                        .map(format_counter)
+                        .unwrap_or_else(|| "-".to_string()),
+                    current_sent: raw.bytes_sent,
+                    current_received: raw.bytes_received,
+                    sent_history,
+                    received_history,
+                    total_history,
+                    dirty: true,
                 };
-            let (sent_delta, received_delta) = if let Some(previous_state) = previous_state.as_ref()
-            {
-                (
-                    raw.bytes_sent.saturating_sub(previous_state.current_sent),
-                    raw.bytes_received
-                        .saturating_sub(previous_state.current_received),
-                )
-            } else {
-                (0, 0)
-            };
-            let total_delta = sent_delta.saturating_add(received_delta);
-
-            let sent_util =
-                utilization_percent_for_history(sent_delta, raw.link_speed_bps, elapsed_secs);
-            let received_util =
-                utilization_percent_for_history(received_delta, raw.link_speed_bps, elapsed_secs);
-            let total_util =
-                utilization_percent_for_history(total_delta, raw.link_speed_bps, elapsed_secs);
-
-            push_history(&mut sent_history, sent_util);
-            push_history(&mut received_history, received_util);
-            push_history(&mut total_history, total_util);
-
-            let bytes_total = raw.bytes_sent.saturating_add(raw.bytes_received);
-            let mut adapter = NetworkAdapterEntry {
-                interface_index: raw.interface_index,
-                key: raw.key,
-                name: raw.name,
-                state: raw.state,
-                link_speed: format_link_speed(raw.link_speed_bps),
-                utilization: utilization_text(total_delta, raw.link_speed_bps, elapsed_secs),
-                bytes_sent: format_counter(raw.bytes_sent),
-                bytes_received: format_counter(raw.bytes_received),
-                bytes_total: format_counter(bytes_total),
-                current_sent: raw.bytes_sent,
-                current_received: raw.bytes_received,
-                sent_history,
-                received_history,
-                total_history,
-                dirty: true,
-            };
-            if let Some(previous_state) = previous_state.as_ref() {
-                adapter.dirty = previous_state.name != adapter.name
-                    || previous_state.state != adapter.state
-                    || previous_state.link_speed != adapter.link_speed
-                    || previous_state.utilization != adapter.utilization
-                    || previous_state.bytes_sent != adapter.bytes_sent
-                    || previous_state.bytes_received != adapter.bytes_received
-                    || previous_state.bytes_total != adapter.bytes_total;
+                if let Some(previous_state) = previous_state.as_ref() {
+                    adapter.dirty = previous_state.name != adapter.name
+                        || previous_state.state != adapter.state
+                        || previous_state.link_speed != adapter.link_speed
+                        || previous_state.utilization != adapter.utilization
+                        || previous_state.bytes_sent != adapter.bytes_sent
+                        || previous_state.bytes_received != adapter.bytes_received
+                        || previous_state.bytes_total != adapter.bytes_total;
+                }
+                adapters.push(adapter);
             }
-            adapters.push(adapter);
-        }
 
-        self.adapters = adapters;
-        let labels_changed = adapter_labels_changed
-            || previous_adapter_order
-                .iter()
-                .copied()
-                .ne(self.adapters.iter().map(|adapter| adapter.key));
-        self.update_listview();
-        if needs_initial_layout || previous_adapter_count != self.adapters.len() {
-            self.size_page();
-        } else if labels_changed {
-            self.label_graphs();
+            self.adapters = adapters;
+            self.scroll_offset = (self.scroll_offset + 2) % GRAPH_GRID;
+            let labels_changed = adapter_labels_changed
+                || previous_adapter_order
+                    .iter()
+                    .copied()
+                    .ne(self.adapters.iter().map(|adapter| adapter.key));
+            self.update_listview();
+            if needs_initial_layout || previous_adapter_count != self.adapters.len() {
+                self.size_page();
+            } else if labels_changed {
+                self.label_graphs();
+            }
+            self.update_graphs();
         }
     }
 
     unsafe fn collect_adapters() -> Result<Vec<RawAdapterEntry>, u32> {
-        let mut table = null_mut::<MIB_IF_TABLE2>();
-        let status = GetIfTable2(&mut table);
-        if status != 0 {
-            if !table.is_null() {
-                FreeMibTable(table as _);
+        unsafe {
+            let mut table = null_mut::<MIB_IF_TABLE2>();
+            let status = GetIfTable2(&mut table);
+            let table = OwnedIfTable::new(table);
+            if status != 0 {
+                return Err(status);
             }
-            return Err(status);
-        }
-        if table.is_null() {
-            return Err(windows_sys::Win32::Foundation::ERROR_INVALID_DATA);
-        }
+            let table = table.ok_or(windows_sys::Win32::Foundation::ERROR_INVALID_DATA)?;
+            let table_ptr = table.as_ptr();
 
-        let count = (*table).NumEntries as usize;
-        let mut adapters = Vec::with_capacity(count);
-        let rows = slice::from_raw_parts((*table).Table.as_ptr(), count);
-        for row in rows {
-            if !include_adapter(row) {
-                continue;
+            let count = (*table_ptr).NumEntries as usize;
+            let mut adapters = Vec::with_capacity(count);
+            let rows = slice::from_raw_parts((*table_ptr).Table.as_ptr(), count);
+            for row in rows {
+                if !include_adapter(row) {
+                    continue;
+                }
+
+                let mut name = wide_array_to_string(&row.Alias);
+                if name.is_empty() {
+                    name = wide_array_to_string(&row.Description);
+                }
+                let key = AdapterIdentity {
+                    luid: row.InterfaceLuid.Value,
+                    interface_index: row.InterfaceIndex,
+                };
+
+                adapters.push(RawAdapterEntry {
+                    interface_index: row.InterfaceIndex,
+                    key,
+                    name,
+                    state: adapter_state_text(row.OperStatus),
+                    link_speed_bps: row.ReceiveLinkSpeed.max(row.TransmitLinkSpeed),
+                    bytes_sent: row.OutOctets,
+                    bytes_received: row.InOctets,
+                });
             }
-
-            let mut name = wide_array_to_string(&row.Alias);
-            if name.is_empty() {
-                name = wide_array_to_string(&row.Description);
-            }
-            let key = AdapterIdentity {
-                luid: row.InterfaceLuid.Value,
-                interface_index: row.InterfaceIndex,
-            };
-
-            adapters.push(RawAdapterEntry {
-                interface_index: row.InterfaceIndex,
-                key,
-                name,
-                state: adapter_state_text(row.OperStatus),
-                link_speed_bps: row.ReceiveLinkSpeed.max(row.TransmitLinkSpeed),
-                bytes_sent: row.OutOctets,
-                bytes_received: row.InOctets,
-            });
+            Ok(adapters)
         }
-
-        FreeMibTable(table as _);
-        Ok(adapters)
     }
 
     unsafe fn configure_columns(&self) {
-        let list = self.list_hwnd();
-        if list.is_null() {
-            return;
-        }
+        unsafe {
+            let list = self.list_hwnd();
+            if list.is_null() {
+                return;
+            }
 
-        SendMessageW(
-            list,
-            LVM_SETEXTENDEDLISTVIEWSTYLE,
-            (LVS_EX_HEADERDRAGDROP | LVS_EX_FULLROWSELECT) as usize,
-            (LVS_EX_HEADERDRAGDROP | LVS_EX_FULLROWSELECT) as isize,
-        );
-
-        while SendMessageW(list, LVM_DELETECOLUMN, 0, 0) != 0 {}
-
-        let titles = network_column_titles();
-        let columns = [
-            (titles[0], 150, LVCFMT_LEFT),
-            (titles[1], 96, LVCFMT_RIGHT),
-            (titles[2], 90, LVCFMT_RIGHT),
-            (titles[3], 120, LVCFMT_LEFT),
-        ];
-
-        for (index, (title, width, fmt)) in columns.iter().enumerate() {
-            let mut title_wide = to_wide_null(title);
-            let mut column = LVCOLUMNW {
-                mask: LVCF_FMT | LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM,
-                fmt: *fmt,
-                cx: *width,
-                pszText: title_wide.as_mut_ptr(),
-                cchTextMax: title_wide.len() as i32,
-                iSubItem: index as i32,
-                ..zeroed()
-            };
             SendMessageW(
                 list,
-                LVM_INSERTCOLUMNW,
-                index,
-                &mut column as *mut _ as isize,
+                LVM_SETEXTENDEDLISTVIEWSTYLE,
+                (LVS_EX_HEADERDRAGDROP | LVS_EX_FULLROWSELECT) as usize,
+                (LVS_EX_HEADERDRAGDROP | LVS_EX_FULLROWSELECT) as isize,
             );
+
+            while SendMessageW(list, LVM_DELETECOLUMN, 0, 0) != 0 {}
+
+            let titles = network_column_titles();
+            let columns = [
+                (titles[0], 150, LVCFMT_LEFT),
+                (titles[1], 96, LVCFMT_RIGHT),
+                (titles[2], 90, LVCFMT_RIGHT),
+                (titles[3], 120, LVCFMT_LEFT),
+            ];
+
+            for (index, (title, width, fmt)) in columns.iter().enumerate() {
+                let mut title_wide = to_wide_null(title);
+                let mut column = LVCOLUMNW {
+                    mask: LVCF_FMT | LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM,
+                    fmt: *fmt,
+                    cx: *width,
+                    pszText: title_wide.as_mut_ptr(),
+                    cchTextMax: title_wide.len() as i32,
+                    iSubItem: index as i32,
+                    ..zeroed()
+                };
+                SendMessageW(
+                    list,
+                    LVM_INSERTCOLUMNW,
+                    index,
+                    &mut column as *mut _ as isize,
+                );
+            }
         }
     }
 
     unsafe fn update_listview(&self) {
-        // 列表只在适配器身份变化时替换整行，普通数值更新尽量走原位写回。
-        let list = self.list_hwnd();
-        if list.is_null() {
-            return;
-        }
-
-        SendMessageW(list, WM_SETREDRAW, 0, 0);
-
-        let mut existing_count = SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) as usize;
-        let common_count = existing_count.min(self.adapters.len());
-
-        for index in 0..common_count {
-            let adapter = &self.adapters[index];
-            let mut current_item = LVITEMW {
-                mask: LVIF_PARAM,
-                iItem: index as i32,
-                ..zeroed()
-            };
-            let current_interface_index =
-                if SendMessageW(list, LVM_GETITEMW, 0, &mut current_item as *mut _ as isize) != 0 {
-                    Some(current_item.lParam as u32)
-                } else {
-                    None
-                };
-
-            if current_interface_index != Some(adapter.interface_index) {
-                self.replace_row(list, index, adapter);
-            } else if adapter.dirty {
-                self.update_row(list, index, adapter);
+        unsafe {
+            // 列表只在适配器身份变化时替换整行，普通数值更新尽量走原位写回。
+            let list = self.list_hwnd();
+            if list.is_null() {
+                return;
             }
-        }
 
-        while existing_count > self.adapters.len() {
-            existing_count -= 1;
-            SendMessageW(list, LVM_DELETEITEM, existing_count, 0);
-        }
+            SendMessageW(list, WM_SETREDRAW, 0, 0);
 
-        for index in common_count..self.adapters.len() {
-            self.insert_row(list, index, &self.adapters[index]);
-        }
+            let mut existing_count = SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) as usize;
+            let common_count = existing_count.min(self.adapters.len());
 
-        finish_list_view_update(list);
+            for index in 0..common_count {
+                let adapter = &self.adapters[index];
+                let mut current_item = LVITEMW {
+                    mask: LVIF_PARAM,
+                    iItem: index as i32,
+                    ..zeroed()
+                };
+                let current_interface_index =
+                    if SendMessageW(list, LVM_GETITEMW, 0, &mut current_item as *mut _ as isize)
+                        != 0
+                    {
+                        Some(current_item.lParam as u32)
+                    } else {
+                        None
+                    };
+
+                if current_interface_index != Some(adapter.interface_index) {
+                    self.replace_row(list, index, adapter);
+                } else if adapter.dirty {
+                    self.update_row(list, index, adapter);
+                }
+            }
+
+            while existing_count > self.adapters.len() {
+                existing_count -= 1;
+                SendMessageW(list, LVM_DELETEITEM, existing_count, 0);
+            }
+
+            for index in common_count..self.adapters.len() {
+                self.insert_row(list, index, &self.adapters[index]);
+            }
+
+            finish_list_view_update(list);
+        }
     }
 
     unsafe fn insert_row(&self, list: HWND, index: usize, adapter: &NetworkAdapterEntry) {
-        let mut name = to_wide_null(&adapter.name);
-        let mut item = LVITEMW {
-            mask: LVIF_TEXT | LVIF_PARAM,
-            iItem: index as i32,
-            iSubItem: 0,
-            pszText: name.as_mut_ptr(),
-            cchTextMax: name.len() as i32,
-            lParam: adapter.interface_index as isize,
-            ..zeroed()
-        };
-        SendMessageW(list, LVM_INSERTITEMW, 0, &mut item as *mut _ as isize);
-        self.update_row(list, index, adapter);
+        unsafe {
+            let mut name = to_wide_null(&adapter.name);
+            let mut item = LVITEMW {
+                mask: LVIF_TEXT | LVIF_PARAM,
+                iItem: index as i32,
+                iSubItem: 0,
+                pszText: name.as_mut_ptr(),
+                cchTextMax: name.len() as i32,
+                lParam: adapter.interface_index as isize,
+                ..zeroed()
+            };
+            SendMessageW(list, LVM_INSERTITEMW, 0, &mut item as *mut _ as isize);
+            self.update_row(list, index, adapter);
+        }
     }
 
     unsafe fn replace_row(&self, list: HWND, index: usize, adapter: &NetworkAdapterEntry) {
-        let mut name = to_wide_null(&adapter.name);
-        let mut item = LVITEMW {
-            mask: LVIF_TEXT | LVIF_PARAM,
-            iItem: index as i32,
-            iSubItem: 0,
-            pszText: name.as_mut_ptr(),
-            cchTextMax: name.len() as i32,
-            lParam: adapter.interface_index as isize,
-            ..zeroed()
-        };
-        SendMessageW(list, LVM_SETITEMW, 0, &mut item as *mut _ as isize);
-        self.update_row(list, index, adapter);
+        unsafe {
+            let mut name = to_wide_null(&adapter.name);
+            let mut item = LVITEMW {
+                mask: LVIF_TEXT | LVIF_PARAM,
+                iItem: index as i32,
+                iSubItem: 0,
+                pszText: name.as_mut_ptr(),
+                cchTextMax: name.len() as i32,
+                lParam: adapter.interface_index as isize,
+                ..zeroed()
+            };
+            SendMessageW(list, LVM_SETITEMW, 0, &mut item as *mut _ as isize);
+            self.update_row(list, index, adapter);
+        }
     }
 
     unsafe fn update_row(&self, list: HWND, index: usize, adapter: &NetworkAdapterEntry) {
-        for (subitem, text) in adapter_row_texts(adapter).iter().enumerate() {
-            let mut value = to_wide_null(text);
-            let mut subitem_item = LVITEMW {
-                mask: LVIF_TEXT,
-                iItem: index as i32,
-                iSubItem: subitem as i32,
-                pszText: value.as_mut_ptr(),
-                cchTextMax: value.len() as i32,
-                ..zeroed()
-            };
-            SendMessageW(list, LVM_SETITEMW, 0, &mut subitem_item as *mut _ as isize);
+        unsafe {
+            for (subitem, text) in adapter_row_texts(adapter).iter().enumerate() {
+                let mut value = to_wide_null(text);
+                let mut subitem_item = LVITEMW {
+                    mask: LVIF_TEXT,
+                    iItem: index as i32,
+                    iSubItem: subitem as i32,
+                    pszText: value.as_mut_ptr(),
+                    cchTextMax: value.len() as i32,
+                    ..zeroed()
+                };
+                SendMessageW(list, LVM_SETITEMW, 0, &mut subitem_item as *mut _ as isize);
+            }
         }
     }
 
     unsafe fn ensure_graphs(&mut self, required: usize) {
-        if required <= self.graphs.len() || self.hwnd.is_null() {
-            return;
-        }
-
-        let frame_class = to_wide_null(FRAME_CLASS_NAME);
-        let button_class = to_wide_null(BUTTON_CLASS_NAME);
-        let empty_text = to_wide_null("");
-        let font = SendMessageW(self.hwnd, WM_GETFONT, 0, 0);
-
-        while self.graphs.len() < required {
-            let graph_id = IDC_NICGRAPH + self.graphs.len() as i32;
-            let graph_hwnd = CreateWindowExW(
-                WS_EX_CLIENTEDGE,
-                button_class.as_ptr(),
-                empty_text.as_ptr(),
-                WS_CHILD | WS_DISABLED | BS_OWNERDRAW as u32,
-                0,
-                0,
-                0,
-                0,
-                self.hwnd,
-                graph_id as usize as HMENU,
-                null_mut(),
-                null_mut(),
-            );
-            let frame_hwnd = CreateWindowExW(
-                WS_EX_NOPARENTNOTIFY,
-                frame_class.as_ptr(),
-                empty_text.as_ptr(),
-                0x0000_0007 | WS_CHILD,
-                0,
-                0,
-                0,
-                0,
-                self.hwnd,
-                null_mut(),
-                null_mut(),
-                null_mut(),
-            );
-            if graph_hwnd.is_null() || frame_hwnd.is_null() {
-                if !graph_hwnd.is_null() {
-                    DestroyWindow(graph_hwnd);
-                }
-                if !frame_hwnd.is_null() {
-                    DestroyWindow(frame_hwnd);
-                }
-                break;
+        unsafe {
+            if required <= self.graphs.len() || self.hwnd.is_null() {
+                return;
             }
 
-            SendMessageW(frame_hwnd, WM_SETFONT, font as usize, 0);
-            SendMessageW(graph_hwnd, WM_SETFONT, font as usize, 0);
-            ShowWindow(frame_hwnd, SW_HIDE);
-            ShowWindow(graph_hwnd, SW_HIDE);
-            self.graphs.push(NetworkGraphControl {
-                frame_hwnd,
-                graph_hwnd,
-            });
+            let frame_class = to_wide_null(FRAME_CLASS_NAME);
+            let button_class = to_wide_null(BUTTON_CLASS_NAME);
+            let empty_text = to_wide_null("");
+            let font = SendMessageW(self.hwnd, WM_GETFONT, 0, 0);
+
+            while self.graphs.len() < required {
+                let graph_id = IDC_NICGRAPH + self.graphs.len() as i32;
+                let graph_hwnd = CreateWindowExW(
+                    WS_EX_CLIENTEDGE,
+                    button_class.as_ptr(),
+                    empty_text.as_ptr(),
+                    WS_CHILD | WS_DISABLED | BS_OWNERDRAW as u32,
+                    0,
+                    0,
+                    0,
+                    0,
+                    self.hwnd,
+                    graph_id as usize as HMENU,
+                    null_mut(),
+                    null_mut(),
+                );
+                let frame_hwnd = CreateWindowExW(
+                    WS_EX_NOPARENTNOTIFY,
+                    frame_class.as_ptr(),
+                    empty_text.as_ptr(),
+                    0x0000_0007 | WS_CHILD,
+                    0,
+                    0,
+                    0,
+                    0,
+                    self.hwnd,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                );
+                if graph_hwnd.is_null() || frame_hwnd.is_null() {
+                    if !graph_hwnd.is_null() {
+                        DestroyWindow(graph_hwnd);
+                    }
+                    if !frame_hwnd.is_null() {
+                        DestroyWindow(frame_hwnd);
+                    }
+                    break;
+                }
+
+                SendMessageW(frame_hwnd, WM_SETFONT, font as usize, 0);
+                SendMessageW(graph_hwnd, WM_SETFONT, font as usize, 0);
+                ShowWindow(frame_hwnd, SW_HIDE);
+                ShowWindow(graph_hwnd, SW_HIDE);
+                self.graphs.push(NetworkGraphControl {
+                    frame_hwnd,
+                    graph_hwnd,
+                });
+            }
         }
     }
 
     unsafe fn destroy_graphs(&mut self) {
-        for graph in self.graphs.drain(..) {
-            if !graph.graph_hwnd.is_null() {
-                DestroyWindow(graph.graph_hwnd);
+        unsafe {
+            for graph in self.graphs.drain(..) {
+                if !graph.graph_hwnd.is_null() {
+                    DestroyWindow(graph.graph_hwnd);
+                }
+                if !graph.frame_hwnd.is_null() {
+                    DestroyWindow(graph.frame_hwnd);
+                }
             }
-            if !graph.frame_hwnd.is_null() {
-                DestroyWindow(graph.frame_hwnd);
+            if !self.cached_graph_bitmap_old.is_null() {
+                SelectObject(self.cached_graph_dc, self.cached_graph_bitmap_old);
             }
+            if !self.cached_graph_bitmap.is_null() {
+                DeleteObject(self.cached_graph_bitmap as _);
+            }
+            if !self.cached_graph_dc.is_null() {
+                DeleteDC(self.cached_graph_dc);
+            }
+            self.cached_graph_dc = null_mut();
+            self.cached_graph_bitmap = null_mut();
+            self.cached_graph_bitmap_old = null_mut();
+            self.cached_graph_width = 0;
+            self.cached_graph_height = 0;
+            self.graphs_per_page = 0;
+            self.first_visible_adapter = 0;
         }
-        if !self.cached_graph_bitmap_old.is_null() {
-            SelectObject(self.cached_graph_dc, self.cached_graph_bitmap_old);
-        }
-        if !self.cached_graph_bitmap.is_null() {
-            DeleteObject(self.cached_graph_bitmap as _);
-        }
-        if !self.cached_graph_dc.is_null() {
-            DeleteDC(self.cached_graph_dc);
-        }
-        self.cached_graph_dc = null_mut();
-        self.cached_graph_bitmap = null_mut();
-        self.cached_graph_bitmap_old = null_mut();
-        self.cached_graph_width = 0;
-        self.cached_graph_height = 0;
-        self.graphs_per_page = 0;
-        self.first_visible_adapter = 0;
     }
 
     unsafe fn update_graphs(&self) {
-        // 只重绘当前一页真正可见的图表，避免隐藏面板也跟着刷新。
-        for pane_index in 0..self.graphs_per_page {
-            let Some(graph) = self.graphs.get(pane_index) else {
-                break;
-            };
-            InvalidateRect(graph.graph_hwnd, null_mut(), 0);
+        unsafe {
+            // 只重绘当前一页真正可见的图表，避免隐藏面板也跟着刷新。
+            for pane_index in 0..self.graphs_per_page {
+                let Some(graph) = self.graphs.get(pane_index) else {
+                    break;
+                };
+                InvalidateRect(graph.graph_hwnd, null_mut(), 0);
+            }
         }
     }
 
     unsafe fn label_graphs(&mut self) {
-        // 图表标题始终绑定当前可见适配器切片，滚动后要一起更新标题文字。
-        let first_visible = self.first_visible_adapter();
-        for pane_index in 0..self.graphs_per_page {
-            let Some(graph) = self.graphs.get(pane_index) else {
-                break;
-            };
-            if let Some(adapter) = self.adapters.get(first_visible + pane_index) {
-                let title = to_wide_null(&adapter.name);
-                SetWindowTextW(graph.frame_hwnd, title.as_ptr());
-            } else {
-                let title = to_wide_null("");
-                SetWindowTextW(graph.frame_hwnd, title.as_ptr());
+        unsafe {
+            // 图表标题始终绑定当前可见适配器切片，滚动后要一起更新标题文字。
+            let first_visible = self.first_visible_adapter();
+            for pane_index in 0..self.graphs_per_page {
+                let Some(graph) = self.graphs.get(pane_index) else {
+                    break;
+                };
+                if let Some(adapter) = self.adapters.get(first_visible + pane_index) {
+                    let title = to_wide_null(&adapter.name);
+                    SetWindowTextW(graph.frame_hwnd, title.as_ptr());
+                } else {
+                    let title = to_wide_null("");
+                    SetWindowTextW(graph.frame_hwnd, title.as_ptr());
+                }
             }
         }
     }
@@ -1215,59 +1284,63 @@ unsafe fn size_graph(
     def_spacing: i32,
     top_spacing: i32,
 ) -> HDWP {
-    // 单个网络图由“外层 frame + 内层 owner-draw graph”两层控件组成，这里一次性定位它们。
-    let graph_width = (rect.right - def_spacing * 2).max(0);
-    let graph_height = (rect.bottom - top_spacing - def_spacing).max(0);
+    unsafe {
+        // 单个网络图由“外层 frame + 内层 owner-draw graph”两层控件组成，这里一次性定位它们。
+        let graph_width = (rect.right - def_spacing * 2).max(0);
+        let graph_height = (rect.bottom - top_spacing - def_spacing).max(0);
 
-    hdwp = DeferWindowPos(
-        hdwp,
-        graph.frame_hwnd,
-        null_mut(),
-        rect.left,
-        rect.top,
-        rect.right,
-        rect.bottom,
-        SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-    );
+        hdwp = DeferWindowPos(
+            hdwp,
+            graph.frame_hwnd,
+            null_mut(),
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
 
-    let left = rect.left + def_spacing;
-    let top = rect.top + top_spacing;
-    let right = left + graph_width;
-    let bottom = top + graph_height;
-    DeferWindowPos(
-        hdwp,
-        graph.graph_hwnd,
-        null_mut(),
-        left,
-        top,
-        right - left,
-        bottom - top,
-        SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-    )
+        let left = rect.left + def_spacing;
+        let top = rect.top + top_spacing;
+        let right = left + graph_width;
+        let bottom = top + graph_height;
+        DeferWindowPos(
+            hdwp,
+            graph.graph_hwnd,
+            null_mut(),
+            left,
+            top,
+            right - left,
+            bottom - top,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        )
+    }
 }
 
 unsafe fn hide_graph(mut hdwp: HDWP, graph: &NetworkGraphControl) -> HDWP {
-    hdwp = DeferWindowPos(
-        hdwp,
-        graph.frame_hwnd,
-        null_mut(),
-        0,
-        0,
-        0,
-        0,
-        SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW,
-    );
+    unsafe {
+        hdwp = DeferWindowPos(
+            hdwp,
+            graph.frame_hwnd,
+            null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW,
+        );
 
-    DeferWindowPos(
-        hdwp,
-        graph.graph_hwnd,
-        null_mut(),
-        0,
-        0,
-        0,
-        0,
-        SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW,
-    )
+        DeferWindowPos(
+            hdwp,
+            graph.graph_hwnd,
+            null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW,
+        )
+    }
 }
 
 fn graphs_per_page(graph_height: i32, adapter_count: usize) -> usize {
@@ -1351,6 +1424,18 @@ fn adapter_state_text(oper_status: i32) -> String {
             _ => adapter_state("Unknown").to_string(),
         }
     }
+}
+
+fn adapter_counter_delta(
+    current_sent: u64,
+    current_received: u64,
+    previous: Option<(u64, u64)>,
+) -> Option<(u64, u64, u64)> {
+    let (previous_sent, previous_received) = previous?;
+    let sent = current_sent.checked_sub(previous_sent)?;
+    let received = current_received.checked_sub(previous_received)?;
+    let total = sent.checked_add(received)?;
+    Some((sent, received, total))
 }
 
 fn utilization_ratio_percent(
@@ -1437,72 +1522,76 @@ fn format_counter(value: u64) -> String {
 }
 
 unsafe fn fill_black(hdc: HDC, rect: &RECT) {
-    FillRect(hdc, rect, GetStockObject(BLACK_BRUSH) as HBRUSH);
+    unsafe {
+        FillRect(hdc, rect, GetStockObject(BLACK_BRUSH) as HBRUSH);
+    }
 }
 
 unsafe fn draw_scale(hdc: HDC, rect: &RECT, max_scale_value: u32) -> i32 {
-    // 刻度区单独占据左侧一列，返回值是后续真正绘图区域的左边界偏移。
-    let top_text = format_scale_label(max_scale_value as f32);
-    let middle_text = format_scale_label(max_scale_value as f32 / 2.0);
-    let bottom_text = "0 %";
-    let (sample_width, sample_height) = measure_graph_text(hdc, " 100 %");
-    let (top_width, top_height) = measure_graph_text(hdc, &top_text);
-    let (middle_width, middle_height) = measure_graph_text(hdc, &middle_text);
-    let (bottom_width, bottom_height) = measure_graph_text(hdc, bottom_text);
-    let scale_width = sample_width
-        .max(top_width)
-        .max(middle_width)
-        .max(bottom_width);
-    let scale_height = sample_height
-        .max(top_height)
-        .max(middle_height)
-        .max(bottom_height);
-    let divider_x = rect.left + scale_width;
+    unsafe {
+        // 刻度区单独占据左侧一列，返回值是后续真正绘图区域的左边界偏移。
+        let top_text = format_scale_label(max_scale_value as f32);
+        let middle_text = format_scale_label(max_scale_value as f32 / 2.0);
+        let bottom_text = "0 %";
+        let (sample_width, sample_height) = measure_graph_text(hdc, " 100 %");
+        let (top_width, top_height) = measure_graph_text(hdc, &top_text);
+        let (middle_width, middle_height) = measure_graph_text(hdc, &middle_text);
+        let (bottom_width, bottom_height) = measure_graph_text(hdc, bottom_text);
+        let scale_width = sample_width
+            .max(top_width)
+            .max(middle_width)
+            .max(bottom_width);
+        let scale_height = sample_height
+            .max(top_height)
+            .max(middle_height)
+            .max(bottom_height);
+        let divider_x = rect.left + scale_width;
 
-    draw_graph_text(
-        hdc,
-        RECT {
-            left: rect.left,
-            top: rect.top,
-            right: divider_x - 3,
-            bottom: rect.top + scale_height,
-        },
-        &top_text,
-        rgb(255, 255, 0),
-        DT_RIGHT,
-    );
-    draw_graph_text(
-        hdc,
-        RECT {
-            left: rect.left,
-            top: rect.top + ((rect.bottom - rect.top - scale_height) / 2),
-            right: divider_x - 3,
-            bottom: rect.top + ((rect.bottom - rect.top + scale_height) / 2),
-        },
-        &middle_text,
-        rgb(255, 255, 0),
-        DT_RIGHT,
-    );
-    draw_graph_text(
-        hdc,
-        RECT {
-            left: rect.left,
-            top: rect.bottom - scale_height,
-            right: divider_x - 3,
-            bottom: rect.bottom,
-        },
-        bottom_text,
-        rgb(255, 255, 0),
-        DT_RIGHT,
-    );
+        draw_graph_text(
+            hdc,
+            RECT {
+                left: rect.left,
+                top: rect.top,
+                right: divider_x - 3,
+                bottom: rect.top + scale_height,
+            },
+            &top_text,
+            rgb(255, 255, 0),
+            DT_RIGHT,
+        );
+        draw_graph_text(
+            hdc,
+            RECT {
+                left: rect.left,
+                top: rect.top + ((rect.bottom - rect.top - scale_height) / 2),
+                right: divider_x - 3,
+                bottom: rect.top + ((rect.bottom - rect.top + scale_height) / 2),
+            },
+            &middle_text,
+            rgb(255, 255, 0),
+            DT_RIGHT,
+        );
+        draw_graph_text(
+            hdc,
+            RECT {
+                left: rect.left,
+                top: rect.bottom - scale_height,
+                right: divider_x - 3,
+                bottom: rect.bottom,
+            },
+            bottom_text,
+            rgb(255, 255, 0),
+            DT_RIGHT,
+        );
 
-    let old_pen = SelectObject(hdc, GetStockObject(DC_PEN) as _);
-    SetDCPenColor(hdc, rgb(255, 255, 0));
-    MoveToEx(hdc, divider_x, rect.top, null_mut());
-    LineTo(hdc, divider_x, rect.bottom);
-    SelectObject(hdc, old_pen);
+        let old_pen = SelectObject(hdc, GetStockObject(DC_PEN) as _);
+        SetDCPenColor(hdc, rgb(255, 255, 0));
+        MoveToEx(hdc, divider_x, rect.top, null_mut());
+        LineTo(hdc, divider_x, rect.bottom);
+        SelectObject(hdc, old_pen);
 
-    scale_width + 3
+        scale_width + 3
+    }
 }
 
 fn draw_scale_gpu(frame: &ChartFrame<'_>, rect: &RECT) -> i32 {
@@ -1521,47 +1610,51 @@ fn draw_scale_gpu(frame: &ChartFrame<'_>, rect: &RECT) -> i32 {
 }
 
 unsafe fn measure_graph_text(hdc: HDC, text: &str) -> (i32, i32) {
-    let mut text_wide = to_wide_null(text);
-    let mut rect = RECT {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
-    DrawTextW(
-        hdc,
-        text_wide.as_mut_ptr(),
-        -1,
-        &mut rect,
-        DT_CALCRECT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
-    );
-    (
-        (rect.right - rect.left).max(1),
-        (rect.bottom - rect.top).max(1),
-    )
+    unsafe {
+        let mut text_wide = to_wide_null(text);
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        DrawTextW(
+            hdc,
+            text_wide.as_mut_ptr(),
+            -1,
+            &mut rect,
+            DT_CALCRECT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        (
+            (rect.right - rect.left).max(1),
+            (rect.bottom - rect.top).max(1),
+        )
+    }
 }
 
 unsafe fn draw_grid(hdc: HDC, rect: &RECT, scroll_offset: i32, zoom: u32) {
-    // 网格密度会随着 zoom 调整，避免在低利用率场景下曲线长期贴底看不清。
-    let old_pen = SelectObject(hdc, GetStockObject(DC_PEN) as _);
-    SetDCPenColor(hdc, rgb(0, 128, 64));
-    let square_height = GRAPH_GRID + ((20 * (100 - (100 / zoom.max(1) as i32))) / 100);
+    unsafe {
+        // 网格密度会随着 zoom 调整，避免在低利用率场景下曲线长期贴底看不清。
+        let old_pen = SelectObject(hdc, GetStockObject(DC_PEN) as _);
+        SetDCPenColor(hdc, rgb(0, 128, 64));
+        let square_height = GRAPH_GRID + ((20 * (100 - (100 / zoom.max(1) as i32))) / 100);
 
-    let mut y = rect.bottom - square_height - 1;
-    while y > rect.top {
-        MoveToEx(hdc, rect.left, y, null_mut());
-        LineTo(hdc, rect.right, y);
-        y -= square_height.max(1);
+        let mut y = rect.bottom - square_height - 1;
+        while y > rect.top {
+            MoveToEx(hdc, rect.left, y, null_mut());
+            LineTo(hdc, rect.right, y);
+            y -= square_height.max(1);
+        }
+
+        let mut x = rect.right - scroll_offset;
+        while x > rect.left {
+            MoveToEx(hdc, x, rect.top, null_mut());
+            LineTo(hdc, x, rect.bottom);
+            x -= GRAPH_GRID;
+        }
+
+        SelectObject(hdc, old_pen);
     }
-
-    let mut x = rect.right - scroll_offset;
-    while x > rect.left {
-        MoveToEx(hdc, x, rect.top, null_mut());
-        LineTo(hdc, x, rect.bottom);
-        x -= GRAPH_GRID;
-    }
-
-    SelectObject(hdc, old_pen);
 }
 
 fn draw_grid_gpu(frame: &ChartFrame<'_>, rect: &RECT, scroll_offset: i32, zoom: u32) {
@@ -1593,36 +1686,38 @@ fn draw_grid_gpu(frame: &ChartFrame<'_>, rect: &RECT, scroll_offset: i32, zoom: 
 }
 
 unsafe fn draw_history(hdc: HDC, rect: &RECT, history: &HistoryBuffer, color: u32, zoom: u32) {
-    // 三条折线都共用这套绘制函数，只靠颜色区分 total / received / sent。
-    if history.is_empty() {
-        return;
-    }
-
-    let width = (rect.right - rect.left).max(1) as usize;
-    let graph_height = (rect.bottom - rect.top).max(1);
-    let scale = ((width - 1) / history.len()).max(1);
-
-    let old_pen = SelectObject(hdc, GetStockObject(DC_PEN) as _);
-    SetDCPenColor(hdc, color);
-    MoveToEx(
-        hdc,
-        rect.right,
-        scaled_history_y(rect, graph_height, history.newest_value(), zoom),
-        null_mut(),
-    );
-
-    for (index, value) in history.iter().enumerate() {
-        if index * scale >= width {
-            break;
+    unsafe {
+        // 三条折线都共用这套绘制函数，只靠颜色区分 total / received / sent。
+        if history.is_empty() {
+            return;
         }
-        LineTo(
-            hdc,
-            rect.right - (scale * index) as i32,
-            scaled_history_y(rect, graph_height, value, zoom),
-        );
-    }
 
-    SelectObject(hdc, old_pen);
+        let width = (rect.right - rect.left).max(1) as usize;
+        let graph_height = (rect.bottom - rect.top).max(1);
+        let scale = ((width - 1) / history.len()).max(1);
+
+        let old_pen = SelectObject(hdc, GetStockObject(DC_PEN) as _);
+        SetDCPenColor(hdc, color);
+        MoveToEx(
+            hdc,
+            rect.right,
+            scaled_history_y(rect, graph_height, history.newest_value(), zoom),
+            null_mut(),
+        );
+
+        for (index, value) in history.iter().enumerate() {
+            if index * scale >= width {
+                break;
+            }
+            LineTo(
+                hdc,
+                rect.right - (scale * index) as i32,
+                scaled_history_y(rect, graph_height, value, zoom),
+            );
+        }
+
+        SelectObject(hdc, old_pen);
+    }
 }
 
 fn draw_history_gpu(
@@ -1691,27 +1786,33 @@ fn format_scale_label(value: f32) -> String {
 }
 
 unsafe fn draw_graph_text(hdc: HDC, mut rect: RECT, text: &str, color: u32, align: u32) {
-    let mut text_wide = to_wide_null(text);
-    SetBkMode(hdc, TRANSPARENT as i32);
-    SetTextColor(hdc, color);
-    DrawTextW(
-        hdc,
-        text_wide.as_mut_ptr(),
-        -1,
-        &mut rect,
-        align | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
-    );
+    unsafe {
+        let mut text_wide = to_wide_null(text);
+        SetBkMode(hdc, TRANSPARENT as i32);
+        SetTextColor(hdc, color);
+        DrawTextW(
+            hdc,
+            text_wide.as_mut_ptr(),
+            -1,
+            &mut rect,
+            align | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
+        );
+    }
 }
 
 unsafe fn draw_graph_scale_overlay(hdc: HDC, rect: RECT, scale_max: u8) {
-    draw_scale(hdc, &rect, graph_scale_top_value(scale_max));
+    unsafe {
+        draw_scale(hdc, &rect, graph_scale_top_value(scale_max));
+    }
 }
 
 unsafe fn layout_spacing() -> (i32, i32) {
-    let units = GetDialogBaseUnits() as usize;
-    let def_spacing = (DEFSPACING_BASE * i32::from(loword(units))) / DLG_SCALE_X;
-    let top_spacing = (TOPSPACING_BASE * i32::from(hiword(units))) / DLG_SCALE_Y;
-    (def_spacing, top_spacing)
+    unsafe {
+        let units = GetDialogBaseUnits() as usize;
+        let def_spacing = (DEFSPACING_BASE * i32::from(loword(units))) / DLG_SCALE_X;
+        let top_spacing = (TOPSPACING_BASE * i32::from(hiword(units))) / DLG_SCALE_Y;
+        (def_spacing, top_spacing)
+    }
 }
 
 const fn rgb(red: u8, green: u8, blue: u8) -> u32 {
@@ -1762,5 +1863,16 @@ mod tests {
     fn renamed_adapter_updates_the_primary_list_column() {
         let adapter = test_adapter("Renamed Ethernet");
         assert_eq!(adapter_row_texts(&adapter)[0], "Renamed Ethernet");
+    }
+
+    #[test]
+    fn adapter_counter_delta_rejects_missing_regressed_and_overflowed_intervals() {
+        assert_eq!(adapter_counter_delta(10, 20, None), None);
+        assert_eq!(adapter_counter_delta(9, 20, Some((10, 10))), None);
+        assert_eq!(adapter_counter_delta(u64::MAX, 1, Some((0, 0))), None);
+        assert_eq!(
+            adapter_counter_delta(15, 24, Some((10, 20))),
+            Some((5, 4, 9))
+        );
     }
 }

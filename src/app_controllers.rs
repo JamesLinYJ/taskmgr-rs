@@ -2,30 +2,23 @@
 //! 这些控制器把长期存活的 UI 状态从 `App` 中分离，同时保持 Win32 消息流完整。
 //!
 //! 四个控制器各司其职：
-//! - RuntimeStatsController：CPU/内存采样与差值计算
+//! - RuntimeStatsController：保存后台系统采样器提交的汇总快照
 //! - TrayController：托盘图标切换与提示文本
 //! - MenuController：菜单弹出/跟踪状态机
 //! - WindowModeController：无标题模式与置顶模式
 
 use std::cell::Cell;
 use std::mem::{size_of, zeroed};
-use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_INVALID_STATE, HWND,
-};
-use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
-use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+use windows_sys::Win32::Foundation::{ERROR_GEN_FAILURE, ERROR_INVALID_STATE, GetLastError, HWND};
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFYICONDATAW,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{HICON, HMENU, LR_DEFAULTCOLOR, LR_DEFAULTSIZE};
 
-use crate::assets::{load_icon_resource, TRAY_ICON_RESOURCES};
-use crate::cpu_sampler::{
-    query_processor_performance, summed_processor_times, ProcessorPerformance,
-};
-use crate::perfpage::PerformanceSnapshot;
+use crate::assets::{TRAY_ICON_RESOURCES, load_icon_resource};
 use crate::resource::PWM_TRAYICON;
+use crate::system_sampler::SystemSample;
 use crate::winutil::{
     destroy_icon_handle, format_resource_string, record_win32_error, to_wide_null,
 };
@@ -33,7 +26,7 @@ use crate::winutil::{
 const NOTIFY_ICON_TIP_CAPACITY: usize = 128;
 
 /// 运行时统计控制器。
-/// 通过全 processor-group 累计时间差计算 CPU 使用率，并通过 GlobalMemoryStatusEx 获取内存占用。
+/// 只保存后台采样器已经验证并原子提交的汇总字段。
 #[derive(Default)]
 pub struct RuntimeStatsController {
     pub cpu_usage: u8,
@@ -41,81 +34,15 @@ pub struct RuntimeStatsController {
     pub mem_limit_kb: u64,
     pub process_count: u32,
     pub processor_count: usize,
-    previous_idle: u64,
-    previous_kernel: u64,
-    previous_user: u64,
-    processor_info: Vec<ProcessorPerformance>,
-    last_refresh_error: Option<u32>,
 }
 
 impl RuntimeStatsController {
-    pub fn apply_snapshot(&mut self, snapshot: PerformanceSnapshot) {
-        self.cpu_usage = snapshot.cpu_usage;
-        self.mem_usage_kb = snapshot.mem_usage_kb;
-        self.mem_limit_kb = snapshot.mem_limit_kb;
-        self.process_count = snapshot.process_count;
-        self.processor_count = snapshot.processor_count;
-        self.last_refresh_error = None;
-    }
-
-    pub fn refresh_runtime_stats(&mut self) {
-        match self.collect_runtime_stats() {
-            Ok(()) => self.last_refresh_error = None,
-            Err(error) => {
-                if self.last_refresh_error != Some(error) {
-                    record_win32_error("runtime stats refresh", error);
-                }
-                self.last_refresh_error = Some(error);
-            }
-        }
-    }
-
-    fn collect_runtime_stats(&mut self) -> Result<(), u32> {
-        // Query every component into local storage first. A failed component leaves the previous
-        // coherent summary untouched instead of mixing values from different refreshes.
-        let mut processor_info = Vec::with_capacity(self.processor_info.len().max(1));
-        query_processor_performance(self.processor_count.max(1), &mut processor_info)
-            .map_err(|status| status as u32)?;
-        if processor_info.is_empty() {
-            return Err(ERROR_INVALID_DATA);
-        }
-
-        let mut memory = unsafe { zeroed::<MEMORYSTATUSEX>() };
-        memory.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
-        if unsafe { GlobalMemoryStatusEx(&mut memory) } == 0 {
-            return Err(last_error_or_gen_failure());
-        }
-        let process_count = process_count()?;
-
-        let processor_count_changed = self.processor_count != processor_info.len();
-        let (idle_value, kernel_value, user_value) = summed_processor_times(&processor_info);
-        let (previous_idle, previous_kernel, previous_user) = if processor_count_changed {
-            (0, 0, 0)
-        } else {
-            (self.previous_idle, self.previous_kernel, self.previous_user)
-        };
-        let mut cpu_usage = self.cpu_usage;
-        if previous_idle != 0 {
-            let delta_idle = idle_value.saturating_sub(previous_idle);
-            let delta_total = kernel_value
-                .saturating_sub(previous_kernel)
-                .saturating_add(user_value.saturating_sub(previous_user));
-            if delta_total != 0 {
-                let active_ticks = delta_total.saturating_sub(delta_idle);
-                cpu_usage = ((active_ticks.saturating_mul(100)) / delta_total).min(100) as u8;
-            }
-        }
-
-        self.cpu_usage = cpu_usage;
-        self.mem_usage_kb = memory.ullTotalPhys.saturating_sub(memory.ullAvailPhys) / 1024;
-        self.mem_limit_kb = memory.ullTotalPhys / 1024;
-        self.process_count = process_count;
-        self.processor_count = processor_info.len();
-        self.previous_idle = idle_value;
-        self.previous_kernel = kernel_value;
-        self.previous_user = user_value;
-        self.processor_info = processor_info;
-        Ok(())
+    pub fn apply_sample(&mut self, sample: &SystemSample) {
+        self.cpu_usage = sample.cpu_usage;
+        self.mem_usage_kb = sample.physical_mem_usage_kb;
+        self.mem_limit_kb = sample.physical_mem_limit_kb;
+        self.process_count = sample.process_count;
+        self.processor_count = sample.processor_count;
     }
 }
 
@@ -247,7 +174,7 @@ impl Drop for TrayController {
 }
 
 /// 菜单状态控制器。
-/// 记录当前活动菜单句柄、菜单跟踪状态和弹出状态，用于任务管理器的
+/// 借用当前页面拥有的活动菜单句柄，并记录菜单跟踪状态和弹出状态，用于任务管理器的
 /// "隐藏时最小化"和菜单自动关闭逻辑。
 #[derive(Default)]
 pub struct MenuController {
@@ -334,24 +261,5 @@ impl WindowModeController {
 
     pub fn mark_restored(&mut self) {
         self.temporarily_hidden = false;
-    }
-}
-
-fn process_count() -> Result<u32, u32> {
-    let mut perf = unsafe { zeroed::<PERFORMANCE_INFORMATION>() };
-    perf.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
-    if unsafe { K32GetPerformanceInfo(&mut perf, perf.cb) } == 0 {
-        return Err(last_error_or_gen_failure());
-    }
-
-    Ok(perf.ProcessCount)
-}
-
-fn last_error_or_gen_failure() -> u32 {
-    let error = unsafe { GetLastError() };
-    if error == 0 {
-        ERROR_GEN_FAILURE
-    } else {
-        error
     }
 }

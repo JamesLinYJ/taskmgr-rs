@@ -6,17 +6,19 @@ use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    DrawTextW, GetCurrentObject, GetObjectW, GetStockObject, LineTo, MoveToEx, Polyline,
-    SelectObject, SetBkMode, SetDCPenColor, SetTextColor, DC_PEN, DT_CENTER, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, HDC, LOGFONTW, OBJ_FONT, TRANSPARENT,
+    DC_PEN, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW, GetCurrentObject,
+    GetObjectW, GetStockObject, HDC, LOGFONTW, LineTo, MoveToEx, OBJ_FONT, Polyline, SelectObject,
+    SetBkMode, SetDCPenColor, SetTextColor, TRANSPARENT,
 };
-use windows_sys::Win32::UI::Shell::StrFormatByteSizeW;
+use windows_sys::Win32::UI::Shell::{
+    SFBS_FLAGS_ROUND_TO_NEAREST_DISPLAYED_DIGIT, StrFormatByteSizeEx,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DeferWindowPos, SetDlgItemTextW, HDWP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREDRAW, SWP_NOZORDER,
+    DeferWindowPos, HDWP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREDRAW, SWP_NOZORDER, SetDlgItemTextW,
 };
 
 use crate::chart_renderer::{ChartColor, ChartFrame};
-use crate::drawing::{fill_black, fill_rect_color, rgb, HistoryBuffer};
+use crate::drawing::{HistoryBuffer, fill_black, fill_rect_color, rgb};
 use crate::winutil::to_wide_null;
 
 pub const HIST_SIZE: usize = 2000;
@@ -80,26 +82,21 @@ pub fn format_mem_meter_text(mem_usage_kb: u64) -> String {
     // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
         let mut buffer = [0u16; 32];
-        let byte_count = mem_usage_kb.saturating_mul(1024).min(i64::MAX as u64) as i64;
-        if !StrFormatByteSizeW(byte_count, buffer.as_mut_ptr(), buffer.len() as u32).is_null() {
+        if let Some(byte_count) = mem_usage_kb.checked_mul(1024)
+            && StrFormatByteSizeEx(
+                byte_count,
+                SFBS_FLAGS_ROUND_TO_NEAREST_DISPLAYED_DIGIT,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+            ) >= 0
+        {
             let len = buffer
                 .iter()
                 .position(|&ch| ch == 0)
                 .unwrap_or(buffer.len());
             return String::from_utf16_lossy(&buffer[..len]);
         }
-
-        // Match XP intent: prefer compact byte-size text over raw kilobytes.
-        let mem_usage_bytes = mem_usage_kb.saturating_mul(1024);
-        let gib = 1024_u64 * 1024 * 1024;
-        let mib = 1024_u64 * 1024;
-        if mem_usage_bytes >= gib {
-            format!("{:.1} GB", mem_usage_bytes as f64 / gib as f64)
-        } else if mem_usage_bytes >= mib {
-            format!("{:.1} MB", mem_usage_bytes as f64 / mib as f64)
-        } else {
-            format!("{mem_usage_kb} KB")
-        }
+        format!("{mem_usage_kb} KB")
     }
 }
 
@@ -430,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_formatter_saturates_large_kilobyte_values() {
-        assert!(!format_mem_meter_text(u64::MAX).is_empty());
+    fn memory_formatter_preserves_unrepresentable_byte_counts_as_kilobytes() {
+        assert_eq!(format_mem_meter_text(u64::MAX), format!("{} KB", u64::MAX));
     }
 }

@@ -17,78 +17,82 @@ use std::mem::{size_of, zeroed};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::slice;
-use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
+use std::sync::mpsc::TryRecvError;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_FILE_NOT_FOUND, ERROR_GEN_FAILURE,
-    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_DATA, ERROR_INVALID_PARAMETER, ERROR_NONE_MAPPED,
-    ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, FILETIME, HANDLE, HINSTANCE, HWND,
-    INVALID_HANDLE_VALUE, LPARAM, POINT, RECT, WPARAM,
+    ERROR_FILE_NOT_FOUND, ERROR_GEN_FAILURE, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_DATA,
+    ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_NONE_MAPPED,
+    ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND, FILETIME, GetLastError, HANDLE, HINSTANCE, HWND,
+    LPARAM, LocalFree, POINT, RECT, RtlNtStatusToDosError, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::MapWindowPoints;
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{
-    GetLengthSid, IsValidSid, IsWellKnownSid, LookupAccountSidW, WinLocalServiceSid,
-    WinLocalSystemSid, WinNetworkServiceSid, SID_NAME_USE,
+    GetLengthSid, GetTokenInformation, IsValidSid, IsWellKnownSid, LookupAccountSidW, SID_NAME_USE,
+    TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalServiceSid, WinLocalSystemSid,
+    WinNetworkServiceSid,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
 };
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
-    REG_EXPAND_SZ, REG_SZ,
+    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_EXPAND_SZ, REG_SZ, RegCloseKey, RegOpenKeyExW,
+    RegQueryValueExW,
 };
 use windows_sys::Win32::System::RemoteDesktop::{
-    WTSEnumerateProcessesW, WTSFreeMemory, WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW,
+    WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW, WTSEnumerateProcessesW,
 };
 use windows_sys::Win32::System::SystemInformation::{
     GetSystemTimeAsFileTime, GetWindowsDirectoryW,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, GetPriorityClass, GetProcessAffinityMask, GetProcessHandleCount,
-    GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, SetPriorityClass,
-    SetProcessAffinityMask, TerminateProcess, ABOVE_NORMAL_PRIORITY_CLASS,
-    BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
-    PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SET_INFORMATION, PROCESS_TERMINATE, PROCESS_VM_READ, REALTIME_PRIORITY_CLASS,
-    STARTUPINFOW,
+    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, CreateProcessW, GetPriorityClass,
+    GetProcessAffinityMask, GetProcessHandleCount, GetProcessTimes, HIGH_PRIORITY_CLASS,
+    IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, OpenProcess, OpenProcessToken, PROCESS_INFORMATION,
+    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION,
+    PROCESS_TERMINATE, PROCESS_VM_READ, QueryFullProcessImageNameW, REALTIME_PRIORITY_CLASS,
+    STARTUPINFOW, SetPriorityClass, SetProcessAffinityMask, TerminateProcess,
 };
 use windows_sys::Win32::UI::Controls::{
-    CheckDlgButton, IsDlgButtonChecked, BST_CHECKED, BST_UNCHECKED, LVCFMT_LEFT, LVCFMT_RIGHT,
-    LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED,
-    LVIS_SELECTED, LVITEMW, LVM_DELETECOLUMN, LVM_ENSUREVISIBLE, LVM_GETCOLUMNWIDTH,
-    LVM_GETITEMCOUNT, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_REDRAWITEMS, LVM_SETITEMCOUNT,
-    LVM_SETITEMSTATE, LVNI_SELECTED, LVN_COLUMNCLICK, LVN_GETDISPINFOW, LVN_ITEMCHANGED,
-    LVSICF_NOINVALIDATEALL, LVSICF_NOSCROLL, LVS_SHOWSELALWAYS, NMHDR, NMLISTVIEW, NMLVDISPINFOW,
+    BST_CHECKED, BST_UNCHECKED, CheckDlgButton, IsDlgButtonChecked, LVCF_FMT, LVCF_SUBITEM,
+    LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW, LVIF_STATE, LVIF_TEXT,
+    LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETECOLUMN, LVM_ENSUREVISIBLE,
+    LVM_GETCOLUMNORDERARRAY, LVM_GETCOLUMNWIDTH, LVM_GETCOUNTPERPAGE, LVM_GETITEMCOUNT,
+    LVM_GETNEXTITEM, LVM_GETTOPINDEX, LVM_INSERTCOLUMNW, LVM_REDRAWITEMS, LVM_SETITEMCOUNT,
+    LVM_SETITEMSTATE, LVN_COLUMNCLICK, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVNI_SELECTED,
+    LVS_SHOWSELALWAYS, LVSICF_NOINVALIDATEALL, LVSICF_NOSCROLL, NMHDR, NMLISTVIEW, NMLVDISPINFOW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EndDialog, GetClientRect, GetCursorPos,
-    GetDlgItem, GetWindowLongW, MessageBoxW, SendMessageW, SetWindowLongW, TrackPopupMenuEx,
-    GWL_STYLE, IDCANCEL, IDOK, IDYES, MB_ICONERROR, MB_ICONEXCLAMATION, MB_OK, MB_YESNO,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, TPM_RETURNCMD, WM_COMMAND, WM_INITDIALOG,
-    WM_SETREDRAW,
+    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EndDialog, GWL_STYLE, GetClientRect,
+    GetCursorPos, GetDlgItem, GetWindowLongW, IDCANCEL, IDOK, IDYES, MB_ICONERROR,
+    MB_ICONEXCLAMATION, MB_OK, MB_YESNO, MessageBoxW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SendMessageW, SetWindowLongW, TPM_RETURNCMD, TrackPopupMenuEx, WM_COMMAND,
+    WM_INITDIALOG, WM_SETREDRAW,
 };
 
 use crate::background_worker::BackgroundWorker;
 use crate::cpu_sampler::{
-    query_processor_performance, summed_processor_times, ProcessorPerformance,
+    ProcessorPerformance, checked_summed_processor_times, query_processor_performance,
 };
 use crate::dialog_templates::dialog_box;
-use crate::language::{localize_dialog, text, TextKey};
+use crate::language::{TextKey, localize_dialog, text};
 use crate::options::Options;
 use crate::options::{ColumnId, UpdateSpeed};
+use crate::process_identity::{
+    ProcIdentity, open_process_for_identity, query_process_identity_for_pid,
+};
 use crate::resource::*;
 use crate::runtime_menu::{MenuItemState, PopupMenu};
 use crate::winutil::{
-    append_32_bit_suffix, finish_list_view_update, get_window_userdata, is_32_bit_process_handle,
-    loword, record_win32_error, set_window_userdata, subclass_list_view, to_wide_null,
-    widestr_ptr_to_string,
+    OwnedHandle, OwnedWtsMemory, append_32_bit_suffix, finish_list_view_update,
+    get_window_userdata, is_32_bit_process_handle, loword, record_win32_error, set_window_userdata,
+    subclass_list_view, to_wide_null, widestr_ptr_to_string,
 };
 
 const PROCESS_COLUMNS: [ProcessColumn; NUM_COLUMN] = [
@@ -159,41 +163,23 @@ struct PreviousProcSample {
     page_faults: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub(crate) struct ProcIdentity {
-    // PID 会被 Windows 复用，因此会影响 delta 或危险操作的身份必须同时带创建时间。
-    pub(crate) pid: u32,
-    pub(crate) creation_time_100ns: u64,
-}
-
-impl ProcIdentity {
-    pub(crate) const fn new(pid: u32, creation_time_100ns: u64) -> Self {
-        Self {
-            pid,
-            creation_time_100ns,
-        }
-    }
-
-    pub(crate) const fn pid_only(pid: u32) -> Self {
-        Self::new(pid, 0)
-    }
-
-    pub(crate) const fn is_verified(self) -> bool {
-        self.creation_time_100ns != 0
-    }
-}
-
 // 列级脏标记位图。每轮刷新时标记变更列，rebuild_listview 只重绘被标记的行。
 #[derive(Clone, Copy, Default)]
 struct DirtyColumns(u32);
 
 impl DirtyColumns {
-    fn all() -> Self {
-        Self(u32::MAX)
-    }
-
     fn from_column(column_id: ColumnId) -> Self {
         Self(1u32 << column_id as u32)
+    }
+
+    fn from_columns(columns: &[ColumnId]) -> Self {
+        columns
+            .iter()
+            .copied()
+            .fold(Self::default(), |mut set, column| {
+                set.mark(column);
+                set
+            })
     }
 
     fn mark(&mut self, column_id: ColumnId) {
@@ -222,20 +208,31 @@ impl DirtyRowRange {
         self.end = self.end.max(index);
     }
 
-    unsafe fn redraw(self, list_hwnd: HWND, item_count: usize) {
-        let Some(start) = self.start else {
-            return;
-        };
-        if item_count == 0 {
-            return;
-        }
+    unsafe fn redraw_visible(self, list_hwnd: HWND, item_count: usize) {
+        unsafe {
+            let Some(start) = self.start else {
+                return;
+            };
+            if item_count == 0 {
+                return;
+            }
 
-        let end = self.end.min(item_count - 1);
-        if start > end {
-            return;
-        }
+            let top = SendMessageW(list_hwnd, LVM_GETTOPINDEX, 0, 0).max(0) as usize;
+            let visible_count = SendMessageW(list_hwnd, LVM_GETCOUNTPERPAGE, 0, 0).max(0) as usize;
+            if visible_count == 0 {
+                return;
+            }
+            let visible_end = top
+                .saturating_add(visible_count)
+                .min(item_count.saturating_sub(1));
+            let start = start.max(top);
+            let end = self.end.min(visible_end);
+            if start > end {
+                return;
+            }
 
-        SendMessageW(list_hwnd, LVM_REDRAWITEMS, start, end as LPARAM);
+            SendMessageW(list_hwnd, LVM_REDRAWITEMS, start, end as LPARAM);
+        }
     }
 }
 
@@ -246,7 +243,7 @@ pub struct ProcEntry {
     pid: u32,
     image_name: String,
     image_name_lower: String,
-    is_32_bit: bool,
+    is_32_bit: Option<bool>,
     user_name: String,
     user_name_lower: String,
     session_id: Option<u32>,
@@ -272,6 +269,72 @@ struct WtsProcessIdentity {
     user_name: Option<String>,
     session_id: u32,
     image_name_lower: String,
+}
+
+struct WtsProcessIdentitySnapshot {
+    identities: HashMap<u32, WtsProcessIdentity>,
+    row_error: Option<u32>,
+}
+
+#[derive(Clone)]
+struct ProcStaticMetadata {
+    is_32_bit: Option<bool>,
+    user_name: String,
+    user_name_lower: String,
+    session_id: Option<u32>,
+    user_identity_resolved: bool,
+}
+
+struct CachedAccountName {
+    name: String,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct AccountNameCache {
+    entries: HashMap<Vec<u8>, CachedAccountName>,
+    generation: u64,
+}
+
+impl AccountNameCache {
+    const MAX_ENTRIES: usize = 256;
+
+    fn begin_refresh(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn get(&mut self, sid: &[u8]) -> Option<String> {
+        let entry = self.entries.get_mut(sid)?;
+        entry.last_used = self.generation;
+        Some(entry.name.clone())
+    }
+
+    fn insert(&mut self, sid: Vec<u8>, name: String) {
+        if !self.entries.contains_key(sid.as_slice())
+            && self.entries.len() >= Self::MAX_ENTRIES
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(sid, _)| sid.clone())
+        {
+            self.entries.remove(oldest.as_slice());
+        }
+        self.entries.insert(
+            sid,
+            CachedAccountName {
+                name,
+                last_used: self.generation,
+            },
+        );
+    }
+}
+
+#[derive(Default)]
+struct ProcWorkerCache {
+    metadata: HashMap<ProcIdentity, ProcStaticMetadata>,
+    account_names: AccountNameCache,
+    processor_info: Vec<ProcessorPerformance>,
 }
 
 // 常用文案缓存，避免命令执行路径上反复查本地化资源。
@@ -392,17 +455,25 @@ impl ProcCommand {
     }
 }
 
-type ProcWorkerResult = Result<(Vec<ProcEntry>, HashMap<ProcIdentity, PreviousProcSample>), u32>;
-
-struct ProcWorkerCompletion {
+struct ProcWorkerSnapshot {
+    entries: Vec<ProcEntry>,
+    next_samples: HashMap<ProcIdentity, PreviousProcSample>,
     system_time: u64,
-    result: ProcWorkerResult,
+    row_error: Option<u32>,
 }
+
+struct CollectedProcessEntries {
+    entries: Vec<ProcEntry>,
+    next_samples: HashMap<ProcIdentity, PreviousProcSample>,
+    row_error: Option<u32>,
+}
+
+type ProcWorkerResult = Result<ProcWorkerSnapshot, u32>;
 
 struct ProcWorkerRequest {
     previous_samples: Arc<HashMap<ProcIdentity, PreviousProcSample>>,
-    total_delta: u64,
-    system_time: u64,
+    previous_system_time: Option<u64>,
+    processor_count: usize,
 }
 
 pub struct ProcessPageState {
@@ -413,7 +484,7 @@ pub struct ProcessPageState {
     entries: Vec<ProcEntry>,
     displayed_identities: Vec<ProcIdentity>,
     previous_samples: HashMap<ProcIdentity, PreviousProcSample>,
-    previous_system_time: u64,
+    previous_system_time: Option<u64>,
     active_columns: Vec<ColumnId>,
     selected_identity: Option<ProcIdentity>,
     pending_find_identity: Option<ProcIdentity>,
@@ -423,16 +494,16 @@ pub struct ProcessPageState {
     confirmations: bool,
     no_title: bool,
     processor_count: usize,
-    system_processor_info: Vec<ProcessorPerformance>,
     debugger_path: Option<String>,
     debugger_error: Option<u32>,
     strings: ProcessStrings,
     pass_count: u64,
-    worker: Option<BackgroundWorker<ProcWorkerRequest, ProcWorkerCompletion>>,
+    worker: Option<BackgroundWorker<ProcWorkerRequest, ProcWorkerResult>>,
     collection_in_flight: bool,
     refresh_requested: bool,
     inflight_previous_samples: Option<Arc<HashMap<ProcIdentity, PreviousProcSample>>>,
     last_refresh_error: Option<u32>,
+    last_row_error: Option<u32>,
 }
 
 impl Default for ProcessPageState {
@@ -444,7 +515,7 @@ impl Default for ProcessPageState {
             entries: Vec::with_capacity(128),
             displayed_identities: Vec::with_capacity(128),
             previous_samples: HashMap::new(),
-            previous_system_time: 0,
+            previous_system_time: None,
             active_columns: Vec::with_capacity(NUM_COLUMN),
             selected_identity: None,
             pending_find_identity: None,
@@ -454,7 +525,6 @@ impl Default for ProcessPageState {
             confirmations: true,
             no_title: false,
             processor_count: 1,
-            system_processor_info: Vec::new(),
             debugger_path: None,
             debugger_error: None,
             strings: ProcessStrings::default(),
@@ -464,6 +534,7 @@ impl Default for ProcessPageState {
             refresh_requested: false,
             inflight_previous_samples: None,
             last_refresh_error: None,
+            last_row_error: None,
         }
     }
 }
@@ -474,14 +545,23 @@ impl ProcessPageState {
         if self.worker.is_some() {
             return Ok(());
         }
+        let mut cache = ProcWorkerCache::default();
         self.worker = Some(BackgroundWorker::spawn(
-            "rtaskmgr-process-sampler",
+            "taskmgr-rs-process-sampler",
             PWM_PROC_WORKER_COMPLETE,
-            |request: ProcWorkerRequest| ProcWorkerCompletion {
-                system_time: request.system_time,
-                result: unsafe {
-                    collect_process_entries(&request.previous_samples, request.total_delta)
-                },
+            move |request: ProcWorkerRequest| {
+                let system_time =
+                    current_system_time(request.processor_count, &mut cache.processor_info)?;
+                let total_delta = system_time_delta(system_time, request.previous_system_time);
+                let collected = unsafe {
+                    collect_process_entries(&request.previous_samples, total_delta, &mut cache)?
+                };
+                Ok(ProcWorkerSnapshot {
+                    entries: collected.entries,
+                    next_samples: collected.next_samples,
+                    system_time,
+                    row_error: collected.row_error,
+                })
             },
         )?);
         Ok(())
@@ -508,64 +588,79 @@ impl ProcessPageState {
         hwnd_page: HWND,
         main_hwnd: HWND,
     ) -> Result<(), u32> {
-        // 进程页初始化主要做三件事：
-        // 加载文案、准备调试器路径、并把 ListView 切到更适合频繁刷新的显示模式。
-        self.hinstance = hinstance;
-        self.hwnd_page = hwnd_page;
-        self.main_hwnd = main_hwnd;
-        self.load_strings();
-        match load_debugger_path() {
-            Ok(path) => {
-                self.debugger_path = path;
-                self.debugger_error = None;
+        unsafe {
+            // 进程页初始化主要做三件事：
+            // 加载文案、准备调试器路径、并把 ListView 切到更适合频繁刷新的显示模式。
+            self.hinstance = hinstance;
+            self.hwnd_page = hwnd_page;
+            self.main_hwnd = main_hwnd;
+            self.load_strings();
+            match load_debugger_path() {
+                Ok(path) => {
+                    self.debugger_path = path;
+                    self.debugger_error = None;
+                }
+                Err(error) => {
+                    self.debugger_path = None;
+                    self.debugger_error = Some(error);
+                    record_win32_error("debugger configuration", error);
+                }
             }
-            Err(error) => {
-                self.debugger_path = None;
-                self.debugger_error = Some(error);
-                record_win32_error("debugger configuration", error);
-            }
-        }
 
-        let list_hwnd = self.list_hwnd();
-        if list_hwnd.is_null() {
-            return Err(windows_sys::Win32::Foundation::ERROR_INVALID_WINDOW_HANDLE);
+            let list_hwnd = self.list_hwnd();
+            if list_hwnd.is_null() {
+                return Err(windows_sys::Win32::Foundation::ERROR_INVALID_WINDOW_HANDLE);
+            }
+            self.start_worker_thread()?;
+            subclass_list_view(list_hwnd);
+            let current_style = GetWindowLongW(list_hwnd, GWL_STYLE) as u32;
+            SetWindowLongW(
+                list_hwnd,
+                GWL_STYLE,
+                (current_style | LVS_SHOWSELALWAYS) as i32,
+            );
+            self.update_ui_state();
+            Ok(())
         }
-        self.start_worker_thread()?;
-        subclass_list_view(list_hwnd);
-        let current_style = GetWindowLongW(list_hwnd, GWL_STYLE) as u32;
-        SetWindowLongW(
-            list_hwnd,
-            GWL_STYLE,
-            (current_style | LVS_SHOWSELALWAYS) as i32,
-        );
-        self.update_ui_state();
-        Ok(())
     }
 
     pub unsafe fn apply_options(&mut self, options: &Options, processor_count: usize) {
-        // 进程页的选项既影响行为，也影响列结构。
-        // 当列配置发生变化时，直接重建列和数据比做局部修补更可靠。
-        self.no_title = options.no_title();
-        self.confirmations = options.confirmations();
-        self.processor_count = processor_count.max(1);
+        unsafe {
+            // 进程页的选项既影响行为，也影响列结构。
+            // 当列配置发生变化时，直接重建列和数据比做局部修补更可靠。
+            self.no_title = options.no_title();
+            self.confirmations = options.confirmations();
+            self.processor_count = processor_count.max(1);
 
-        let desired_columns = columns_from_options(options);
-        if desired_columns != self.active_columns {
-            self.active_columns = desired_columns;
-            self.setup_columns(options);
+            let desired_columns = columns_from_options(options);
+            if desired_columns != self.active_columns {
+                self.active_columns = desired_columns;
+                let visible_columns = DirtyColumns::from_columns(&self.active_columns);
+                for entry in &mut self.entries {
+                    entry.rebuild_display_columns(&self.active_columns);
+                    entry.dirty_columns = visible_columns;
+                }
+                self.setup_columns(options);
+            }
         }
     }
 
     pub unsafe fn timer_event(&mut self, options: &Options, force: bool) {
-        // 每一轮刷新都走“采样 -> 合并旧状态 -> 排序/重绘”这条统一链路。
-        self.paused = options.update_speed == UpdateSpeed::Paused as i32;
-        if force || !self.paused {
-            self.refresh_processes();
+        unsafe {
+            // 每一轮刷新都走“采样 -> 合并旧状态 -> 排序/重绘”这条统一链路。
+            self.paused = options.update_speed == UpdateSpeed::Paused as i32;
+            if force || !self.paused {
+                self.refresh_processes();
+            }
         }
     }
 
     pub unsafe fn deactivate(&mut self, options: &mut Options) {
-        self.save_column_widths(options);
+        unsafe {
+            if let Err(error) = self.save_column_layout(options) {
+                record_win32_error("process column layout persistence", error);
+            }
+        }
     }
 
     pub unsafe fn destroy(&mut self) {
@@ -576,127 +671,138 @@ impl ProcessPageState {
     }
 
     pub unsafe fn handle_notify(&mut self, lparam: LPARAM) -> isize {
-        // ListView 处于 owner-data 风格，因此文本、排序和选择同步都靠通知消息驱动。
-        let notify_header = &*(lparam as *const NMHDR);
-        match notify_header.code {
-            code if code == LVN_GETDISPINFOW => {
-                let display_info = &mut *(lparam as *mut NMLVDISPINFOW);
-                self.fill_display_info(&mut display_info.item);
-                1
-            }
-            code if code == LVN_ITEMCHANGED => {
-                let notify = &*(lparam as *const NMLISTVIEW);
-                if (notify.uChanged & LVIF_STATE) != 0 {
-                    self.selected_identity = self.current_selected_identity();
-                    self.update_ui_state();
+        unsafe {
+            // ListView 处于 owner-data 风格，因此文本、排序和选择同步都靠通知消息驱动。
+            let notify_header = &*(lparam as *const NMHDR);
+            match notify_header.code {
+                code if code == LVN_GETDISPINFOW => {
+                    let display_info = &mut *(lparam as *mut NMLVDISPINFOW);
+                    self.fill_display_info(&mut display_info.item);
+                    1
                 }
-                1
-            }
-            code if code == LVN_COLUMNCLICK => {
-                let notify = &*(lparam as *const NMLISTVIEW);
-                let clicked = self
-                    .active_columns
-                    .get(notify.iSubItem as usize)
-                    .copied()
-                    .unwrap_or(ColumnId::Pid);
-                if self.sort_column == clicked {
-                    self.sort_direction *= -1;
-                } else {
-                    self.sort_column = clicked;
-                    self.sort_direction = -1;
+                code if code == LVN_ITEMCHANGED => {
+                    let notify = &*(lparam as *const NMLISTVIEW);
+                    if (notify.uChanged & LVIF_STATE) != 0 {
+                        self.selected_identity = self.current_selected_identity();
+                        self.update_ui_state();
+                    }
+                    1
                 }
-                self.selected_identity =
-                    self.current_selected_identity().or(self.selected_identity);
-                self.resort_entries();
-                self.rebuild_listview();
-                self.refresh_processes();
-                1
+                code if code == LVN_COLUMNCLICK => {
+                    let notify = &*(lparam as *const NMLISTVIEW);
+                    let clicked = self
+                        .active_columns
+                        .get(notify.iSubItem as usize)
+                        .copied()
+                        .unwrap_or(ColumnId::Pid);
+                    if self.sort_column == clicked {
+                        self.sort_direction *= -1;
+                    } else {
+                        self.sort_column = clicked;
+                        self.sort_direction = -1;
+                    }
+                    self.selected_identity =
+                        self.current_selected_identity().or(self.selected_identity);
+                    self.resort_entries();
+                    self.rebuild_listview();
+                    self.refresh_processes();
+                    1
+                }
+                _ => 0,
             }
-            _ => 0,
         }
     }
 
     // 将命令 ID 分派到具体的进程操作（结束、调试、优先级、亲和性等）。
     pub unsafe fn handle_command(&mut self, command_id: u16, options: Option<&mut Options>) {
-        let Some(command) = ProcCommand::from_command_id(command_id, IDC_TERMINATE as u16) else {
-            return;
-        };
+        unsafe {
+            let Some(command) = ProcCommand::from_command_id(command_id, IDC_TERMINATE as u16)
+            else {
+                return;
+            };
 
-        match command {
-            ProcCommand::PickColumns => {
-                if let Some(options) = options {
-                    self.pick_columns(options);
+            match command {
+                ProcCommand::PickColumns => {
+                    if let Some(options) = options {
+                        self.pick_columns(options);
+                    }
                 }
-            }
-            ProcCommand::Terminate => {
-                if let Some(identity) = self.current_selected_identity() {
-                    self.kill_process(identity);
+                ProcCommand::Terminate => {
+                    if let Some(identity) = self.current_selected_identity() {
+                        self.kill_process(identity);
+                    }
                 }
-            }
-            ProcCommand::TerminateTree => {
-                if let Some(identity) = self.current_selected_identity() {
-                    self.kill_process_tree(identity);
+                ProcCommand::TerminateTree => {
+                    if let Some(identity) = self.current_selected_identity() {
+                        self.kill_process_tree(identity);
+                    }
                 }
-            }
-            ProcCommand::Debug => {
-                if let Some(identity) = self.current_selected_identity() {
-                    self.attach_debugger(identity);
+                ProcCommand::Debug => {
+                    if let Some(identity) = self.current_selected_identity() {
+                        self.attach_debugger(identity);
+                    }
                 }
-            }
-            ProcCommand::OpenFileLocation => {
-                if let Some(identity) = self.current_selected_identity() {
-                    self.open_file_location(identity);
+                ProcCommand::OpenFileLocation => {
+                    if let Some(identity) = self.current_selected_identity() {
+                        self.open_file_location(identity);
+                    }
                 }
-            }
-            ProcCommand::Affinity => {
-                if let Some(identity) = self.current_selected_identity() {
-                    self.set_affinity(identity);
+                ProcCommand::Affinity => {
+                    if let Some(identity) = self.current_selected_identity() {
+                        self.set_affinity(identity);
+                    }
                 }
-            }
-            ProcCommand::SetPriority(priority) => {
-                if let Some(identity) = self.current_selected_identity() {
-                    self.set_priority(identity, priority);
+                ProcCommand::SetPriority(priority) => {
+                    if let Some(identity) = self.current_selected_identity() {
+                        self.set_priority(identity, priority);
+                    }
                 }
             }
         }
     }
 
     pub unsafe fn show_context_menu(&mut self, x: i32, y: i32) {
-        // 右键菜单会按当前选中进程和系统能力动态裁剪。
-        self.selected_identity = self.current_selected_identity();
-        let Some(entry) = self.selected_entry() else {
-            return;
-        };
+        unsafe {
+            // 右键菜单会按当前选中进程和系统能力动态裁剪。
+            self.selected_identity = self.current_selected_identity();
+            let Some(entry) = self.selected_entry() else {
+                return;
+            };
 
-        let Some(popup) = self.build_context_menu(entry) else {
-            return;
-        };
+            let popup = match self.build_context_menu(entry) {
+                Ok(popup) => popup,
+                Err(error) => {
+                    record_win32_error("process popup menu creation", error);
+                    return;
+                }
+            };
 
-        self.paused = true;
-        let mut cursor = POINT { x, y };
-        if cursor.x == -1 && cursor.y == -1 {
-            GetCursorPos(&mut cursor);
-        }
+            self.paused = true;
+            let mut cursor = POINT { x, y };
+            if cursor.x == -1 && cursor.y == -1 {
+                GetCursorPos(&mut cursor);
+            }
 
-        SendMessageW(self.main_hwnd, crate::resource::PWM_INPOPUP, 1, 0);
-        let command = TrackPopupMenuEx(
-            popup.as_raw(),
-            TPM_RETURNCMD,
-            cursor.x,
-            cursor.y,
-            self.hwnd_page,
-            null(),
-        );
-        SendMessageW(self.main_hwnd, crate::resource::PWM_INPOPUP, 0, 0);
-        self.paused = false;
+            SendMessageW(self.main_hwnd, crate::resource::PWM_INPOPUP, 1, 0);
+            let command = TrackPopupMenuEx(
+                popup.as_raw(),
+                TPM_RETURNCMD,
+                cursor.x,
+                cursor.y,
+                self.hwnd_page,
+                null(),
+            );
+            SendMessageW(self.main_hwnd, crate::resource::PWM_INPOPUP, 0, 0);
+            self.paused = false;
 
-        if command != 0 {
-            self.handle_command(command as u16, None);
+            if command != 0 {
+                self.handle_command(command as u16, None);
+            }
         }
     }
 
     // 构造进程右键菜单，包含结束进程、调试、打开文件位置、优先级和亲和性子菜单。
-    unsafe fn build_context_menu(&self, entry: &ProcEntry) -> Option<PopupMenu> {
+    unsafe fn build_context_menu(&self, entry: &ProcEntry) -> Result<PopupMenu, u32> {
         let identity_verified = entry.identity.is_verified();
         let mut priority_menu = PopupMenu::new()?;
         let checked_priority = match entry.priority_class {
@@ -715,7 +821,7 @@ impl ProcessPageState {
             ProcPriority::BelowNormal,
             ProcPriority::Low,
         ] {
-            if !priority_menu.append_item(
+            priority_menu.append_item(
                 priority.command_id(),
                 text(priority.text_key()),
                 if !identity_verified {
@@ -728,9 +834,7 @@ impl ProcessPageState {
                 } else {
                     MenuItemState::ENABLED
                 },
-            ) {
-                return None;
-            }
+            )?;
         }
 
         let mut popup = PopupMenu::new()?;
@@ -772,21 +876,14 @@ impl ProcessPageState {
                 },
             ),
         ] {
-            if !popup.append_item(command.command_id(), text(label_key), state) {
-                return None;
-            }
+            popup.append_item(command.command_id(), text(label_key), state)?;
         }
 
-        if !popup.append_separator() {
-            return None;
-        }
+        popup.append_separator()?;
+        popup.append_submenu(text(TextKey::SetPriority), priority_menu)?;
 
-        if !popup.append_submenu(text(TextKey::SetPriority), priority_menu) {
-            return None;
-        }
-
-        if self.processor_count > 1
-            && !popup.append_item(
+        if self.processor_count > 1 {
+            popup.append_item(
                 ProcCommand::Affinity.command_id(),
                 text(TextKey::SetAffinity),
                 if identity_verified {
@@ -794,81 +891,83 @@ impl ProcessPageState {
                 } else {
                     MenuItemState::disabled()
                 },
-            )
-        {
-            return None;
+            )?;
         }
 
-        Some(popup)
+        Ok(popup)
     }
 
     pub unsafe fn size_page(&self) {
-        // 进程页布局以“列表吃掉剩余空间，按钮贴右下角”为核心规则。
-        let mut parent_rect = zeroed::<RECT>();
-        GetClientRect(self.hwnd_page, &mut parent_rect);
+        unsafe {
+            // 进程页布局以“列表吃掉剩余空间，按钮贴右下角”为核心规则。
+            let mut parent_rect = zeroed::<RECT>();
+            GetClientRect(self.hwnd_page, &mut parent_rect);
 
-        let mut hdwp = BeginDeferWindowPos(10);
-        if hdwp.is_null() {
-            return;
-        }
+            let mut hdwp = BeginDeferWindowPos(10);
+            if hdwp.is_null() {
+                return;
+            }
 
-        let terminate_hwnd = GetDlgItem(self.hwnd_page, IDC_TERMINATE);
-        let list_hwnd = self.list_hwnd();
-        if terminate_hwnd.is_null() || list_hwnd.is_null() {
+            let terminate_hwnd = GetDlgItem(self.hwnd_page, IDC_TERMINATE);
+            let list_hwnd = self.list_hwnd();
+            if terminate_hwnd.is_null() || list_hwnd.is_null() {
+                EndDeferWindowPos(hdwp);
+                return;
+            }
+
+            let terminate_rect = window_rect_relative_to_page(terminate_hwnd, self.hwnd_page);
+            let dx = (parent_rect.right - DEFAULT_MARGIN * 2) - terminate_rect.right;
+            let dy = (parent_rect.bottom - DEFAULT_MARGIN * 2) - terminate_rect.bottom;
+
+            hdwp = DeferWindowPos(
+                hdwp,
+                terminate_hwnd,
+                null_mut(),
+                terminate_rect.left + dx,
+                terminate_rect.top + dy,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+
+            let list_rect = window_rect_relative_to_page(list_hwnd, self.hwnd_page);
+            hdwp = DeferWindowPos(
+                hdwp,
+                list_hwnd,
+                null_mut(),
+                0,
+                0,
+                (terminate_rect.right - list_rect.left + dx).max(0),
+                (terminate_rect.top - list_rect.top + dy - DEFAULT_MARGIN).max(0),
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+
             EndDeferWindowPos(hdwp);
-            return;
         }
-
-        let terminate_rect = window_rect_relative_to_page(terminate_hwnd, self.hwnd_page);
-        let dx = (parent_rect.right - DEFAULT_MARGIN * 2) - terminate_rect.right;
-        let dy = (parent_rect.bottom - DEFAULT_MARGIN * 2) - terminate_rect.bottom;
-
-        hdwp = DeferWindowPos(
-            hdwp,
-            terminate_hwnd,
-            null_mut(),
-            terminate_rect.left + dx,
-            terminate_rect.top + dy,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-        );
-
-        let list_rect = window_rect_relative_to_page(list_hwnd, self.hwnd_page);
-        hdwp = DeferWindowPos(
-            hdwp,
-            list_hwnd,
-            null_mut(),
-            0,
-            0,
-            (terminate_rect.right - list_rect.left + dx).max(0),
-            (terminate_rect.top - list_rect.top + dy - DEFAULT_MARGIN).max(0),
-            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-        );
-
-        EndDeferWindowPos(hdwp);
     }
 
     // 从进程页跳转到指定 PID 的行并高亮选中。由任务页的“转到进程”命令触发。
     pub unsafe fn find_process(&mut self, identity: ProcIdentity) -> bool {
-        if !identity.is_verified() {
-            return false;
-        }
-        let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.identity == identity)
-        else {
-            self.pending_find_identity = Some(identity);
-            self.refresh_processes();
-            return true;
-        };
+        unsafe {
+            if !identity.is_verified() {
+                return false;
+            }
+            let Some(index) = self
+                .entries
+                .iter()
+                .position(|entry| entry.identity == identity)
+            else {
+                self.pending_find_identity = Some(identity);
+                self.refresh_processes();
+                return true;
+            };
 
-        self.selected_identity = Some(self.entries[index].identity);
-        let list_hwnd = self.list_hwnd();
-        self.set_list_selection(list_hwnd, Some(index));
-        self.update_ui_state();
-        true
+            self.selected_identity = Some(self.entries[index].identity);
+            let list_hwnd = self.list_hwnd();
+            self.set_list_selection(list_hwnd, Some(index));
+            self.update_ui_state();
+            true
+        }
     }
 
     fn list_hwnd(&self) -> HWND {
@@ -901,49 +1000,43 @@ impl ProcessPageState {
     }
 
     unsafe fn update_ui_state(&self) {
-        // 当前实现里只有“结束进程”按钮依赖选择状态，
-        // 但统一收口在这里，后续扩展其它按钮更容易。
-        let has_selection = self
-            .current_selected_identity()
-            .is_some_and(ProcIdentity::is_verified);
-        let terminate_button = GetDlgItem(self.hwnd_page, IDC_TERMINATE);
-        if !terminate_button.is_null() {
-            EnableWindow(terminate_button, i32::from(has_selection));
+        unsafe {
+            // 当前实现里只有“结束进程”按钮依赖选择状态，
+            // 但统一收口在这里，后续扩展其它按钮更容易。
+            let has_selection = self
+                .current_selected_identity()
+                .is_some_and(ProcIdentity::is_verified);
+            let terminate_button = GetDlgItem(self.hwnd_page, IDC_TERMINATE);
+            if !terminate_button.is_null() {
+                EnableWindow(terminate_button, i32::from(has_selection));
+            }
         }
     }
 
     unsafe fn refresh_processes(&mut self) {
-        self.drain_worker_results();
-        if self.collection_in_flight {
-            self.refresh_requested = true;
-            return;
-        }
+        unsafe {
+            self.drain_worker_results();
+            if self.collection_in_flight {
+                self.refresh_requested = true;
+                return;
+            }
 
-        self.refresh_requested = false;
-        self.schedule_process_collection();
+            self.refresh_requested = false;
+            self.schedule_process_collection();
+        }
     }
 
     unsafe fn schedule_process_collection(&mut self) {
-        let system_total =
-            match current_system_time(self.processor_count, &mut self.system_processor_info) {
-                Ok(value) => value,
-                Err(error) => {
-                    self.set_refresh_error(error);
-                    return;
-                }
-            };
-        let total_delta = system_total.saturating_sub(self.previous_system_time);
-        let previous_samples = Arc::new(std::mem::take(&mut self.previous_samples));
         let Some(worker) = self.worker.as_ref() else {
-            self.previous_samples = unwrap_previous_samples(previous_samples);
             self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
             return;
         };
+        let previous_samples = Arc::new(std::mem::take(&mut self.previous_samples));
 
         let request = ProcWorkerRequest {
             previous_samples: Arc::clone(&previous_samples),
-            total_delta,
-            system_time: system_total,
+            previous_system_time: self.previous_system_time,
+            processor_count: self.processor_count,
         };
         if let Err(error) = worker.submit(request, self.hwnd_page) {
             self.previous_samples = unwrap_previous_samples(previous_samples);
@@ -956,42 +1049,56 @@ impl ProcessPageState {
     }
 
     unsafe fn drain_worker_results(&mut self) {
-        loop {
-            let result = match self.worker.as_ref() {
-                Some(worker) => worker.try_recv(),
-                None => return,
-            };
+        unsafe {
+            loop {
+                let result = match self.worker.as_ref() {
+                    Some(worker) => worker.try_recv(),
+                    None => return,
+                };
 
-            match result {
-                Ok(completion) => self.apply_worker_completion(completion),
-                Err(TryRecvError::Empty) => return,
-                Err(TryRecvError::Disconnected) => {
-                    self.worker = None;
-                    self.collection_in_flight = false;
-                    if let Some(samples) = self.inflight_previous_samples.take() {
-                        self.previous_samples = unwrap_previous_samples(samples);
+                match result {
+                    Ok(completion) => self.apply_worker_completion(completion),
+                    Err(TryRecvError::Empty) => return,
+                    Err(TryRecvError::Disconnected) => {
+                        self.worker = None;
+                        self.collection_in_flight = false;
+                        if let Some(samples) = self.inflight_previous_samples.take() {
+                            self.previous_samples = unwrap_previous_samples(samples);
+                        }
+                        self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
+                        return;
                     }
-                    self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
-                    return;
                 }
             }
         }
     }
 
-    unsafe fn apply_worker_completion(&mut self, completion: ProcWorkerCompletion) {
-        self.collection_in_flight = false;
-        let previous_samples = self.inflight_previous_samples.take();
+    unsafe fn apply_worker_completion(&mut self, completion: ProcWorkerResult) {
+        unsafe {
+            self.collection_in_flight = false;
+            let previous_samples = self.inflight_previous_samples.take();
 
-        match completion.result {
-            Ok((entries, next_samples)) => {
-                self.last_refresh_error = None;
-                self.apply_process_snapshot(entries, next_samples, completion.system_time);
-            }
-            Err(error) => {
-                if let Some(samples) = previous_samples {
-                    self.previous_samples = unwrap_previous_samples(samples);
+            match completion {
+                Ok(snapshot) => {
+                    self.last_refresh_error = None;
+                    if self.last_row_error != snapshot.row_error
+                        && let Some(error) = snapshot.row_error
+                    {
+                        record_win32_error("process row metadata", error);
+                    }
+                    self.last_row_error = snapshot.row_error;
+                    self.apply_process_snapshot(
+                        snapshot.entries,
+                        snapshot.next_samples,
+                        snapshot.system_time,
+                    );
                 }
-                self.set_refresh_error(error);
+                Err(error) => {
+                    if let Some(samples) = previous_samples {
+                        self.previous_samples = unwrap_previous_samples(samples);
+                    }
+                    self.set_refresh_error(error);
+                }
             }
         }
     }
@@ -1002,38 +1109,46 @@ impl ProcessPageState {
         next_samples: HashMap<ProcIdentity, PreviousProcSample>,
         system_time: u64,
     ) {
-        let previous_selection = self.current_selected_identity().or(self.selected_identity);
-        let current_pass = self.pass_count;
-        let mut sort_dirty = false;
-        let mut existing_by_identity = HashMap::with_capacity(self.entries.len());
-        for (index, entry) in self.entries.iter_mut().enumerate() {
-            existing_by_identity.insert(entry.identity, index);
-        }
-
-        for snapshot in entries {
-            if let Some(&index) = existing_by_identity.get(&snapshot.identity) {
-                let existing = &mut self.entries[index];
-                let changed = update_process_entry(existing, &snapshot, current_pass);
-                sort_dirty |= changed.contains(self.sort_column);
-            } else {
-                self.entries.push(snapshot.with_pass_count(current_pass));
-                sort_dirty = true;
+        unsafe {
+            let previous_selection = self.current_selected_identity().or(self.selected_identity);
+            let current_pass = self.pass_count;
+            let visible_columns = DirtyColumns::from_columns(&self.active_columns);
+            let mut sort_dirty = false;
+            let mut existing_by_identity = HashMap::with_capacity(self.entries.len());
+            for (index, entry) in self.entries.iter_mut().enumerate() {
+                existing_by_identity.insert(entry.identity, index);
             }
-        }
 
-        sort_dirty |= self.remove_stale_entries(current_pass);
-        if sort_dirty {
-            self.resort_entries();
+            for snapshot in entries {
+                if let Some(&index) = existing_by_identity.get(&snapshot.identity) {
+                    let existing = &mut self.entries[index];
+                    let changed =
+                        update_process_entry(existing, &snapshot, current_pass, visible_columns);
+                    sort_dirty |= changed.contains(self.sort_column);
+                } else {
+                    self.entries.push(snapshot.with_pass_count(
+                        current_pass,
+                        &self.active_columns,
+                        visible_columns,
+                    ));
+                    sort_dirty = true;
+                }
+            }
+
+            sort_dirty |= self.remove_stale_entries(current_pass);
+            if sort_dirty {
+                self.resort_entries();
+            }
+            self.previous_samples = next_samples;
+            self.previous_system_time = Some(system_time);
+            let requested_selection = self
+                .pending_find_identity
+                .take()
+                .filter(|identity| self.entries.iter().any(|entry| entry.identity == *identity));
+            self.selected_identity = requested_selection.or(previous_selection);
+            self.rebuild_listview();
+            self.pass_count = self.pass_count.wrapping_add(1);
         }
-        self.previous_samples = next_samples;
-        self.previous_system_time = system_time;
-        let requested_selection = self
-            .pending_find_identity
-            .take()
-            .filter(|identity| self.entries.iter().any(|entry| entry.identity == *identity));
-        self.selected_identity = requested_selection.or(previous_selection);
-        self.rebuild_listview();
-        self.pass_count = self.pass_count.wrapping_add(1);
     }
 
     fn set_refresh_error(&mut self, error: u32) {
@@ -1044,10 +1159,12 @@ impl ProcessPageState {
     }
 
     pub unsafe fn handle_worker_completion(&mut self) {
-        self.drain_worker_results();
-        if self.refresh_requested && !self.collection_in_flight {
-            self.refresh_requested = false;
-            self.schedule_process_collection();
+        unsafe {
+            self.drain_worker_results();
+            if self.refresh_requested && !self.collection_in_flight {
+                self.refresh_requested = false;
+                self.schedule_process_collection();
+            }
         }
     }
 
@@ -1066,186 +1183,218 @@ impl ProcessPageState {
     }
 
     unsafe fn rebuild_listview(&mut self) {
-        // 进程列表使用 LVS_OWNERDATA；刷新只更新虚拟项数量和索引映射，
-        // 不再为每个进程创建、删除或移动 Win32 ListView 项。
-        let list_hwnd = self.list_hwnd();
-        if list_hwnd.is_null() {
-            return;
-        }
-        let selected_identity = self.selected_identity;
-        let selected_index = selected_identity.and_then(|identity| {
-            self.entries
-                .iter()
-                .position(|entry| entry.identity == identity)
-        });
-        let existing_count = SendMessageW(list_hwnd, LVM_GETITEMCOUNT, 0, 0) as usize;
-        let structure_changed = existing_count != self.entries.len();
-        let order_changed = self.displayed_identities.len() != self.entries.len()
-            || self
-                .displayed_identities
-                .iter()
-                .copied()
-                .ne(self.entries.iter().map(|entry| entry.identity));
-        let bulk_update = structure_changed || order_changed;
-
-        if bulk_update {
-            SendMessageW(list_hwnd, WM_SETREDRAW, 0, 0);
-        }
-
-        let mut dirty_rows = DirtyRowRange::default();
-        for (index, entry) in self.entries.iter_mut().enumerate() {
-            if entry.dirty_columns.any() {
-                entry.dirty_columns = DirtyColumns::default();
-                dirty_rows.mark(index);
+        unsafe {
+            // 进程列表使用 LVS_OWNERDATA；刷新只更新虚拟项数量和索引映射，
+            // 不再为每个进程创建、删除或移动 Win32 ListView 项。
+            let list_hwnd = self.list_hwnd();
+            if list_hwnd.is_null() {
+                return;
             }
+            let selected_identity = self.selected_identity;
+            let selected_index = selected_identity.and_then(|identity| {
+                self.entries
+                    .iter()
+                    .position(|entry| entry.identity == identity)
+            });
+            let existing_count = SendMessageW(list_hwnd, LVM_GETITEMCOUNT, 0, 0) as usize;
+            let structure_changed = existing_count != self.entries.len();
+            let order_changed = self.displayed_identities.len() != self.entries.len()
+                || self
+                    .displayed_identities
+                    .iter()
+                    .copied()
+                    .ne(self.entries.iter().map(|entry| entry.identity));
+            let bulk_update = structure_changed || order_changed;
+
+            if bulk_update {
+                SendMessageW(list_hwnd, WM_SETREDRAW, 0, 0);
+            }
+
+            let mut dirty_rows = DirtyRowRange::default();
+            for (index, entry) in self.entries.iter_mut().enumerate() {
+                if entry.dirty_columns.any() {
+                    entry.dirty_columns = DirtyColumns::default();
+                    dirty_rows.mark(index);
+                }
+            }
+
+            if structure_changed {
+                SendMessageW(
+                    list_hwnd,
+                    LVM_SETITEMCOUNT,
+                    self.entries.len(),
+                    (LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL) as LPARAM,
+                );
+            }
+
+            if bulk_update {
+                self.set_list_selection(list_hwnd, selected_index);
+                finish_list_view_update(list_hwnd);
+            } else {
+                dirty_rows.redraw_visible(list_hwnd, self.entries.len());
+            }
+
+            self.displayed_identities.clear();
+            self.displayed_identities
+                .extend(self.entries.iter().map(|entry| entry.identity));
+
+            if selected_index.is_none() {
+                self.selected_identity = None;
+            }
+
+            self.update_ui_state();
         }
-
-        if structure_changed {
-            SendMessageW(
-                list_hwnd,
-                LVM_SETITEMCOUNT,
-                self.entries.len(),
-                (LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL) as LPARAM,
-            );
-        }
-
-        if bulk_update {
-            self.set_list_selection(list_hwnd, selected_index);
-            finish_list_view_update(list_hwnd);
-        } else {
-            dirty_rows.redraw(list_hwnd, self.entries.len());
-        }
-
-        self.displayed_identities.clear();
-        self.displayed_identities
-            .extend(self.entries.iter().map(|entry| entry.identity));
-
-        if selected_index.is_none() {
-            self.selected_identity = None;
-        }
-
-        self.update_ui_state();
     }
 
     unsafe fn set_list_selection(&self, list_hwnd: HWND, selected_index: Option<usize>) {
-        // Clearing all virtual item states is one ListView operation instead of an O(n) loop.
-        let mut item = LVITEMW {
-            stateMask: LVIS_SELECTED | LVIS_FOCUSED,
-            state: 0,
-            ..zeroed()
-        };
-        SendMessageW(
-            list_hwnd,
-            LVM_SETITEMSTATE,
-            usize::MAX,
-            &mut item as *mut _ as LPARAM,
-        );
-
-        if let Some(index) = selected_index {
-            item.state = LVIS_SELECTED | LVIS_FOCUSED;
-            SendMessageW(
-                list_hwnd,
-                LVM_SETITEMSTATE,
-                index,
-                &mut item as *mut _ as LPARAM,
-            );
-            SendMessageW(list_hwnd, LVM_ENSUREVISIBLE, index, 0);
-        }
-    }
-
-    unsafe fn fill_display_info(&self, item: &mut LVITEMW) {
-        if (item.mask & LVIF_TEXT) == 0
-            || item.iItem < 0
-            || item.pszText.is_null()
-            || item.cchTextMax <= 0
-        {
-            return;
-        }
-
-        let entry = self.entries.get(item.iItem as usize);
-        let Some(entry) = entry else {
-            *item.pszText = 0;
-            return;
-        };
-        let Some(column_id) = self.active_columns.get(item.iSubItem as usize).copied() else {
-            *item.pszText = 0;
-            return;
-        };
-
-        let text = column_text(entry, column_id, &self.strings);
-        copy_text_to_callback_buffer(item.pszText, item.cchTextMax as usize, text);
-    }
-
-    // 销毁现有列并按照 active_columns 重建所有列头。列宽优先从 options 读取，否则用默认值。
-    unsafe fn setup_columns(&self, options: &Options) {
-        let list_hwnd = self.list_hwnd();
-        while SendMessageW(list_hwnd, LVM_DELETECOLUMN, 0, 0) != 0 {}
-
-        for (index, column_id) in self.active_columns.iter().enumerate() {
-            let column = PROCESS_COLUMNS[*column_id as usize];
-            let width = options
-                .column_widths
-                .get(index)
-                .copied()
-                .filter(|value| *value > 0)
-                .unwrap_or(column.default_width);
-            let title = text(column.title_key).to_string();
-            let mut title_wide = to_wide_null(&title);
-            let mut lv_column = LVCOLUMNW {
-                mask: LVCF_FMT | LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM,
-                fmt: column.fmt,
-                cx: width,
-                pszText: title_wide.as_mut_ptr(),
-                cchTextMax: title_wide.len() as i32,
-                iSubItem: index as i32,
+        unsafe {
+            // Clearing all virtual item states is one ListView operation instead of an O(n) loop.
+            let mut item = LVITEMW {
+                stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+                state: 0,
                 ..zeroed()
             };
             SendMessageW(
                 list_hwnd,
-                LVM_INSERTCOLUMNW,
-                index,
-                &mut lv_column as *mut _ as LPARAM,
+                LVM_SETITEMSTATE,
+                usize::MAX,
+                &mut item as *mut _ as LPARAM,
             );
-        }
 
-        if !self.entries.is_empty() {
-            SendMessageW(
-                list_hwnd,
-                LVM_REDRAWITEMS,
-                0,
-                self.entries.len().saturating_sub(1) as LPARAM,
-            );
-        }
-    }
-
-    unsafe fn save_column_widths(&mut self, options: &mut Options) {
-        // 列宽始终按“当前显示列顺序”写回配置，而不是按枚举顺序写，
-        // 这样下次恢复时才能对上用户真正看到的列布局。
-        for value in options.column_widths.iter_mut() {
-            *value = -1;
-        }
-
-        for index in 0..self.active_columns.len() {
-            let cx = SendMessageW(self.list_hwnd(), LVM_GETCOLUMNWIDTH, index, 0) as i32;
-            if index < options.column_widths.len() {
-                options.column_widths[index] = cx;
+            if let Some(index) = selected_index {
+                item.state = LVIS_SELECTED | LVIS_FOCUSED;
+                SendMessageW(
+                    list_hwnd,
+                    LVM_SETITEMSTATE,
+                    index,
+                    &mut item as *mut _ as LPARAM,
+                );
+                SendMessageW(list_hwnd, LVM_ENSUREVISIBLE, index, 0);
             }
         }
     }
 
-    unsafe fn current_selected_identity(&self) -> Option<ProcIdentity> {
-        let list_hwnd = self.list_hwnd();
-        let index = SendMessageW(
-            list_hwnd,
-            LVM_GETNEXTITEM,
-            usize::MAX,
-            LVNI_SELECTED as LPARAM,
-        ) as i32;
-        if index < 0 {
-            return None;
-        }
+    unsafe fn fill_display_info(&self, item: &mut LVITEMW) {
+        unsafe {
+            if (item.mask & LVIF_TEXT) == 0
+                || item.iItem < 0
+                || item.pszText.is_null()
+                || item.cchTextMax <= 0
+            {
+                return;
+            }
 
-        self.entries.get(index as usize).map(|entry| entry.identity)
+            let entry = self.entries.get(item.iItem as usize);
+            let Some(entry) = entry else {
+                *item.pszText = 0;
+                return;
+            };
+            let Some(column_id) = self.active_columns.get(item.iSubItem as usize).copied() else {
+                *item.pszText = 0;
+                return;
+            };
+
+            let text = column_text(entry, column_id, &self.strings);
+            copy_text_to_callback_buffer(item.pszText, item.cchTextMax as usize, text);
+        }
+    }
+
+    // 销毁现有列并按照 active_columns 重建所有列头。列宽优先从 options 读取，否则用默认值。
+    unsafe fn setup_columns(&self, options: &Options) {
+        unsafe {
+            let list_hwnd = self.list_hwnd();
+            while SendMessageW(list_hwnd, LVM_DELETECOLUMN, 0, 0) != 0 {}
+
+            for (index, column_id) in self.active_columns.iter().enumerate() {
+                let column = PROCESS_COLUMNS[*column_id as usize];
+                let width = options
+                    .column_widths
+                    .get(index)
+                    .copied()
+                    .filter(|value| *value > 0)
+                    .unwrap_or(column.default_width);
+                let title = text(column.title_key).to_string();
+                let mut title_wide = to_wide_null(&title);
+                let mut lv_column = LVCOLUMNW {
+                    mask: LVCF_FMT | LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM,
+                    fmt: column.fmt,
+                    cx: width,
+                    pszText: title_wide.as_mut_ptr(),
+                    cchTextMax: title_wide.len() as i32,
+                    iSubItem: index as i32,
+                    ..zeroed()
+                };
+                SendMessageW(
+                    list_hwnd,
+                    LVM_INSERTCOLUMNW,
+                    index,
+                    &mut lv_column as *mut _ as LPARAM,
+                );
+            }
+
+            if !self.entries.is_empty() {
+                SendMessageW(
+                    list_hwnd,
+                    LVM_REDRAWITEMS,
+                    0,
+                    self.entries.len().saturating_sub(1) as LPARAM,
+                );
+            }
+        }
+    }
+
+    unsafe fn save_column_layout(&self, options: &mut Options) -> Result<(), u32> {
+        unsafe {
+            let column_count = self.active_columns.len();
+            if column_count == 0 {
+                return Err(ERROR_INVALID_DATA);
+            }
+
+            let list = self.list_hwnd();
+            let mut display_order = vec![0i32; column_count];
+            if SendMessageW(
+                list,
+                LVM_GETCOLUMNORDERARRAY,
+                column_count,
+                display_order.as_mut_ptr() as LPARAM,
+            ) == 0
+            {
+                return Err(ERROR_GEN_FAILURE);
+            }
+
+            let ordered_columns = reorder_process_columns(&self.active_columns, &display_order)
+                .ok_or(ERROR_INVALID_DATA)?;
+            let widths = self
+                .active_columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| {
+                    (
+                        *column as i32,
+                        SendMessageW(list, LVM_GETCOLUMNWIDTH, index, 0) as i32,
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            write_process_column_layout(options, &ordered_columns, &widths);
+            Ok(())
+        }
+    }
+
+    unsafe fn current_selected_identity(&self) -> Option<ProcIdentity> {
+        unsafe {
+            let list_hwnd = self.list_hwnd();
+            let index = SendMessageW(
+                list_hwnd,
+                LVM_GETNEXTITEM,
+                usize::MAX,
+                LVNI_SELECTED as LPARAM,
+            ) as i32;
+            if index < 0 {
+                return None;
+            }
+
+            self.entries.get(index as usize).map(|entry| entry.identity)
+        }
     }
 
     fn selected_entry(&self) -> Option<&ProcEntry> {
@@ -1254,392 +1403,416 @@ impl ProcessPageState {
     }
 
     unsafe fn quick_confirm(&self, title: &str, body: &str) -> bool {
-        // 用户关闭“确认”选项后，危险操作直接放行，保持与原版 Task Manager 行为一致。
-        if !self.confirmations {
-            return true;
-        }
+        unsafe {
+            // 用户关闭“确认”选项后，危险操作直接放行，保持与原版 Task Manager 行为一致。
+            if !self.confirmations {
+                return true;
+            }
 
-        let title_wide = to_wide_null(title);
-        let body_wide = to_wide_null(body);
-        MessageBoxW(
-            self.hwnd_page,
-            body_wide.as_ptr(),
-            title_wide.as_ptr(),
-            MB_ICONEXCLAMATION | MB_YESNO,
-        ) == IDYES
+            let title_wide = to_wide_null(title);
+            let body_wide = to_wide_null(body);
+            MessageBoxW(
+                self.hwnd_page,
+                body_wide.as_ptr(),
+                title_wide.as_ptr(),
+                MB_ICONEXCLAMATION | MB_YESNO,
+            ) == IDYES
+        }
     }
 
-    unsafe fn show_failure_message(&self, body: &str, error: u32) {
-        let title = if self.strings.warning.is_empty() {
-            "Task Manager".to_string()
-        } else {
-            self.strings.warning.clone()
-        };
-        let message = format!("{body}\r\n\r\nWin32 error: {error}");
-        let title_wide = to_wide_null(&title);
-        let message_wide = to_wide_null(&message);
-        MessageBoxW(
-            self.hwnd_page,
-            message_wide.as_ptr(),
-            title_wide.as_ptr(),
-            MB_OK | MB_ICONERROR,
-        );
+    fn show_failure_message(&self, body: &str, error: u32) {
+        unsafe {
+            let title = if self.strings.warning.is_empty() {
+                "Task Manager".to_string()
+            } else {
+                self.strings.warning.clone()
+            };
+            let message = format!("{body}\r\n\r\nWin32 error: {error}");
+            let title_wide = to_wide_null(&title);
+            let message_wide = to_wide_null(&message);
+            MessageBoxW(
+                self.hwnd_page,
+                message_wide.as_ptr(),
+                title_wide.as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+        }
     }
 
     // 结束指定 PID 的进程。先弹确认框，再通过 TerminateProcess 终止。
     unsafe fn kill_process(&mut self, identity: ProcIdentity) -> bool {
-        if !self.quick_confirm(&self.strings.warning, &self.strings.kill) {
-            return false;
-        }
-
-        let handle = match open_process_for_identity(
-            identity,
-            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-        ) {
-            Ok(handle) => handle,
-            Err(error) => {
-                self.show_failure_message(&self.strings.cant_kill, error);
+        unsafe {
+            if !self.quick_confirm(&self.strings.warning, &self.strings.kill) {
                 return false;
             }
-        };
 
-        let result = TerminateProcess(handle, 1);
-        let error = windows_sys::Win32::Foundation::GetLastError();
-        CloseHandle(handle);
+            let handle = match open_process_for_identity(
+                identity,
+                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            ) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    self.show_failure_message(&self.strings.cant_kill, error);
+                    return false;
+                }
+            };
 
-        if result == 0 {
-            self.show_failure_message(&self.strings.cant_kill, error);
-            false
-        } else {
-            self.paused = false;
-            self.refresh_processes();
-            true
+            let result = TerminateProcess(handle.as_raw(), 1);
+            let error = windows_sys::Win32::Foundation::GetLastError();
+
+            if result == 0 {
+                self.show_failure_message(&self.strings.cant_kill, error);
+                false
+            } else {
+                self.paused = false;
+                self.refresh_processes();
+                true
+            }
         }
     }
 
     // 结束进程以及所有子进程。按叶子优先的顺序遍历进程树，逐进程 TerminateProcess。
     unsafe fn kill_process_tree(&mut self, identity: ProcIdentity) -> bool {
-        if !self.quick_confirm(&self.strings.warning, &self.strings.kill_tree) {
-            return false;
-        }
-
-        let root_handle = match open_process_for_identity(
-            identity,
-            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-        ) {
-            Ok(handle) => handle,
-            Err(error) => {
-                self.show_failure_message(&self.strings.cant_kill, error);
+        unsafe {
+            if !self.quick_confirm(&self.strings.warning, &self.strings.kill_tree) {
                 return false;
             }
-        };
 
-        let pid = identity.pid;
-        let termination_order = match collect_process_tree_termination_order(identity) {
-            Ok(order) if !order.is_empty() => order,
-            Ok(_) => {
-                CloseHandle(root_handle);
+            let mut root_handle = match open_process_for_identity(
+                identity,
+                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            ) {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    self.show_failure_message(&self.strings.cant_kill, error);
+                    return false;
+                }
+            };
+
+            let pid = identity.pid;
+            let termination_order = match collect_process_tree_termination_order(identity) {
+                Ok(order) if !order.is_empty() => order,
+                Ok(_) => {
+                    self.show_failure_message(
+                        &self.strings.kill_tree_fail_body,
+                        windows_sys::Win32::Foundation::ERROR_GEN_FAILURE,
+                    );
+                    return false;
+                }
+                Err(error) => {
+                    self.show_failure_message(&self.strings.kill_tree_fail_body, error);
+                    return false;
+                }
+            };
+
+            // 先验证并打开整棵树，再开始终止，避免权限/身份错误造成可预见的半完成状态。
+            let mut targets = Vec::with_capacity(termination_order.len());
+            for target_identity in termination_order {
+                if target_identity == identity {
+                    let Some(handle) = root_handle.take() else {
+                        self.show_failure_message(
+                            &self.strings.kill_tree_fail_body,
+                            ERROR_INVALID_DATA,
+                        );
+                        return false;
+                    };
+                    targets.push((target_identity, handle));
+                    continue;
+                }
+
+                match open_process_for_identity(
+                    target_identity,
+                    PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                ) {
+                    Ok(handle) => targets.push((target_identity, handle)),
+                    Err(error) => {
+                        self.show_failure_message(&self.strings.kill_tree_fail_body, error);
+                        return false;
+                    }
+                }
+            }
+
+            if root_handle.is_some() {
                 self.show_failure_message(
                     &self.strings.kill_tree_fail_body,
                     windows_sys::Win32::Foundation::ERROR_GEN_FAILURE,
                 );
                 return false;
             }
-            Err(error) => {
-                CloseHandle(root_handle);
-                self.show_failure_message(&self.strings.kill_tree_fail_body, error);
+
+            let mut any_success = false;
+            let mut any_failure = false;
+            let mut root_error = 0u32;
+
+            for (target_identity, handle) in targets {
+                let target_pid = target_identity.pid;
+                if TerminateProcess(handle.as_raw(), 1) == 0 {
+                    any_failure = true;
+                    if target_pid == pid {
+                        root_error = windows_sys::Win32::Foundation::GetLastError();
+                    }
+                } else {
+                    any_success = true;
+                }
+            }
+
+            if any_success {
+                self.paused = false;
+                self.refresh_processes();
+            }
+
+            if root_error != 0 && !any_success {
+                self.show_failure_message(&self.strings.cant_kill, root_error);
                 return false;
             }
-        };
 
-        // 先验证并打开整棵树，再开始终止，避免权限/身份错误造成可预见的半完成状态。
-        let mut targets = Vec::with_capacity(termination_order.len());
-        for target_identity in termination_order {
-            if target_identity == identity {
-                targets.push((target_identity, root_handle));
-                continue;
+            if any_failure {
+                let body_wide = to_wide_null(&self.strings.kill_tree_fail_body);
+                let title_wide = to_wide_null(&self.strings.kill_tree_fail);
+                MessageBoxW(
+                    self.hwnd_page,
+                    body_wide.as_ptr(),
+                    title_wide.as_ptr(),
+                    MB_OK | MB_ICONEXCLAMATION,
+                );
+                return false;
             }
 
-            match open_process_for_identity(
-                target_identity,
-                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-            ) {
-                Ok(handle) => targets.push((target_identity, handle)),
-                Err(error) => {
-                    for (_, handle) in targets {
-                        if handle != root_handle {
-                            CloseHandle(handle);
-                        }
-                    }
-                    CloseHandle(root_handle);
-                    self.show_failure_message(&self.strings.kill_tree_fail_body, error);
-                    return false;
-                }
-            }
+            any_success
         }
-
-        if !targets.iter().any(|(target, _)| *target == identity) {
-            for (_, handle) in targets {
-                CloseHandle(handle);
-            }
-            CloseHandle(root_handle);
-            self.show_failure_message(
-                &self.strings.kill_tree_fail_body,
-                windows_sys::Win32::Foundation::ERROR_GEN_FAILURE,
-            );
-            return false;
-        }
-
-        let mut any_success = false;
-        let mut any_failure = false;
-        let mut root_error = 0u32;
-
-        for (target_identity, handle) in targets {
-            let target_pid = target_identity.pid;
-            if TerminateProcess(handle, 1) == 0 {
-                any_failure = true;
-                if target_pid == pid {
-                    root_error = windows_sys::Win32::Foundation::GetLastError();
-                }
-            } else {
-                any_success = true;
-            }
-            CloseHandle(handle);
-        }
-
-        if any_success {
-            self.paused = false;
-            self.refresh_processes();
-        }
-
-        if root_error != 0 && !any_success {
-            self.show_failure_message(&self.strings.cant_kill, root_error);
-            return false;
-        }
-
-        if any_failure {
-            let body_wide = to_wide_null(&self.strings.kill_tree_fail_body);
-            let title_wide = to_wide_null(&self.strings.kill_tree_fail);
-            MessageBoxW(
-                self.hwnd_page,
-                body_wide.as_ptr(),
-                title_wide.as_ptr(),
-                MB_OK | MB_ICONEXCLAMATION,
-            );
-            return false;
-        }
-
-        any_success
     }
 
     // 以 AeDebug 注册表配置的调试器启动并附加到目标进程。命令行传 -p <pid>。
     unsafe fn attach_debugger(&mut self, identity: ProcIdentity) -> bool {
-        let Some(debugger_path) = self.debugger_path.as_ref() else {
-            let error = match self.debugger_error {
-                Some(error) => error,
-                None => ERROR_FILE_NOT_FOUND,
+        unsafe {
+            let Some(debugger_path) = self.debugger_path.as_ref() else {
+                let error = match self.debugger_error {
+                    Some(error) => error,
+                    None => ERROR_FILE_NOT_FOUND,
+                };
+                self.show_failure_message(&self.strings.cant_debug, error);
+                return false;
             };
-            self.show_failure_message(&self.strings.cant_debug, error);
-            return false;
-        };
 
-        if !self.quick_confirm(&self.strings.warning, &self.strings.debug) {
-            return false;
-        }
+            if !self.quick_confirm(&self.strings.warning, &self.strings.debug) {
+                return false;
+            }
 
-        let target_handle =
-            match open_process_for_identity(identity, PROCESS_QUERY_LIMITED_INFORMATION) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    self.show_failure_message(&self.strings.cant_debug, error);
-                    return false;
+            let target_handle =
+                match open_process_for_identity(identity, PROCESS_QUERY_LIMITED_INFORMATION) {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        self.show_failure_message(&self.strings.cant_debug, error);
+                        return false;
+                    }
+                };
+
+            let pid = identity.pid;
+            let command_line = format!("{} -p {pid}", quote_command_line_arg(debugger_path));
+            let mut command_line_wide = to_wide_null(&command_line);
+            let application_name = to_wide_null(debugger_path);
+            let startup_info = STARTUPINFOW {
+                cb: size_of::<STARTUPINFOW>() as u32,
+                ..zeroed()
+            };
+            let mut process_info = zeroed::<PROCESS_INFORMATION>();
+
+            let created = CreateProcessW(
+                application_name.as_ptr(),
+                command_line_wide.as_mut_ptr(),
+                null_mut(),
+                null_mut(),
+                0,
+                windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE,
+                null(),
+                null(),
+                &startup_info,
+                &mut process_info,
+            );
+            let create_error = windows_sys::Win32::Foundation::GetLastError();
+            drop(target_handle);
+
+            if created == 0 {
+                self.show_failure_message(&self.strings.cant_debug, create_error);
+                false
+            } else {
+                match own_created_process_handles(process_info) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        self.show_failure_message(&self.strings.cant_debug, error);
+                        false
+                    }
                 }
-            };
-
-        let pid = identity.pid;
-        let command_line = format!("{} -p {pid}", quote_command_line_arg(debugger_path));
-        let mut command_line_wide = to_wide_null(&command_line);
-        let application_name = to_wide_null(debugger_path);
-        let startup_info = STARTUPINFOW {
-            cb: size_of::<STARTUPINFOW>() as u32,
-            ..zeroed()
-        };
-        let mut process_info = zeroed::<PROCESS_INFORMATION>();
-
-        let created = CreateProcessW(
-            application_name.as_ptr(),
-            command_line_wide.as_mut_ptr(),
-            null_mut(),
-            null_mut(),
-            0,
-            windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE,
-            null(),
-            null(),
-            &startup_info,
-            &mut process_info,
-        );
-        let create_error = windows_sys::Win32::Foundation::GetLastError();
-        CloseHandle(target_handle);
-
-        if created == 0 {
-            self.show_failure_message(&self.strings.cant_debug, create_error);
-            false
-        } else {
-            CloseHandle(process_info.hThread);
-            CloseHandle(process_info.hProcess);
-            true
+            }
         }
     }
 
     // 通过 explorer.exe /select 命令在资源管理器中定位进程的可执行文件。
     unsafe fn open_file_location(&mut self, identity: ProcIdentity) -> bool {
-        let image_path = match query_process_image_path(identity) {
-            Ok(path) => path,
-            Err(error) => {
-                self.show_failure_message(&self.strings.cant_open_file_location, error);
+        unsafe {
+            let image_path = match query_process_image_path(identity) {
+                Ok(path) => path,
+                Err(error) => {
+                    self.show_failure_message(&self.strings.cant_open_file_location, error);
+                    return false;
+                }
+            };
+
+            if !Path::new(&image_path).exists() {
+                self.show_failure_message(&self.strings.cant_open_file_location, 2);
                 return false;
             }
-        };
 
-        if !Path::new(&image_path).exists() {
-            self.show_failure_message(&self.strings.cant_open_file_location, 2);
-            return false;
-        }
-
-        let windows_directory = match query_windows_directory() {
-            Ok(path) => path,
-            Err(error) => {
-                self.show_failure_message(&self.strings.cant_open_file_location, error);
-                return false;
-            }
-        };
-        let explorer_path = format!("{windows_directory}\\explorer.exe");
-        let command_line = format!(
-            "{explorer_path} /select,{}",
-            quote_command_line_arg(&image_path)
-        );
-        let mut command_line_wide = to_wide_null(&command_line);
-        let startup_info = STARTUPINFOW {
-            cb: size_of::<STARTUPINFOW>() as u32,
-            ..zeroed()
-        };
-        let mut process_info = zeroed::<PROCESS_INFORMATION>();
-        let created = CreateProcessW(
-            null(),
-            command_line_wide.as_mut_ptr(),
-            null_mut(),
-            null_mut(),
-            0,
-            0,
-            null(),
-            null(),
-            &startup_info,
-            &mut process_info,
-        );
-        if created == 0 {
-            self.show_failure_message(
-                &self.strings.cant_open_file_location,
-                windows_sys::Win32::Foundation::GetLastError(),
+            let windows_directory = match query_windows_directory() {
+                Ok(path) => path,
+                Err(error) => {
+                    self.show_failure_message(&self.strings.cant_open_file_location, error);
+                    return false;
+                }
+            };
+            let explorer_path = format!("{windows_directory}\\explorer.exe");
+            let command_line = format!(
+                "{explorer_path} /select,{}",
+                quote_command_line_arg(&image_path)
             );
-            return false;
-        }
+            let mut command_line_wide = to_wide_null(&command_line);
+            let startup_info = STARTUPINFOW {
+                cb: size_of::<STARTUPINFOW>() as u32,
+                ..zeroed()
+            };
+            let mut process_info = zeroed::<PROCESS_INFORMATION>();
+            let created = CreateProcessW(
+                null(),
+                command_line_wide.as_mut_ptr(),
+                null_mut(),
+                null_mut(),
+                0,
+                0,
+                null(),
+                null(),
+                &startup_info,
+                &mut process_info,
+            );
+            if created == 0 {
+                self.show_failure_message(
+                    &self.strings.cant_open_file_location,
+                    windows_sys::Win32::Foundation::GetLastError(),
+                );
+                return false;
+            }
 
-        CloseHandle(process_info.hThread);
-        CloseHandle(process_info.hProcess);
-        true
+            match own_created_process_handles(process_info) {
+                Ok(_) => true,
+                Err(error) => {
+                    self.show_failure_message(&self.strings.cant_open_file_location, error);
+                    false
+                }
+            }
+        }
     }
 
     // 通过 SetPriorityClass 修改进程优先级类。先弹确认框，操作成功后刷新列表。
     unsafe fn set_priority(&mut self, identity: ProcIdentity, priority: ProcPriority) -> bool {
-        let priority_class = match priority {
-            ProcPriority::Low => IDLE_PRIORITY_CLASS,
-            ProcPriority::BelowNormal => BELOW_NORMAL_PRIORITY_CLASS,
-            ProcPriority::Normal => NORMAL_PRIORITY_CLASS,
-            ProcPriority::AboveNormal => ABOVE_NORMAL_PRIORITY_CLASS,
-            ProcPriority::High => HIGH_PRIORITY_CLASS,
-            ProcPriority::Realtime => REALTIME_PRIORITY_CLASS,
-        };
+        unsafe {
+            let priority_class = match priority {
+                ProcPriority::Low => IDLE_PRIORITY_CLASS,
+                ProcPriority::BelowNormal => BELOW_NORMAL_PRIORITY_CLASS,
+                ProcPriority::Normal => NORMAL_PRIORITY_CLASS,
+                ProcPriority::AboveNormal => ABOVE_NORMAL_PRIORITY_CLASS,
+                ProcPriority::High => HIGH_PRIORITY_CLASS,
+                ProcPriority::Realtime => REALTIME_PRIORITY_CLASS,
+            };
 
-        if !self.quick_confirm(&self.strings.warning, &self.strings.prichange) {
-            return false;
-        }
-
-        let handle = match open_process_for_identity(
-            identity,
-            PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
-        ) {
-            Ok(handle) => handle,
-            Err(error) => {
-                self.show_failure_message(&self.strings.cant_change_priority, error);
+            if !self.quick_confirm(&self.strings.warning, &self.strings.prichange) {
                 return false;
             }
-        };
 
-        let result = SetPriorityClass(handle, priority_class);
-        let error = windows_sys::Win32::Foundation::GetLastError();
-        CloseHandle(handle);
+            let handle = match open_process_for_identity(
+                identity,
+                PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+            ) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    self.show_failure_message(&self.strings.cant_change_priority, error);
+                    return false;
+                }
+            };
 
-        if result == 0 {
-            self.show_failure_message(&self.strings.cant_change_priority, error);
-            false
-        } else {
-            self.paused = false;
-            self.refresh_processes();
-            true
+            let result = SetPriorityClass(handle.as_raw(), priority_class);
+            let error = windows_sys::Win32::Foundation::GetLastError();
+
+            if result == 0 {
+                self.show_failure_message(&self.strings.cant_change_priority, error);
+                false
+            } else {
+                self.paused = false;
+                self.refresh_processes();
+                true
+            }
         }
     }
 
     // 通过 SetProcessAffinityMask 设置进程 CPU 亲和性。用户通过对话框选择 CPU。
     unsafe fn set_affinity(&mut self, identity: ProcIdentity) -> bool {
-        let handle = match open_process_for_identity(
-            identity,
-            PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION,
-        ) {
-            Ok(handle) => handle,
-            Err(error) => {
-                self.show_failure_message(&self.strings.cant_set_affinity, error);
-                return false;
-            }
-        };
-
-        let mut process_mask = 0usize;
-        let mut system_mask = 0usize;
-        let mut success = false;
-
-        if GetProcessAffinityMask(handle, &mut process_mask, &mut system_mask) != 0 {
-            process_mask &= system_mask;
-            let mut context = AffinityDialogContext {
-                page: self as *mut ProcessPageState,
-                process_mask,
-                system_mask,
-            };
-            if dialog_box(
-                self.hinstance,
-                IDD_AFFINITY,
-                self.hwnd_page,
-                Some(affinity_dialog_proc),
-                &mut context as *mut AffinityDialogContext as LPARAM,
-            ) == IDOK as isize
-            {
-                if SetProcessAffinityMask(handle, context.process_mask) == 0 {
-                    self.show_failure_message(
-                        &self.strings.cant_set_affinity,
-                        windows_sys::Win32::Foundation::GetLastError(),
-                    );
-                } else {
-                    self.refresh_processes();
-                    success = true;
+        unsafe {
+            let handle = match open_process_for_identity(
+                identity,
+                PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION,
+            ) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    self.show_failure_message(&self.strings.cant_set_affinity, error);
+                    return false;
                 }
-            }
-        } else {
-            self.show_failure_message(
-                &self.strings.cant_set_affinity,
-                windows_sys::Win32::Foundation::GetLastError(),
-            );
-        }
+            };
 
-        CloseHandle(handle);
-        success
+            let mut process_mask = 0usize;
+            let mut system_mask = 0usize;
+            let mut success = false;
+
+            if GetProcessAffinityMask(handle.as_raw(), &mut process_mask, &mut system_mask) != 0 {
+                process_mask &= system_mask;
+                if process_mask == 0 || system_mask == 0 {
+                    self.show_failure_message(&self.strings.cant_set_affinity, ERROR_NOT_SUPPORTED);
+                    return false;
+                }
+                let mut context = AffinityDialogContext {
+                    page: self as *mut ProcessPageState,
+                    process_mask,
+                    system_mask,
+                };
+                match dialog_box(
+                    self.hinstance,
+                    IDD_AFFINITY,
+                    self.hwnd_page,
+                    Some(affinity_dialog_proc),
+                    &mut context as *mut AffinityDialogContext as LPARAM,
+                ) {
+                    Ok(result) if result == IDOK as isize => {
+                        if SetProcessAffinityMask(handle.as_raw(), context.process_mask) == 0 {
+                            self.show_failure_message(
+                                &self.strings.cant_set_affinity,
+                                windows_sys::Win32::Foundation::GetLastError(),
+                            );
+                        } else {
+                            self.refresh_processes();
+                            success = true;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.show_failure_message(&self.strings.cant_set_affinity, error);
+                    }
+                }
+            } else {
+                self.show_failure_message(
+                    &self.strings.cant_set_affinity,
+                    windows_sys::Win32::Foundation::GetLastError(),
+                );
+            }
+
+            success
+        }
     }
 
     // 打开“选择列”对话框。通过 ColumnDialogContext 传递页面和选项指针给 dialog proc。
@@ -1648,13 +1821,16 @@ impl ProcessPageState {
             page: self as *mut ProcessPageState,
             options: options as *mut Options,
         };
-        dialog_box(
+        if let Err(error) = dialog_box(
             self.hinstance,
             IDD_SELECTPROCCOLS,
             self.main_hwnd,
             Some(column_select_dialog_proc),
             &mut context as *mut ColumnDialogContext as LPARAM,
-        );
+        ) {
+            record_win32_error("process column dialog creation", error);
+            self.show_failure_message(text(TextKey::SelectColumnsMenu), error);
+        }
     }
 }
 
@@ -1665,44 +1841,49 @@ unsafe extern "system" fn column_select_dialog_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> isize {
-    match msg {
-        WM_INITDIALOG => {
-            set_window_userdata(hwnd, lparam);
-            localize_dialog(hwnd, IDD_SELECTPROCCOLS);
-            let context = &*(lparam as *const ColumnDialogContext);
-            let options = &*context.options;
+    unsafe {
+        match msg {
+            WM_INITDIALOG => {
+                set_window_userdata(hwnd, lparam);
+                localize_dialog(hwnd, IDD_SELECTPROCCOLS);
+                let context = &*(lparam as *const ColumnDialogContext);
+                let options = &*context.options;
 
-            for &control_id in &COLUMN_DIALOG_IDS {
-                CheckDlgButton(hwnd, control_id, BST_UNCHECKED);
-            }
-            CheckDlgButton(hwnd, IDC_IMAGENAME, BST_CHECKED);
+                for &control_id in &COLUMN_DIALOG_IDS {
+                    CheckDlgButton(hwnd, control_id, BST_UNCHECKED);
+                }
+                CheckDlgButton(hwnd, IDC_IMAGENAME, BST_CHECKED);
 
-            for column in columns_from_options(options) {
-                CheckDlgButton(hwnd, COLUMN_DIALOG_IDS[column as usize], BST_CHECKED);
-            }
-            1
-        }
-        WM_COMMAND => match i32::from(loword(wparam)) {
-            IDOK => {
-                let context = &mut *(get_window_userdata(hwnd) as *mut ColumnDialogContext);
-                let page = &mut *context.page;
-                let options = &mut *context.options;
-
-                page.save_column_widths(options);
-                apply_selected_columns(hwnd, options);
-                page.active_columns = columns_from_options(options);
-                page.setup_columns(options);
-                page.refresh_processes();
-                EndDialog(hwnd, IDOK as isize);
+                for column in columns_from_options(options) {
+                    CheckDlgButton(hwnd, COLUMN_DIALOG_IDS[column as usize], BST_CHECKED);
+                }
                 1
             }
-            IDCANCEL => {
-                EndDialog(hwnd, IDCANCEL as isize);
-                1
-            }
+            WM_COMMAND => match i32::from(loword(wparam)) {
+                IDOK => {
+                    let context = &mut *(get_window_userdata(hwnd) as *mut ColumnDialogContext);
+                    let page = &mut *context.page;
+                    let options = &mut *context.options;
+
+                    if let Err(error) = page.save_column_layout(options) {
+                        record_win32_error("process column layout persistence", error);
+                        return 1;
+                    }
+                    apply_selected_columns(hwnd, options);
+                    page.active_columns = columns_from_options(options);
+                    page.setup_columns(options);
+                    page.refresh_processes();
+                    EndDialog(hwnd, IDOK as isize);
+                    1
+                }
+                IDCANCEL => {
+                    EndDialog(hwnd, IDCANCEL as isize);
+                    1
+                }
+                _ => 0,
+            },
             _ => 0,
-        },
-        _ => 0,
+        }
     }
 }
 
@@ -1714,62 +1895,64 @@ unsafe extern "system" fn affinity_dialog_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> isize {
-    match msg {
-        WM_INITDIALOG => {
-            set_window_userdata(hwnd, lparam);
-            localize_dialog(hwnd, IDD_AFFINITY);
-            let context = &*(lparam as *const AffinityDialogContext);
+    unsafe {
+        match msg {
+            WM_INITDIALOG => {
+                set_window_userdata(hwnd, lparam);
+                localize_dialog(hwnd, IDD_AFFINITY);
+                let context = &*(lparam as *const AffinityDialogContext);
 
-            for cpu_index in 0..=MAX_AFFINITY_CPU {
-                let control_id = IDC_CPU0 + cpu_index;
-                let mask = affinity_cpu_mask(cpu_index);
-                let enabled = mask != 0 && (context.system_mask & mask) != 0;
-                EnableWindow(GetDlgItem(hwnd, control_id), i32::from(enabled));
-                CheckDlgButton(
-                    hwnd,
-                    control_id,
-                    if enabled && (context.process_mask & mask) != 0 {
-                        BST_CHECKED
-                    } else {
-                        BST_UNCHECKED
-                    },
-                );
-            }
-            1
-        }
-        WM_COMMAND => match i32::from(loword(wparam)) {
-            IDCANCEL => {
-                EndDialog(hwnd, IDCANCEL as isize);
+                for cpu_index in 0..=MAX_AFFINITY_CPU {
+                    let control_id = IDC_CPU0 + cpu_index;
+                    let mask = affinity_cpu_mask(cpu_index);
+                    let enabled = mask != 0 && (context.system_mask & mask) != 0;
+                    EnableWindow(GetDlgItem(hwnd, control_id), i32::from(enabled));
+                    CheckDlgButton(
+                        hwnd,
+                        control_id,
+                        if enabled && (context.process_mask & mask) != 0 {
+                            BST_CHECKED
+                        } else {
+                            BST_UNCHECKED
+                        },
+                    );
+                }
                 1
             }
-            IDOK => {
-                let context = &mut *(get_window_userdata(hwnd) as *mut AffinityDialogContext);
-                let page = &*context.page;
-
-                context.process_mask = 0;
-                for cpu_index in 0..=MAX_AFFINITY_CPU {
-                    let mask = affinity_cpu_mask(cpu_index);
-                    if mask == 0 || (context.system_mask & mask) == 0 {
-                        continue;
-                    }
-                    if IsDlgButtonChecked(hwnd, IDC_CPU0 + cpu_index) == BST_CHECKED {
-                        context.process_mask |= mask;
-                    }
-                }
-
-                if context.process_mask == 0 {
-                    let title_wide = to_wide_null(&page.strings.invalid_option);
-                    let body_wide = to_wide_null(&page.strings.no_affinity_mask);
-                    MessageBoxW(hwnd, body_wide.as_ptr(), title_wide.as_ptr(), MB_ICONERROR);
-                    1
-                } else {
-                    EndDialog(hwnd, IDOK as isize);
+            WM_COMMAND => match i32::from(loword(wparam)) {
+                IDCANCEL => {
+                    EndDialog(hwnd, IDCANCEL as isize);
                     1
                 }
-            }
+                IDOK => {
+                    let context = &mut *(get_window_userdata(hwnd) as *mut AffinityDialogContext);
+                    let page = &*context.page;
+
+                    context.process_mask = 0;
+                    for cpu_index in 0..=MAX_AFFINITY_CPU {
+                        let mask = affinity_cpu_mask(cpu_index);
+                        if mask == 0 || (context.system_mask & mask) == 0 {
+                            continue;
+                        }
+                        if IsDlgButtonChecked(hwnd, IDC_CPU0 + cpu_index) == BST_CHECKED {
+                            context.process_mask |= mask;
+                        }
+                    }
+
+                    if context.process_mask == 0 {
+                        let title_wide = to_wide_null(&page.strings.invalid_option);
+                        let body_wide = to_wide_null(&page.strings.no_affinity_mask);
+                        MessageBoxW(hwnd, body_wide.as_ptr(), title_wide.as_ptr(), MB_ICONERROR);
+                        1
+                    } else {
+                        EndDialog(hwnd, IDOK as isize);
+                        1
+                    }
+                }
+                _ => 0,
+            },
             _ => 0,
-        },
-        _ => 0,
+        }
     }
 }
 
@@ -1780,121 +1963,156 @@ fn affinity_cpu_mask(cpu_index: i32) -> usize {
         .unwrap_or(0)
 }
 
-// 将对话框中的列勾选状态持久化到 options。保留已有列宽，新增列使用默认宽度。
-unsafe fn apply_selected_columns(hwnd: HWND, options: &mut Options) {
-    let mut existing_widths = HashMap::with_capacity(NUM_COLUMN);
-    for (index, value) in options.active_process_columns.iter().copied().enumerate() {
-        let Some(column) = column_id_from_i32(value) else {
-            break;
-        };
-        existing_widths.insert(column as i32, options.column_widths[index]);
+fn reorder_process_columns(active: &[ColumnId], display_order: &[i32]) -> Option<Vec<ColumnId>> {
+    if active.is_empty() || active.len() != display_order.len() {
+        return None;
     }
 
-    for value in options.active_process_columns.iter_mut() {
-        *value = -1;
-    }
-    for value in options.column_widths.iter_mut() {
-        *value = -1;
-    }
-
-    let mut next_index = 0usize;
-    options.active_process_columns[next_index] = ColumnId::ImageName as i32;
-    options.column_widths[next_index] = existing_widths
-        .get(&(ColumnId::ImageName as i32))
-        .copied()
-        .filter(|width| *width > 0)
-        .unwrap_or(PROCESS_COLUMNS[ColumnId::ImageName as usize].default_width);
-    next_index += 1;
-
-    for (column_index, &control_id) in COLUMN_DIALOG_IDS
-        .iter()
-        .enumerate()
-        .take(NUM_COLUMN)
-        .skip(1)
-    {
-        if IsDlgButtonChecked(hwnd, control_id) == BST_CHECKED {
-            let column = column_id_from_i32(column_index as i32).unwrap_or(ColumnId::Pid);
-            options.active_process_columns[next_index] = column as i32;
-            options.column_widths[next_index] = existing_widths
-                .get(&(column as i32))
-                .copied()
-                .filter(|width| *width > 0)
-                .unwrap_or(PROCESS_COLUMNS[column as usize].default_width);
-            next_index += 1;
+    let mut seen = vec![false; active.len()];
+    let mut ordered = Vec::with_capacity(active.len());
+    for &logical_index in display_order {
+        let logical_index = usize::try_from(logical_index).ok()?;
+        if logical_index >= active.len() || seen[logical_index] {
+            return None;
         }
+        seen[logical_index] = true;
+        ordered.push(active[logical_index]);
+    }
+    (ordered.first() == Some(&ColumnId::ImageName)).then_some(ordered)
+}
+
+fn write_process_column_layout(
+    options: &mut Options,
+    columns: &[ColumnId],
+    widths: &HashMap<i32, i32>,
+) {
+    options.active_process_columns.fill(-1);
+    options.column_widths.fill(-1);
+    for (index, &column) in columns.iter().take(NUM_COLUMN).enumerate() {
+        options.active_process_columns[index] = column as i32;
+        options.column_widths[index] = widths
+            .get(&(column as i32))
+            .copied()
+            .filter(|width| *width > 0)
+            .unwrap_or(PROCESS_COLUMNS[column as usize].default_width);
+    }
+}
+
+// 将对话框中的列勾选状态持久化到 options。保留已有顺序和列宽，新增列追加到末尾。
+unsafe fn apply_selected_columns(hwnd: HWND, options: &mut Options) {
+    unsafe {
+        let existing_columns = columns_from_options(options);
+        let mut existing_widths = HashMap::with_capacity(NUM_COLUMN);
+        for (index, value) in options.active_process_columns.iter().copied().enumerate() {
+            let Some(column) = column_id_from_i32(value) else {
+                break;
+            };
+            existing_widths.insert(column as i32, options.column_widths[index]);
+        }
+
+        let mut selected = [false; NUM_COLUMN];
+        selected[ColumnId::ImageName as usize] = true;
+        for (column_index, &control_id) in COLUMN_DIALOG_IDS
+            .iter()
+            .enumerate()
+            .take(NUM_COLUMN)
+            .skip(1)
+        {
+            if IsDlgButtonChecked(hwnd, control_id) == BST_CHECKED {
+                selected[column_index] = true;
+            }
+        }
+
+        let mut columns = Vec::with_capacity(NUM_COLUMN);
+        columns.push(ColumnId::ImageName);
+        for column in existing_columns.into_iter().skip(1) {
+            if selected[column as usize] {
+                columns.push(column);
+                selected[column as usize] = false;
+            }
+        }
+        for (column_index, is_selected) in selected.iter().copied().enumerate().skip(1) {
+            if is_selected {
+                columns.push(column_id_from_i32(column_index as i32).unwrap_or(ColumnId::Pid));
+            }
+        }
+        write_process_column_layout(options, &columns, &existing_widths);
     }
 }
 
 unsafe fn load_debugger_path() -> Result<Option<String>, u32> {
-    // 进程页的“调试”命令依赖 AeDebug 注册表配置。
-    // 这里只提取真正的可执行文件路径，过滤掉旧式 drwtsn32 之类的无效值。
-    let mut key: HKEY = null_mut();
-    let key_name = to_wide_null("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug");
-    let value_name = to_wide_null("Debugger");
-    let open_status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_name.as_ptr(), 0, KEY_READ, &mut key);
-    if open_status != 0 {
-        return if open_status == ERROR_FILE_NOT_FOUND || open_status == ERROR_PATH_NOT_FOUND {
-            Ok(None)
-        } else {
-            Err(open_status)
-        };
-    }
+    unsafe {
+        // 进程页的“调试”命令依赖 AeDebug 注册表配置。
+        // 这里只提取真正的可执行文件路径，过滤掉旧式 drwtsn32 之类的无效值。
+        let mut key: HKEY = null_mut();
+        let key_name = to_wide_null("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug");
+        let value_name = to_wide_null("Debugger");
+        let open_status =
+            RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_name.as_ptr(), 0, KEY_READ, &mut key);
+        if open_status != 0 {
+            return if open_status == ERROR_FILE_NOT_FOUND || open_status == ERROR_PATH_NOT_FOUND {
+                Ok(None)
+            } else {
+                Err(open_status)
+            };
+        }
 
-    let mut value_size = 0u32;
-    let size_status = RegQueryValueExW(
-        key,
-        value_name.as_ptr(),
-        null_mut(),
-        null_mut(),
-        null_mut(),
-        &mut value_size,
-    );
-    if size_status != 0 || value_size < 2 {
+        let mut value_size = 0u32;
+        let size_status = RegQueryValueExW(
+            key,
+            value_name.as_ptr(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut value_size,
+        );
+        if size_status != 0 || value_size < 2 {
+            let close_status = RegCloseKey(key);
+            if close_status != 0 {
+                return Err(close_status);
+            }
+            return if size_status == ERROR_FILE_NOT_FOUND {
+                Ok(None)
+            } else if size_status != 0 {
+                Err(size_status)
+            } else {
+                Err(ERROR_INVALID_DATA)
+            };
+        }
+
+        let mut buffer = vec![0u16; (value_size as usize / size_of::<u16>()).max(2)];
+        let mut value_type = 0u32;
+        let status = RegQueryValueExW(
+            key,
+            value_name.as_ptr(),
+            null_mut(),
+            &mut value_type,
+            buffer.as_mut_ptr() as *mut u8,
+            &mut value_size,
+        );
         let close_status = RegCloseKey(key);
         if close_status != 0 {
             return Err(close_status);
         }
-        return if size_status == ERROR_FILE_NOT_FOUND {
-            Ok(None)
-        } else if size_status != 0 {
-            Err(size_status)
-        } else {
-            Err(ERROR_INVALID_DATA)
+
+        if status != 0 || value_size < 2 || !(value_type == REG_SZ || value_type == REG_EXPAND_SZ) {
+            return Err(if status != 0 {
+                status
+            } else {
+                ERROR_INVALID_DATA
+            });
+        }
+
+        let length = buffer
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(buffer.len());
+        let raw = String::from_utf16_lossy(&buffer[..length]);
+        let Some(executable) = normalize_debugger_command(&raw, value_type)? else {
+            return Ok(None);
         };
+        Ok(Path::new(&executable).is_file().then_some(executable))
     }
-
-    let mut buffer = vec![0u16; (value_size as usize / size_of::<u16>()).max(2)];
-    let mut value_type = 0u32;
-    let status = RegQueryValueExW(
-        key,
-        value_name.as_ptr(),
-        null_mut(),
-        &mut value_type,
-        buffer.as_mut_ptr() as *mut u8,
-        &mut value_size,
-    );
-    let close_status = RegCloseKey(key);
-    if close_status != 0 {
-        return Err(close_status);
-    }
-
-    if status != 0 || value_size < 2 || !(value_type == REG_SZ || value_type == REG_EXPAND_SZ) {
-        return Err(if status != 0 {
-            status
-        } else {
-            ERROR_INVALID_DATA
-        });
-    }
-
-    let length = buffer
-        .iter()
-        .position(|value| *value == 0)
-        .unwrap_or(buffer.len());
-    let raw = String::from_utf16_lossy(&buffer[..length]);
-    let Some(executable) = normalize_debugger_command(&raw, value_type)? else {
-        return Ok(None);
-    };
-    Ok(Path::new(&executable).is_file().then_some(executable))
 }
 
 // 引用命令行参数。只在包含空格、制表符或引号时加引号，并正确处理反斜杠转义。
@@ -2027,199 +2245,269 @@ fn well_known_service_name(sid: *mut core::ffi::c_void) -> Option<String> {
 
 // 通过 LookupAccountSidW 将 SID 解析为经典 Task Manager 风格的账户名。
 unsafe fn lookup_account_name_from_sid(sid: *mut core::ffi::c_void) -> Result<Option<String>, u32> {
-    if sid.is_null() || IsValidSid(sid) == 0 {
-        return Ok(None);
-    }
-    if let Some(name) = well_known_service_name(sid) {
-        return Ok(Some(name));
-    }
-
-    let mut name_len = 0u32;
-    let mut domain_len = 0u32;
-    let mut sid_use = 0 as SID_NAME_USE;
-    if LookupAccountSidW(
-        null_mut(),
-        sid,
-        null_mut(),
-        &mut name_len,
-        null_mut(),
-        &mut domain_len,
-        &mut sid_use,
-    ) == 0
-    {
-        let error = GetLastError();
-        if error == ERROR_NONE_MAPPED {
-            return sid_string(sid).map(Some);
+    unsafe {
+        if sid.is_null() || IsValidSid(sid) == 0 {
+            return Ok(None);
         }
-        if error != ERROR_INSUFFICIENT_BUFFER {
+        if let Some(name) = well_known_service_name(sid) {
+            return Ok(Some(name));
+        }
+
+        let mut name_len = 0u32;
+        let mut domain_len = 0u32;
+        let mut sid_use = 0 as SID_NAME_USE;
+        if LookupAccountSidW(
+            null_mut(),
+            sid,
+            null_mut(),
+            &mut name_len,
+            null_mut(),
+            &mut domain_len,
+            &mut sid_use,
+        ) == 0
+        {
+            let error = GetLastError();
+            if error == ERROR_NONE_MAPPED {
+                return sid_string(sid).map(Some);
+            }
+            if error != ERROR_INSUFFICIENT_BUFFER {
+                return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+            }
+        }
+
+        if name_len == 0 {
+            return Err(ERROR_INVALID_DATA);
+        }
+
+        let mut name = vec![0u16; name_len as usize];
+        let mut domain = vec![0u16; domain_len as usize];
+        let domain_ptr = if domain.is_empty() {
+            null_mut()
+        } else {
+            domain.as_mut_ptr()
+        };
+        if LookupAccountSidW(
+            null_mut(),
+            sid,
+            name.as_mut_ptr(),
+            &mut name_len,
+            domain_ptr,
+            &mut domain_len,
+            &mut sid_use,
+        ) == 0
+        {
+            let error = GetLastError();
+            if error == ERROR_NONE_MAPPED {
+                return sid_string(sid).map(Some);
+            }
             return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
         }
-    }
 
-    if name_len == 0 {
-        return Err(ERROR_INVALID_DATA);
+        let available = (name_len as usize).min(name.len());
+        let length = name[..available]
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(available);
+        Ok(Some(String::from_utf16_lossy(&name[..length])))
     }
-
-    let mut name = vec![0u16; name_len as usize];
-    let mut domain = vec![0u16; domain_len as usize];
-    let domain_ptr = if domain.is_empty() {
-        null_mut()
-    } else {
-        domain.as_mut_ptr()
-    };
-    if LookupAccountSidW(
-        null_mut(),
-        sid,
-        name.as_mut_ptr(),
-        &mut name_len,
-        domain_ptr,
-        &mut domain_len,
-        &mut sid_use,
-    ) == 0
-    {
-        let error = GetLastError();
-        if error == ERROR_NONE_MAPPED {
-            return sid_string(sid).map(Some);
-        }
-        return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
-    }
-
-    let available = (name_len as usize).min(name.len());
-    let length = name[..available]
-        .iter()
-        .position(|value| *value == 0)
-        .unwrap_or(available);
-    Ok(Some(String::from_utf16_lossy(&name[..length])))
 }
 
 unsafe fn lookup_account_name_from_sid_cached(
     sid: *mut core::ffi::c_void,
-    account_cache: &mut HashMap<Vec<u8>, String>,
+    account_cache: &mut AccountNameCache,
 ) -> Result<Option<String>, u32> {
-    let cache_key = sid_cache_key(sid);
-    if let Some(name) = cache_key.as_ref().and_then(|key| account_cache.get(key)) {
-        return Ok(Some(name.clone()));
-    }
+    unsafe {
+        if sid.is_null() || IsValidSid(sid) == 0 {
+            return lookup_account_name_from_sid(sid);
+        }
+        let length = GetLengthSid(sid) as usize;
+        if length == 0 {
+            return lookup_account_name_from_sid(sid);
+        }
+        let cache_key = slice::from_raw_parts(sid as *const u8, length);
+        if let Some(name) = account_cache.get(cache_key) {
+            return Ok(Some(name));
+        }
 
-    let name = lookup_account_name_from_sid(sid)?;
-    if let (Some(cache_key), Some(name)) = (cache_key, name.as_ref()) {
-        account_cache.insert(cache_key, name.clone());
+        let name = lookup_account_name_from_sid(sid)?;
+        if let Some(name) = name.as_ref() {
+            account_cache.insert(cache_key.to_vec(), name.clone());
+        }
+        Ok(name)
     }
-    Ok(name)
+}
+
+unsafe fn query_process_account_name(
+    process_handle: HANDLE,
+    account_cache: &mut AccountNameCache,
+) -> Result<Option<String>, u32> {
+    unsafe {
+        let mut raw_token = null_mut();
+        if OpenProcessToken(process_handle, TOKEN_QUERY, &mut raw_token) == 0 {
+            let error = GetLastError();
+            return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+        }
+        let token = OwnedHandle::new(raw_token).ok_or(ERROR_INVALID_DATA)?;
+
+        let mut required_bytes = 0u32;
+        if GetTokenInformation(
+            token.as_raw(),
+            TokenUser,
+            null_mut(),
+            0,
+            &mut required_bytes,
+        ) != 0
+        {
+            return Err(ERROR_INVALID_DATA);
+        }
+        let error = GetLastError();
+        if error != ERROR_INSUFFICIENT_BUFFER || required_bytes < size_of::<TOKEN_USER>() as u32 {
+            return Err(if error == 0 {
+                ERROR_INVALID_DATA
+            } else {
+                error
+            });
+        }
+
+        let word_count = (required_bytes as usize).div_ceil(size_of::<usize>());
+        let mut storage = vec![0usize; word_count];
+        let storage_bytes = storage
+            .len()
+            .checked_mul(size_of::<usize>())
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or(ERROR_INVALID_DATA)?;
+        let mut returned_bytes = 0u32;
+        if GetTokenInformation(
+            token.as_raw(),
+            TokenUser,
+            storage.as_mut_ptr() as *mut _,
+            storage_bytes,
+            &mut returned_bytes,
+        ) == 0
+        {
+            let error = GetLastError();
+            return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+        }
+        if returned_bytes < size_of::<TOKEN_USER>() as u32 || returned_bytes > storage_bytes {
+            return Err(ERROR_INVALID_DATA);
+        }
+
+        let token_user = &*(storage.as_ptr() as *const TOKEN_USER);
+        lookup_account_name_from_sid_cached(token_user.User.Sid, account_cache)
+    }
 }
 
 unsafe fn sid_string(sid: *mut core::ffi::c_void) -> Result<String, u32> {
-    let mut string_sid = null_mut::<u16>();
-    if ConvertSidToStringSidW(sid, &mut string_sid) == 0 || string_sid.is_null() {
-        let error = GetLastError();
-        return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
-    }
+    unsafe {
+        let mut string_sid = null_mut::<u16>();
+        if ConvertSidToStringSidW(sid, &mut string_sid) == 0 || string_sid.is_null() {
+            let error = GetLastError();
+            return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+        }
 
-    let value = widestr_ptr_to_string(string_sid);
-    if !LocalFree(string_sid as _).is_null() {
-        let error = GetLastError();
-        return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+        let value = widestr_ptr_to_string(string_sid);
+        if !LocalFree(string_sid as _).is_null() {
+            let error = GetLastError();
+            return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+        }
+        Ok(value)
     }
-    Ok(value)
-}
-
-unsafe fn sid_cache_key(sid: *mut core::ffi::c_void) -> Option<Vec<u8>> {
-    if sid.is_null() || IsValidSid(sid) == 0 {
-        return None;
-    }
-    let length = GetLengthSid(sid) as usize;
-    if length == 0 {
-        return None;
-    }
-    Some(slice::from_raw_parts(sid as *const u8, length).to_vec())
 }
 
 unsafe fn collect_process_identity_map(
     required_pids: &HashSet<u32>,
-    account_cache: &mut HashMap<Vec<u8>, String>,
-) -> Result<HashMap<u32, WtsProcessIdentity>, u32> {
-    if required_pids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    // WTS 进程枚举能一次拿到大量进程对应的 SID / Session 信息，
-    // 先建表再回填到快照里，比逐进程单查用户名更高效。
-    let mut process_info = null_mut::<WTS_PROCESS_INFOW>();
-    let mut count = 0u32;
-
-    if WTSEnumerateProcessesW(
-        WTS_CURRENT_SERVER_HANDLE,
-        0,
-        1,
-        &mut process_info,
-        &mut count,
-    ) == 0
-    {
-        let error = windows_sys::Win32::Foundation::GetLastError();
-        if !process_info.is_null() {
-            WTSFreeMemory(process_info as _);
+    account_cache: &mut AccountNameCache,
+) -> Result<WtsProcessIdentitySnapshot, u32> {
+    unsafe {
+        if required_pids.is_empty() {
+            return Ok(WtsProcessIdentitySnapshot {
+                identities: HashMap::new(),
+                row_error: None,
+            });
         }
-        return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
-    }
-    if process_info.is_null() {
-        return Err(ERROR_INVALID_DATA);
-    }
+        // WTS 进程枚举能一次拿到大量进程对应的 SID / Session 信息，
+        // 先建表再回填到快照里，比逐进程单查用户名更高效。
+        let mut process_info = null_mut::<WTS_PROCESS_INFOW>();
+        let mut count = 0u32;
 
-    let mut identities = HashMap::with_capacity(count as usize);
-    let mut collection_error = None;
-    let processes = slice::from_raw_parts(process_info, count as usize);
-    for process in processes {
-        let pid = process.ProcessId;
-        if !required_pids.contains(&pid) {
-            continue;
-        }
-        let user_name = if pid == 0 {
-            Some("SYSTEM".to_string())
-        } else {
-            match lookup_account_name_from_sid_cached(process.pUserSid, account_cache) {
-                Ok(name) => name,
-                Err(error) => {
-                    collection_error = Some(error);
-                    break;
-                }
-            }
-        };
-        identities.insert(
-            pid,
-            WtsProcessIdentity {
-                user_name,
-                session_id: process.SessionId,
-                image_name_lower: widestr_ptr_to_string(process.pProcessName).to_lowercase(),
-            },
+        let enumeration_result = WTSEnumerateProcessesW(
+            WTS_CURRENT_SERVER_HANDLE,
+            0,
+            1,
+            &mut process_info,
+            &mut count,
         );
-    }
+        if enumeration_result == 0 {
+            let error = windows_sys::Win32::Foundation::GetLastError();
+            let _unexpected_buffer = OwnedWtsMemory::new(process_info);
+            return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+        }
+        let process_info = OwnedWtsMemory::new(process_info).ok_or(ERROR_INVALID_DATA)?;
 
-    WTSFreeMemory(process_info as _);
-    match collection_error {
-        Some(error) => Err(error),
-        None => Ok(identities),
+        let mut identities = HashMap::with_capacity(count as usize);
+        let mut row_error = None;
+        let processes = slice::from_raw_parts(process_info.as_ptr(), count as usize);
+        for process in processes {
+            let pid = process.ProcessId;
+            if !required_pids.contains(&pid) {
+                continue;
+            }
+            let user_name = if pid == 0 {
+                Some("SYSTEM".to_string())
+            } else {
+                match lookup_account_name_from_sid_cached(process.pUserSid, account_cache) {
+                    Ok(name) => name,
+                    Err(error) => {
+                        row_error.get_or_insert(error);
+                        None
+                    }
+                }
+            };
+            identities.insert(
+                pid,
+                WtsProcessIdentity {
+                    user_name,
+                    session_id: process.SessionId,
+                    image_name_lower: widestr_ptr_to_string(process.pProcessName).to_lowercase(),
+                },
+            );
+        }
+
+        Ok(WtsProcessIdentitySnapshot {
+            identities,
+            row_error,
+        })
     }
 }
 
-fn merge_wts_process_identity(entry: &mut ProcEntry, wts_identity: Option<&WtsProcessIdentity>) {
+fn merge_wts_process_identity(
+    entry: &mut ProcEntry,
+    wts_identity: Option<&WtsProcessIdentity>,
+) -> bool {
     let Some(wts_identity) = wts_identity else {
-        return;
+        return false;
     };
 
     // WTS only keys rows by PID. Requiring the same image and a compatible session prevents a
     // stale WTS row from overwriting a newer process after PID reuse.
     if !wts_identity_matches(&entry.image_name_lower, entry.session_id, wts_identity) {
-        return;
+        return false;
     }
 
-    if entry.user_name.is_empty() {
-        if let Some(user_name) = wts_identity.user_name.as_ref() {
-            entry.user_name.clone_from(user_name);
-            entry.user_name_lower = user_name.to_lowercase();
-        }
+    let user_name = wts_identity
+        .user_name
+        .as_ref()
+        .filter(|user_name| !user_name.is_empty());
+    if entry.user_name.is_empty()
+        && let Some(user_name) = user_name
+    {
+        entry.user_name.clone_from(user_name);
+        entry.user_name_lower = user_name.to_lowercase();
     }
     if entry.session_id.is_none() {
         entry.session_id = Some(wts_identity.session_id);
     }
+    user_name.is_some()
 }
 
 fn wts_identity_matches(
@@ -2380,10 +2668,11 @@ fn collect_process_tree_termination_order(
     root_identity: ProcIdentity,
 ) -> Result<Vec<ProcIdentity>, u32> {
     unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == INVALID_HANDLE_VALUE {
-            return Err(windows_sys::Win32::Foundation::GetLastError());
-        }
+        let raw_snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        let Some(snapshot) = OwnedHandle::new(raw_snapshot) else {
+            let error = windows_sys::Win32::Foundation::GetLastError();
+            return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+        };
 
         let mut snapshot_time = zeroed::<FILETIME>();
         GetSystemTimeAsFileTime(&mut snapshot_time);
@@ -2393,10 +2682,9 @@ fn collect_process_tree_termination_order(
         let mut process_entry = zeroed::<PROCESSENTRY32W>();
         process_entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
 
-        if Process32FirstW(snapshot, &mut process_entry) == 0 {
+        if Process32FirstW(snapshot.as_raw(), &mut process_entry) == 0 {
             let error = windows_sys::Win32::Foundation::GetLastError();
-            CloseHandle(snapshot);
-            return Err(error);
+            return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
         }
 
         loop {
@@ -2404,17 +2692,14 @@ fn collect_process_tree_termination_order(
                 .entry(process_entry.th32ParentProcessID)
                 .or_default()
                 .push(process_entry.th32ProcessID);
-            if Process32NextW(snapshot, &mut process_entry) == 0 {
+            if Process32NextW(snapshot.as_raw(), &mut process_entry) == 0 {
                 let error = windows_sys::Win32::Foundation::GetLastError();
                 if error != ERROR_NO_MORE_FILES {
-                    CloseHandle(snapshot);
                     return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
                 }
                 break;
             }
         }
-
-        CloseHandle(snapshot);
 
         // The snapshot is keyed only by PID. Revalidate the root after enumeration so a root
         // that exited and had its PID reused cannot lend the replacement's children to this tree.
@@ -2453,31 +2738,33 @@ unsafe fn collect_verified_process_tree_children(
     visited: &mut HashSet<u32>,
     order: &mut Vec<ProcIdentity>,
 ) -> Result<(), u32> {
-    if !visited.insert(parent.pid) {
-        return Ok(());
-    }
-
-    if let Some(children) = child_map.get(&parent.pid) {
-        for &child_pid in children {
-            if visited.contains(&child_pid) {
-                continue;
-            }
-            let child = query_process_identity_for_pid(child_pid)?;
-            if !is_valid_process_tree_edge(parent, child, snapshot_time_100ns) {
-                continue;
-            }
-            collect_verified_process_tree_children(
-                child,
-                snapshot_time_100ns,
-                child_map,
-                visited,
-                order,
-            )?;
+    unsafe {
+        if !visited.insert(parent.pid) {
+            return Ok(());
         }
-    }
 
-    order.push(parent);
-    Ok(())
+        if let Some(children) = child_map.get(&parent.pid) {
+            for &child_pid in children {
+                if visited.contains(&child_pid) {
+                    continue;
+                }
+                let child = query_process_identity_for_pid(child_pid)?;
+                if !is_valid_process_tree_edge(parent, child, snapshot_time_100ns) {
+                    continue;
+                }
+                collect_verified_process_tree_children(
+                    child,
+                    snapshot_time_100ns,
+                    child_map,
+                    visited,
+                    order,
+                )?;
+            }
+        }
+
+        order.push(parent);
+        Ok(())
+    }
 }
 
 fn is_valid_process_tree_edge(
@@ -2491,59 +2778,19 @@ fn is_valid_process_tree_edge(
         && child.creation_time_100ns <= snapshot_time_100ns
 }
 
-pub(crate) unsafe fn query_process_identity_for_pid(pid: u32) -> Result<ProcIdentity, u32> {
-    let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-    if handle.is_null() {
-        return Err(windows_sys::Win32::Foundation::GetLastError());
-    }
-    let creation_time = query_process_creation_time(handle);
-    let error = windows_sys::Win32::Foundation::GetLastError();
-    CloseHandle(handle);
-    creation_time
-        .map(|value| ProcIdentity::new(pid, value))
-        .ok_or(error)
-}
-
-unsafe fn open_process_for_identity(identity: ProcIdentity, access: u32) -> Result<HANDLE, u32> {
-    if !identity.is_verified() {
-        return Err(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
-    }
-
-    let handle = OpenProcess(access, 0, identity.pid);
-    if handle.is_null() {
-        return Err(windows_sys::Win32::Foundation::GetLastError());
-    }
-
-    match query_process_creation_time(handle) {
-        Some(creation_time_100ns) if creation_time_100ns == identity.creation_time_100ns => {}
-        Some(_) => {
-            CloseHandle(handle);
-            return Err(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
-        }
-        None => {
-            let error = windows_sys::Win32::Foundation::GetLastError();
-            CloseHandle(handle);
-            return Err(error);
-        }
-    }
-
-    Ok(handle)
-}
-
-unsafe fn query_process_creation_time(handle: HANDLE) -> Option<u64> {
-    let mut creation = zeroed::<FILETIME>();
-    let mut exit = zeroed::<FILETIME>();
-    let mut kernel = zeroed::<FILETIME>();
-    let mut user = zeroed::<FILETIME>();
-    if GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
-        return None;
-    }
-
-    Some(filetime_to_u64(creation))
-}
-
 fn kb_from_bytes(value: usize) -> u64 {
     (value as u64) / 1024
+}
+
+fn own_created_process_handles(
+    process_info: PROCESS_INFORMATION,
+) -> Result<(OwnedHandle, OwnedHandle), u32> {
+    let process = OwnedHandle::new(process_info.hProcess);
+    let thread = OwnedHandle::new(process_info.hThread);
+    match (process, thread) {
+        (Some(process), Some(thread)) => Ok((process, thread)),
+        _ => Err(ERROR_INVALID_HANDLE),
+    }
 }
 
 fn signed_kb_delta(current: u64, previous: u64) -> i64 {
@@ -2562,232 +2809,313 @@ fn unwrap_previous_samples(
 
 // 通过 QueryFullProcessImageNameW 查询进程可执行文件的全路径。
 unsafe fn query_process_image_path(identity: ProcIdentity) -> Result<String, u32> {
-    let handle = open_process_for_identity(identity, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    unsafe {
+        let handle = open_process_for_identity(identity, PROCESS_QUERY_LIMITED_INFORMATION)?;
 
-    let mut capacity = 32768u32;
-    let mut buffer = vec![0u16; capacity as usize];
-    let success = QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut capacity);
-    let error = windows_sys::Win32::Foundation::GetLastError();
-    CloseHandle(handle);
+        let mut capacity = 32768u32;
+        let mut buffer = vec![0u16; capacity as usize];
+        let success =
+            QueryFullProcessImageNameW(handle.as_raw(), 0, buffer.as_mut_ptr(), &mut capacity);
+        let error = windows_sys::Win32::Foundation::GetLastError();
+        drop(handle);
 
-    if success == 0 {
-        return Err(error);
+        if success == 0 {
+            return Err(error);
+        }
+
+        Ok(String::from_utf16_lossy(&buffer[..capacity as usize]))
     }
-
-    Ok(String::from_utf16_lossy(&buffer[..capacity as usize]))
 }
 
 unsafe fn query_windows_directory() -> Result<String, u32> {
-    let mut buffer = vec![0u16; 260];
-    loop {
-        let length = GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) as usize;
-        if length == 0 {
-            return Err(windows_sys::Win32::Foundation::GetLastError());
+    unsafe {
+        let mut buffer = vec![0u16; 260];
+        loop {
+            let length = GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) as usize;
+            if length == 0 {
+                return Err(windows_sys::Win32::Foundation::GetLastError());
+            }
+            if length < buffer.len() {
+                return Ok(String::from_utf16_lossy(&buffer[..length]));
+            }
+            buffer.resize(length.saturating_add(1), 0);
         }
-        if length < buffer.len() {
-            return Ok(String::from_utf16_lossy(&buffer[..length]));
-        }
-        buffer.resize(length.saturating_add(1), 0);
     }
 }
 
 unsafe fn collect_process_entries(
     previous_samples: &HashMap<ProcIdentity, PreviousProcSample>,
-    total_delta: u64,
-) -> Result<(Vec<ProcEntry>, HashMap<ProcIdentity, PreviousProcSample>), u32> {
-    // 采样阶段只构造“当下这一轮”的快照，真正的增量计算依赖外部传入的历史样本。
-    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(windows_sys::Win32::Foundation::GetLastError());
-    }
-
-    let mut entries = Vec::with_capacity(previous_samples.len().max(64));
-    let mut next_samples = HashMap::with_capacity(previous_samples.len().max(64));
-    let mut account_cache = HashMap::<Vec<u8>, String>::new();
-    let mut process_entry = zeroed::<PROCESSENTRY32W>();
-    process_entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
-
-    if Process32FirstW(snapshot, &mut process_entry) == 0 {
-        let error = windows_sys::Win32::Foundation::GetLastError();
-        CloseHandle(snapshot);
-        return if error == ERROR_NO_MORE_FILES {
-            Ok((entries, next_samples))
-        } else {
-            Err(if error == 0 { ERROR_GEN_FAILURE } else { error })
-        };
-    }
-
-    loop {
-        let pid = process_entry.th32ProcessID;
-        let thread_count = process_entry.cntThreads;
-        let image_name = utf16_buffer_to_string(&process_entry.szExeFile);
-        let mut entry = ProcEntry {
-            identity: ProcIdentity::pid_only(pid),
-            pid,
-            image_name: image_name.clone(),
-            image_name_lower: image_name.to_lowercase(),
-            is_32_bit: false,
-            user_name: String::new(),
-            user_name_lower: String::new(),
-            session_id: None,
-            cpu: 0,
-            cpu_time_100ns: 0,
-            display_cpu_time_100ns: 0,
-            mem_usage_kb: 0,
-            mem_diff_kb: 0,
-            page_faults: 0,
-            page_faults_diff: 0,
-            commit_charge_kb: 0,
-            paged_pool_kb: 0,
-            nonpaged_pool_kb: 0,
-            priority_class: NORMAL_PRIORITY_CLASS,
-            handle_count: 0,
-            thread_count,
-            display_text: std::array::from_fn(|_| String::new()),
-            pass_count: 0,
-            dirty_columns: DirtyColumns::default(),
-        };
-        let mut raw_cpu_time_100ns = 0u64;
-
-        if pid == 0 {
-            entry.user_name = "SYSTEM".to_string();
-            entry.user_name_lower = "system".to_string();
-            entry.session_id = Some(0);
-        }
-
-        let memory_handle = if pid == 0 {
-            null_mut()
-        } else {
-            OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid)
-        };
-        let query_handle = if pid != 0 && memory_handle.is_null() {
-            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
-        } else {
-            null_mut()
-        };
-        let info_handle = if !memory_handle.is_null() {
-            memory_handle
-        } else {
-            query_handle
+    total_delta: Option<u64>,
+    cache: &mut ProcWorkerCache,
+) -> Result<CollectedProcessEntries, u32> {
+    unsafe {
+        // 采样阶段只构造“当下这一轮”的快照，真正的增量计算依赖外部传入的历史样本。
+        let raw_snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        let Some(snapshot) = OwnedHandle::new(raw_snapshot) else {
+            let error = windows_sys::Win32::Foundation::GetLastError();
+            return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
         };
 
-        if !info_handle.is_null() {
-            entry.is_32_bit = match is_32_bit_process_handle(info_handle) {
-                Ok(is_32_bit) => is_32_bit,
-                Err(error) => {
-                    if !memory_handle.is_null() {
-                        CloseHandle(memory_handle);
-                    }
-                    if !query_handle.is_null() {
-                        CloseHandle(query_handle);
-                    }
-                    CloseHandle(snapshot);
-                    return Err(error);
-                }
+        let mut entries = Vec::with_capacity(previous_samples.len().max(64));
+        let mut next_samples = HashMap::with_capacity(previous_samples.len().max(64));
+        let mut resolved_user_identities = HashSet::with_capacity(previous_samples.len().max(64));
+        let mut row_error = None;
+        let mut process_entry = zeroed::<PROCESSENTRY32W>();
+        process_entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+
+        if Process32FirstW(snapshot.as_raw(), &mut process_entry) == 0 {
+            let error = windows_sys::Win32::Foundation::GetLastError();
+            return if error == ERROR_NO_MORE_FILES {
+                Ok(CollectedProcessEntries {
+                    entries,
+                    next_samples,
+                    row_error,
+                })
+            } else {
+                Err(if error == 0 { ERROR_GEN_FAILURE } else { error })
             };
-            let mut creation = zeroed::<FILETIME>();
-            let mut exit = zeroed::<FILETIME>();
-            let mut kernel = zeroed::<FILETIME>();
-            let mut user = zeroed::<FILETIME>();
-            if GetProcessTimes(
-                info_handle,
-                &mut creation,
-                &mut exit,
-                &mut kernel,
-                &mut user,
-            ) != 0
-            {
-                entry.identity = ProcIdentity::new(pid, filetime_to_u64(creation));
-                let cpu_time_100ns = filetime_to_u64(kernel).saturating_add(filetime_to_u64(user));
-                raw_cpu_time_100ns = cpu_time_100ns;
-                entry.cpu_time_100ns = cpu_time_100ns;
-                entry.display_cpu_time_100ns = cpu_time_100ns;
-                if let Some(previous) = previous_samples.get(&entry.identity) {
-                    let delta = cpu_time_100ns.saturating_sub(previous.raw_cpu_time_100ns);
-                    entry.cpu = cpu_percent_from_delta(delta, total_delta);
-                }
+        }
+        cache.account_names.begin_refresh();
+
+        loop {
+            let pid = process_entry.th32ProcessID;
+            let thread_count = process_entry.cntThreads;
+            let image_name = utf16_buffer_to_string(&process_entry.szExeFile);
+            let mut entry = ProcEntry {
+                identity: ProcIdentity::pid_only(pid),
+                pid,
+                image_name: image_name.clone(),
+                image_name_lower: image_name.to_lowercase(),
+                is_32_bit: None,
+                user_name: String::new(),
+                user_name_lower: String::new(),
+                session_id: None,
+                cpu: 0,
+                cpu_time_100ns: 0,
+                display_cpu_time_100ns: 0,
+                mem_usage_kb: 0,
+                mem_diff_kb: 0,
+                page_faults: 0,
+                page_faults_diff: 0,
+                commit_charge_kb: 0,
+                paged_pool_kb: 0,
+                nonpaged_pool_kb: 0,
+                priority_class: NORMAL_PRIORITY_CLASS,
+                handle_count: 0,
+                thread_count,
+                display_text: std::array::from_fn(|_| String::new()),
+                pass_count: 0,
+                dirty_columns: DirtyColumns::default(),
+            };
+            let mut raw_cpu_time_100ns = 0u64;
+
+            if pid == 0 {
+                entry.user_name = "SYSTEM".to_string();
+                entry.user_name_lower = "system".to_string();
+                entry.session_id = Some(0);
             }
 
-            if !memory_handle.is_null() {
-                let mut counters = PROCESS_MEMORY_COUNTERS_EX {
-                    cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
-                    ..zeroed()
-                };
-                if K32GetProcessMemoryInfo(
-                    memory_handle,
-                    &mut counters as *mut _ as *mut _,
-                    size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+            let memory_handle = if pid == 0 {
+                None
+            } else {
+                OwnedHandle::new(OpenProcess(
+                    PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                    0,
+                    pid,
+                ))
+            };
+            let query_handle = if pid != 0 && memory_handle.is_none() {
+                OwnedHandle::new(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid))
+            } else {
+                None
+            };
+            let info_handle = memory_handle
+                .as_ref()
+                .or(query_handle.as_ref())
+                .map(OwnedHandle::as_raw);
+
+            if let Some(info_handle) = info_handle {
+                let mut creation = zeroed::<FILETIME>();
+                let mut exit = zeroed::<FILETIME>();
+                let mut kernel = zeroed::<FILETIME>();
+                let mut user = zeroed::<FILETIME>();
+                if GetProcessTimes(
+                    info_handle,
+                    &mut creation,
+                    &mut exit,
+                    &mut kernel,
+                    &mut user,
                 ) != 0
                 {
-                    entry.mem_usage_kb = kb_from_bytes(counters.WorkingSetSize);
-                    entry.page_faults = counters.PageFaultCount;
-                    entry.commit_charge_kb = kb_from_bytes(counters.PrivateUsage);
-                    entry.paged_pool_kb = kb_from_bytes(counters.QuotaPagedPoolUsage);
-                    entry.nonpaged_pool_kb = kb_from_bytes(counters.QuotaNonPagedPoolUsage);
-
-                    if let Some(previous) = previous_samples.get(&entry.identity) {
-                        entry.mem_diff_kb =
-                            signed_kb_delta(entry.mem_usage_kb, previous.mem_usage_kb);
-                        entry.page_faults_diff =
-                            i64::from(entry.page_faults) - i64::from(previous.page_faults);
+                    entry.identity = ProcIdentity::new(pid, filetime_to_u64(creation));
+                    let cpu_time_100ns =
+                        filetime_to_u64(kernel).saturating_add(filetime_to_u64(user));
+                    raw_cpu_time_100ns = cpu_time_100ns;
+                    entry.cpu_time_100ns = cpu_time_100ns;
+                    entry.display_cpu_time_100ns = cpu_time_100ns;
+                    if let Some(previous) = previous_samples.get(&entry.identity)
+                        && let Some(total_delta) = total_delta
+                        && let Some(process_delta) =
+                            cpu_time_100ns.checked_sub(previous.raw_cpu_time_100ns)
+                    {
+                        entry.cpu = cpu_percent_from_delta(process_delta, total_delta);
                     }
+                }
+
+                if let Some(metadata) = cache.metadata.get(&entry.identity) {
+                    entry.apply_static_metadata(metadata);
+                    if metadata.user_identity_resolved {
+                        resolved_user_identities.insert(entry.identity);
+                    }
+                }
+                if entry.identity.is_verified() && entry.is_32_bit.is_none() {
+                    entry.is_32_bit = match is_32_bit_process_handle(info_handle) {
+                        Ok(is_32_bit) => Some(is_32_bit),
+                        Err(error) => {
+                            row_error.get_or_insert(if error == 0 {
+                                ERROR_GEN_FAILURE
+                            } else {
+                                error
+                            });
+                            None
+                        }
+                    };
+                }
+
+                if entry.identity.is_verified()
+                    && !resolved_user_identities.contains(&entry.identity)
+                {
+                    // The token is tied to the already creation-time-verified process handle.
+                    // Access-denied and exit races remain row-local; WTS resolves those rows in
+                    // one identity-validated batch after the process walk completes.
+                    if let Ok(Some(user_name)) =
+                        query_process_account_name(info_handle, &mut cache.account_names)
+                    {
+                        entry.user_name_lower = user_name.to_lowercase();
+                        entry.user_name = user_name;
+                        resolved_user_identities.insert(entry.identity);
+                    }
+                }
+
+                if let Some(memory_handle) = memory_handle.as_ref() {
+                    let mut counters = PROCESS_MEMORY_COUNTERS_EX {
+                        cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+                        ..zeroed()
+                    };
+                    if K32GetProcessMemoryInfo(
+                        memory_handle.as_raw(),
+                        &mut counters as *mut _ as *mut _,
+                        size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+                    ) != 0
+                    {
+                        entry.mem_usage_kb = kb_from_bytes(counters.WorkingSetSize);
+                        entry.page_faults = counters.PageFaultCount;
+                        entry.commit_charge_kb = kb_from_bytes(counters.PrivateUsage);
+                        entry.paged_pool_kb = kb_from_bytes(counters.QuotaPagedPoolUsage);
+                        entry.nonpaged_pool_kb = kb_from_bytes(counters.QuotaNonPagedPoolUsage);
+
+                        if let Some(previous) = previous_samples.get(&entry.identity) {
+                            entry.mem_diff_kb =
+                                signed_kb_delta(entry.mem_usage_kb, previous.mem_usage_kb);
+                            entry.page_faults_diff =
+                                i64::from(entry.page_faults) - i64::from(previous.page_faults);
+                        }
+                    }
+                }
+
+                let mut handle_count = 0u32;
+                if GetProcessHandleCount(info_handle, &mut handle_count) != 0 {
+                    entry.handle_count = handle_count;
+                }
+
+                let priority_class = GetPriorityClass(info_handle);
+                if priority_class != 0 {
+                    entry.priority_class = priority_class;
+                }
+
+                if entry.identity.is_verified() {
+                    next_samples.insert(
+                        entry.identity,
+                        PreviousProcSample {
+                            raw_cpu_time_100ns,
+                            mem_usage_kb: entry.mem_usage_kb,
+                            page_faults: entry.page_faults,
+                        },
+                    );
                 }
             }
 
-            let mut handle_count = 0u32;
-            if GetProcessHandleCount(info_handle, &mut handle_count) != 0 {
-                entry.handle_count = handle_count;
-            }
+            entries.push(entry);
 
-            let priority_class = GetPriorityClass(info_handle);
-            if priority_class != 0 {
-                entry.priority_class = priority_class;
+            if Process32NextW(snapshot.as_raw(), &mut process_entry) == 0 {
+                let error = windows_sys::Win32::Foundation::GetLastError();
+                if error != ERROR_NO_MORE_FILES {
+                    return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+                }
+                break;
             }
+        }
 
-            if entry.identity.is_verified() {
-                next_samples.insert(
+        let required_identity_pids = entries
+            .iter()
+            .filter(|entry| {
+                entry.pid != 0
+                    && (!entry.identity.is_verified()
+                        || cache
+                            .metadata
+                            .get(&entry.identity)
+                            .is_none_or(|metadata| !metadata.user_identity_resolved))
+            })
+            .map(|entry| entry.pid)
+            .collect::<HashSet<_>>();
+        let identity_snapshot =
+            collect_process_identity_map(&required_identity_pids, &mut cache.account_names)?;
+        row_error = row_error.or(identity_snapshot.row_error);
+        for entry in entries.iter_mut().filter(|entry| entry.pid != 0) {
+            if merge_wts_process_identity(entry, identity_snapshot.identities.get(&entry.pid))
+                && entry.identity.is_verified()
+            {
+                resolved_user_identities.insert(entry.identity);
+            }
+        }
+
+        let current_identities = entries
+            .iter()
+            .map(|entry| entry.identity)
+            .filter(|identity| identity.is_verified())
+            .collect::<HashSet<_>>();
+        cache
+            .metadata
+            .retain(|identity, _| current_identities.contains(identity));
+        for entry in entries.iter().filter(|entry| entry.identity.is_verified()) {
+            let resolved = resolved_user_identities.contains(&entry.identity);
+            if let Some(metadata) = cache.metadata.get_mut(&entry.identity) {
+                if resolved && !metadata.user_identity_resolved {
+                    metadata.user_name.clone_from(&entry.user_name);
+                    metadata.user_name_lower.clone_from(&entry.user_name_lower);
+                    metadata.session_id = entry.session_id;
+                    metadata.user_identity_resolved = true;
+                }
+            } else {
+                cache.metadata.insert(
                     entry.identity,
-                    PreviousProcSample {
-                        raw_cpu_time_100ns,
-                        mem_usage_kb: entry.mem_usage_kb,
-                        page_faults: entry.page_faults,
+                    ProcStaticMetadata {
+                        is_32_bit: entry.is_32_bit,
+                        user_name: entry.user_name.clone(),
+                        user_name_lower: entry.user_name_lower.clone(),
+                        session_id: entry.session_id,
+                        user_identity_resolved: resolved,
                     },
                 );
             }
         }
 
-        if !memory_handle.is_null() {
-            CloseHandle(memory_handle);
-        }
-        if !query_handle.is_null() {
-            CloseHandle(query_handle);
-        }
-
-        entries.push(entry);
-
-        if Process32NextW(snapshot, &mut process_entry) == 0 {
-            let error = windows_sys::Win32::Foundation::GetLastError();
-            if error != ERROR_NO_MORE_FILES {
-                CloseHandle(snapshot);
-                return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
-            }
-            break;
-        }
+        Ok(CollectedProcessEntries {
+            entries,
+            next_samples,
+            row_error,
+        })
     }
-
-    CloseHandle(snapshot);
-
-    let snapshot_pids = entries
-        .iter()
-        .map(|entry| entry.pid)
-        .collect::<HashSet<_>>();
-    let identities = collect_process_identity_map(&snapshot_pids, &mut account_cache)?;
-    for entry in &mut entries {
-        merge_wts_process_identity(entry, identities.get(&entry.pid));
-        entry.rebuild_display_text();
-    }
-
-    Ok((entries, next_samples))
 }
 
 // 读取系统总 CPU 时间（kernel + user），用于计算每轮刷新的 CPU 时间增量。
@@ -2796,9 +3124,19 @@ fn current_system_time(
     processor_info: &mut Vec<ProcessorPerformance>,
 ) -> Result<u64, u32> {
     query_processor_performance(processor_count.max(1), processor_info)
-        .map_err(|status| status as u32)?;
-    let (_, kernel, user) = summed_processor_times(processor_info);
-    Ok(kernel.saturating_add(user))
+        .map_err(ntstatus_to_win32)?;
+    let (_, kernel, user) =
+        checked_summed_processor_times(processor_info).ok_or(ERROR_INVALID_DATA)?;
+    kernel.checked_add(user).ok_or(ERROR_INVALID_DATA)
+}
+
+fn ntstatus_to_win32(status: i32) -> u32 {
+    let error = unsafe { RtlNtStatusToDosError(status) };
+    if error == 0 { ERROR_GEN_FAILURE } else { error }
+}
+
+fn system_time_delta(current: u64, previous: Option<u64>) -> Option<u64> {
+    previous.and_then(|previous| current.checked_sub(previous))
 }
 
 // 将 Win32 FILETIME 结构合并为一个 u64（100ns 单位）。
@@ -2815,60 +3153,76 @@ fn utf16_buffer_to_string(buffer: &[u16]) -> String {
     String::from_utf16_lossy(&buffer[..length])
 }
 
-// 根据进程 CPU 时间增量与系统总时间增量计算 CPU 使用率百分比（0-99）。
-// 除 1000 再除 10 的等效运算，避免浮点计算。
+// 根据进程 CPU 时间增量与系统总时间增量计算 CPU 使用率百分比。
 fn cpu_percent_from_delta(delta_100ns: u64, total_delta_100ns: u64) -> u8 {
     if total_delta_100ns == 0 {
         return 0;
     }
-
-    let scaled_total = (total_delta_100ns / 1000).max(1);
-    (((delta_100ns / scaled_total) + 5) / 10).min(99) as u8
+    let rounded = (u128::from(delta_100ns) * 100 + u128::from(total_delta_100ns) / 2)
+        / u128::from(total_delta_100ns);
+    rounded.min(100) as u8
 }
 
 // 获取窗口相对于页面客户区的矩形坐标（MapWindowPoints）。
 unsafe fn window_rect_relative_to_page(hwnd: HWND, page_hwnd: HWND) -> RECT {
-    let mut rect = zeroed::<RECT>();
-    windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect);
-    MapWindowPoints(null_mut(), page_hwnd, &mut rect as *mut _ as _, 2);
-    rect
+    unsafe {
+        let mut rect = zeroed::<RECT>();
+        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect);
+        MapWindowPoints(null_mut(), page_hwnd, &mut rect as *mut _ as _, 2);
+        rect
+    }
 }
 
 impl ProcEntry {
-    fn rebuild_display_text(&mut self) {
-        self.display_text[ColumnId::ImageName as usize] =
-            append_32_bit_suffix(&self.image_name, self.is_32_bit).into_owned();
-        self.display_text[ColumnId::Pid as usize] = self.pid.to_string();
-        self.display_text[ColumnId::Username as usize].clone_from(&self.user_name);
-        self.display_text[ColumnId::SessionId as usize] = self
-            .session_id
-            .map(|session_id| session_id.to_string())
-            .unwrap_or_default();
-        self.display_text[ColumnId::Cpu as usize] = format!("{:02} %", self.cpu);
-        self.display_text[ColumnId::CpuTime as usize] =
-            format_elapsed_time(self.display_cpu_time_100ns);
-        self.display_text[ColumnId::MemUsage as usize] = format_kilobytes(self.mem_usage_kb);
-        self.display_text[ColumnId::MemUsageDiff as usize] =
-            format_signed_kilobytes(self.mem_diff_kb);
-        self.display_text[ColumnId::PageFaults as usize] = self.page_faults.to_string();
-        self.display_text[ColumnId::PageFaultsDiff as usize] = self.page_faults_diff.to_string();
-        self.display_text[ColumnId::CommitCharge as usize] =
-            format_kilobytes(self.commit_charge_kb);
-        self.display_text[ColumnId::PagedPool as usize] = format_kilobytes(self.paged_pool_kb);
-        self.display_text[ColumnId::NonPagedPool as usize] =
-            format_kilobytes(self.nonpaged_pool_kb);
-        self.display_text[ColumnId::HandleCount as usize] = self.handle_count.to_string();
-        self.display_text[ColumnId::ThreadCount as usize] = self.thread_count.to_string();
+    fn rebuild_display_columns(&mut self, columns: &[ColumnId]) {
+        for column in columns.iter().copied() {
+            self.rebuild_display_column(column);
+        }
     }
 
-    fn copy_display_column_from(&mut self, snapshot: &Self, column_id: ColumnId) {
-        self.display_text[column_id as usize]
-            .clone_from(&snapshot.display_text[column_id as usize]);
+    fn rebuild_display_column(&mut self, column_id: ColumnId) {
+        let text = match column_id {
+            ColumnId::ImageName => {
+                append_32_bit_suffix(&self.image_name, self.is_32_bit == Some(true)).into_owned()
+            }
+            ColumnId::Pid => self.pid.to_string(),
+            ColumnId::Username => self.user_name.clone(),
+            ColumnId::SessionId => self
+                .session_id
+                .map(|session_id| session_id.to_string())
+                .unwrap_or_default(),
+            ColumnId::Cpu => format!("{:02} %", self.cpu),
+            ColumnId::CpuTime => format_elapsed_time(self.display_cpu_time_100ns),
+            ColumnId::MemUsage => format_kilobytes(self.mem_usage_kb),
+            ColumnId::MemUsageDiff => format_signed_kilobytes(self.mem_diff_kb),
+            ColumnId::PageFaults => self.page_faults.to_string(),
+            ColumnId::PageFaultsDiff => self.page_faults_diff.to_string(),
+            ColumnId::CommitCharge => format_kilobytes(self.commit_charge_kb),
+            ColumnId::PagedPool => format_kilobytes(self.paged_pool_kb),
+            ColumnId::NonPagedPool => format_kilobytes(self.nonpaged_pool_kb),
+            ColumnId::BasePriority => return,
+            ColumnId::HandleCount => self.handle_count.to_string(),
+            ColumnId::ThreadCount => self.thread_count.to_string(),
+        };
+        self.display_text[column_id as usize] = text;
     }
 
-    fn with_pass_count(mut self, pass_count: u64) -> Self {
+    fn apply_static_metadata(&mut self, metadata: &ProcStaticMetadata) {
+        self.is_32_bit = metadata.is_32_bit;
+        self.user_name.clone_from(&metadata.user_name);
+        self.user_name_lower.clone_from(&metadata.user_name_lower);
+        self.session_id = metadata.session_id;
+    }
+
+    fn with_pass_count(
+        mut self,
+        pass_count: u64,
+        active_columns: &[ColumnId],
+        visible_columns: DirtyColumns,
+    ) -> Self {
         self.pass_count = pass_count;
-        self.dirty_columns = DirtyColumns::all();
+        self.rebuild_display_columns(active_columns);
+        self.dirty_columns = visible_columns;
         self
     }
 }
@@ -2877,6 +3231,7 @@ fn update_process_entry(
     entry: &mut ProcEntry,
     snapshot: &ProcEntry,
     pass_count: u64,
+    visible_columns: DirtyColumns,
 ) -> DirtyColumns {
     // 增量更新时只给真正变更的列打脏标记，
     // 后续 ListView 才能做到“只重绘必要行/列”。
@@ -2893,86 +3248,76 @@ fn update_process_entry(
         entry.is_32_bit = snapshot.is_32_bit;
     }
     if image_name_changed || bitness_changed {
-        entry.copy_display_column_from(snapshot, ColumnId::ImageName);
-        mark_process_column_changed(entry, &mut changed, ColumnId::ImageName);
+        mark_process_column_changed(entry, &mut changed, ColumnId::ImageName, visible_columns);
     }
     if entry.pid != snapshot.pid {
         entry.pid = snapshot.pid;
-        entry.copy_display_column_from(snapshot, ColumnId::Pid);
-        mark_process_column_changed(entry, &mut changed, ColumnId::Pid);
+        mark_process_column_changed(entry, &mut changed, ColumnId::Pid, visible_columns);
     }
     if entry.user_name != snapshot.user_name {
         entry.user_name.clone_from(&snapshot.user_name);
         entry.user_name_lower = snapshot.user_name_lower.clone();
-        entry.copy_display_column_from(snapshot, ColumnId::Username);
-        mark_process_column_changed(entry, &mut changed, ColumnId::Username);
+        mark_process_column_changed(entry, &mut changed, ColumnId::Username, visible_columns);
     }
     if entry.session_id != snapshot.session_id {
         entry.session_id = snapshot.session_id;
-        entry.copy_display_column_from(snapshot, ColumnId::SessionId);
-        mark_process_column_changed(entry, &mut changed, ColumnId::SessionId);
+        mark_process_column_changed(entry, &mut changed, ColumnId::SessionId, visible_columns);
     }
     if entry.cpu != snapshot.cpu {
         entry.cpu = snapshot.cpu;
-        entry.copy_display_column_from(snapshot, ColumnId::Cpu);
-        mark_process_column_changed(entry, &mut changed, ColumnId::Cpu);
+        mark_process_column_changed(entry, &mut changed, ColumnId::Cpu, visible_columns);
     }
     if entry.cpu_time_100ns != snapshot.cpu_time_100ns {
         entry.cpu_time_100ns = snapshot.cpu_time_100ns;
     }
     if entry.display_cpu_time_100ns != snapshot.display_cpu_time_100ns {
         entry.display_cpu_time_100ns = snapshot.display_cpu_time_100ns;
-        entry.copy_display_column_from(snapshot, ColumnId::CpuTime);
-        mark_process_column_changed(entry, &mut changed, ColumnId::CpuTime);
+        mark_process_column_changed(entry, &mut changed, ColumnId::CpuTime, visible_columns);
     }
     if entry.mem_usage_kb != snapshot.mem_usage_kb {
         entry.mem_usage_kb = snapshot.mem_usage_kb;
-        entry.copy_display_column_from(snapshot, ColumnId::MemUsage);
-        mark_process_column_changed(entry, &mut changed, ColumnId::MemUsage);
+        mark_process_column_changed(entry, &mut changed, ColumnId::MemUsage, visible_columns);
     }
     if entry.mem_diff_kb != snapshot.mem_diff_kb {
         entry.mem_diff_kb = snapshot.mem_diff_kb;
-        entry.copy_display_column_from(snapshot, ColumnId::MemUsageDiff);
-        mark_process_column_changed(entry, &mut changed, ColumnId::MemUsageDiff);
+        mark_process_column_changed(entry, &mut changed, ColumnId::MemUsageDiff, visible_columns);
     }
     if entry.page_faults != snapshot.page_faults {
         entry.page_faults = snapshot.page_faults;
-        entry.copy_display_column_from(snapshot, ColumnId::PageFaults);
-        mark_process_column_changed(entry, &mut changed, ColumnId::PageFaults);
+        mark_process_column_changed(entry, &mut changed, ColumnId::PageFaults, visible_columns);
     }
     if entry.page_faults_diff != snapshot.page_faults_diff {
         entry.page_faults_diff = snapshot.page_faults_diff;
-        entry.copy_display_column_from(snapshot, ColumnId::PageFaultsDiff);
-        mark_process_column_changed(entry, &mut changed, ColumnId::PageFaultsDiff);
+        mark_process_column_changed(
+            entry,
+            &mut changed,
+            ColumnId::PageFaultsDiff,
+            visible_columns,
+        );
     }
     if entry.commit_charge_kb != snapshot.commit_charge_kb {
         entry.commit_charge_kb = snapshot.commit_charge_kb;
-        entry.copy_display_column_from(snapshot, ColumnId::CommitCharge);
-        mark_process_column_changed(entry, &mut changed, ColumnId::CommitCharge);
+        mark_process_column_changed(entry, &mut changed, ColumnId::CommitCharge, visible_columns);
     }
     if entry.paged_pool_kb != snapshot.paged_pool_kb {
         entry.paged_pool_kb = snapshot.paged_pool_kb;
-        entry.copy_display_column_from(snapshot, ColumnId::PagedPool);
-        mark_process_column_changed(entry, &mut changed, ColumnId::PagedPool);
+        mark_process_column_changed(entry, &mut changed, ColumnId::PagedPool, visible_columns);
     }
     if entry.nonpaged_pool_kb != snapshot.nonpaged_pool_kb {
         entry.nonpaged_pool_kb = snapshot.nonpaged_pool_kb;
-        entry.copy_display_column_from(snapshot, ColumnId::NonPagedPool);
-        mark_process_column_changed(entry, &mut changed, ColumnId::NonPagedPool);
+        mark_process_column_changed(entry, &mut changed, ColumnId::NonPagedPool, visible_columns);
     }
     if entry.priority_class != snapshot.priority_class {
         entry.priority_class = snapshot.priority_class;
-        mark_process_column_changed(entry, &mut changed, ColumnId::BasePriority);
+        mark_process_column_changed(entry, &mut changed, ColumnId::BasePriority, visible_columns);
     }
     if entry.handle_count != snapshot.handle_count {
         entry.handle_count = snapshot.handle_count;
-        entry.copy_display_column_from(snapshot, ColumnId::HandleCount);
-        mark_process_column_changed(entry, &mut changed, ColumnId::HandleCount);
+        mark_process_column_changed(entry, &mut changed, ColumnId::HandleCount, visible_columns);
     }
     if entry.thread_count != snapshot.thread_count {
         entry.thread_count = snapshot.thread_count;
-        entry.copy_display_column_from(snapshot, ColumnId::ThreadCount);
-        mark_process_column_changed(entry, &mut changed, ColumnId::ThreadCount);
+        mark_process_column_changed(entry, &mut changed, ColumnId::ThreadCount, visible_columns);
     }
 
     changed
@@ -2982,22 +3327,104 @@ fn mark_process_column_changed(
     entry: &mut ProcEntry,
     changed: &mut DirtyColumns,
     column_id: ColumnId,
+    visible_columns: DirtyColumns,
 ) {
-    entry.dirty_columns.mark(column_id);
     changed.mark(column_id);
+    if visible_columns.contains(column_id) {
+        entry.rebuild_display_column(column_id);
+        entry.dirty_columns.mark(column_id);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        affinity_cpu_mask, extract_first_command_token, is_valid_process_tree_edge,
-        normalize_debugger_command_with, signed_kb_delta, validate_snapshot_root_identity,
-        wts_identity_matches, PreviousProcSample, ProcIdentity, ProcWorkerCompletion,
-        ProcessPageState, WtsProcessIdentity,
+        DirtyColumns, PreviousProcSample, ProcEntry, ProcIdentity, ProcessPageState,
+        WtsProcessIdentity, affinity_cpu_mask, cpu_percent_from_delta, extract_first_command_token,
+        is_valid_process_tree_edge, merge_wts_process_identity, normalize_debugger_command_with,
+        reorder_process_columns, signed_kb_delta, system_time_delta,
+        validate_snapshot_root_identity, write_process_column_layout, wts_identity_matches,
     };
+    use crate::options::{ColumnId, Options};
     use std::collections::HashMap;
     use std::sync::Arc;
     use windows_sys::Win32::System::Registry::{REG_EXPAND_SZ, REG_SZ};
+    use windows_sys::Win32::System::Threading::NORMAL_PRIORITY_CLASS;
+
+    fn empty_process_entry(image_name: &str) -> ProcEntry {
+        ProcEntry {
+            identity: ProcIdentity::new(1234, 10),
+            pid: 1234,
+            image_name: image_name.to_string(),
+            image_name_lower: image_name.to_lowercase(),
+            is_32_bit: None,
+            user_name: String::new(),
+            user_name_lower: String::new(),
+            session_id: None,
+            cpu: 0,
+            cpu_time_100ns: 0,
+            display_cpu_time_100ns: 0,
+            mem_usage_kb: 0,
+            mem_diff_kb: 0,
+            page_faults: 0,
+            page_faults_diff: 0,
+            commit_charge_kb: 0,
+            paged_pool_kb: 0,
+            nonpaged_pool_kb: 0,
+            priority_class: NORMAL_PRIORITY_CLASS,
+            handle_count: 0,
+            thread_count: 0,
+            display_text: std::array::from_fn(|_| String::new()),
+            pass_count: 0,
+            dirty_columns: DirtyColumns::default(),
+        }
+    }
+
+    #[test]
+    fn dragged_process_columns_map_display_order_to_stable_ids() {
+        let active = [
+            ColumnId::ImageName,
+            ColumnId::Username,
+            ColumnId::Cpu,
+            ColumnId::MemUsage,
+        ];
+        assert_eq!(
+            reorder_process_columns(&active, &[0, 2, 1, 3]),
+            Some(vec![
+                ColumnId::ImageName,
+                ColumnId::Cpu,
+                ColumnId::Username,
+                ColumnId::MemUsage,
+            ])
+        );
+        assert_eq!(reorder_process_columns(&active, &[1, 0, 2, 3]), None);
+        assert_eq!(reorder_process_columns(&active, &[0, 2, 2, 3]), None);
+    }
+
+    #[test]
+    fn persisted_process_layout_keeps_widths_attached_to_column_ids() {
+        let mut options = Options::default();
+        let widths = HashMap::from([
+            (ColumnId::ImageName as i32, 120),
+            (ColumnId::Cpu as i32, 44),
+            (ColumnId::Username as i32, 160),
+        ]);
+        write_process_column_layout(
+            &mut options,
+            &[ColumnId::ImageName, ColumnId::Cpu, ColumnId::Username],
+            &widths,
+        );
+        assert_eq!(
+            &options.active_process_columns[..4],
+            &[
+                ColumnId::ImageName as i32,
+                ColumnId::Cpu as i32,
+                ColumnId::Username as i32,
+                -1,
+            ]
+        );
+        assert_eq!(&options.column_widths[..3], &[120, 44, 160]);
+    }
 
     #[test]
     fn extracts_quoted_absolute_debugger_path() {
@@ -3107,6 +3534,20 @@ mod tests {
     }
 
     #[test]
+    fn missing_wts_user_name_remains_retryable() {
+        let mut entry = empty_process_entry("services.exe");
+        let identity = WtsProcessIdentity {
+            user_name: None,
+            session_id: 0,
+            image_name_lower: "services.exe".to_string(),
+        };
+
+        assert!(!merge_wts_process_identity(&mut entry, Some(&identity)));
+        assert!(entry.user_name.is_empty());
+        assert_eq!(entry.session_id, Some(0));
+    }
+
+    #[test]
     fn failed_process_worker_restores_the_previous_sample_snapshot() {
         let identity = ProcIdentity::new(1234, 55);
         let mut samples = HashMap::new();
@@ -3120,22 +3561,34 @@ mod tests {
         );
         let mut state = ProcessPageState {
             collection_in_flight: true,
-            previous_system_time: 77,
+            previous_system_time: Some(77),
             inflight_previous_samples: Some(Arc::new(samples)),
             ..ProcessPageState::default()
         };
 
         unsafe {
-            state.apply_worker_completion(ProcWorkerCompletion {
-                system_time: 999,
-                result: Err(5),
-            });
+            state.apply_worker_completion(Err(5));
         }
 
         assert!(!state.collection_in_flight);
         assert!(state.inflight_previous_samples.is_none());
         assert!(state.previous_samples.contains_key(&identity));
-        assert_eq!(state.previous_system_time, 77);
+        assert_eq!(state.previous_system_time, Some(77));
         assert_eq!(state.last_refresh_error, Some(5));
+    }
+
+    #[test]
+    fn system_time_delta_requires_a_monotonic_baseline() {
+        assert_eq!(system_time_delta(100, None), None);
+        assert_eq!(system_time_delta(90, Some(100)), None);
+        assert_eq!(system_time_delta(125, Some(100)), Some(25));
+    }
+
+    #[test]
+    fn process_cpu_percentage_uses_exact_integer_rounding() {
+        assert_eq!(cpu_percent_from_delta(0, 100), 0);
+        assert_eq!(cpu_percent_from_delta(1, 3), 33);
+        assert_eq!(cpu_percent_from_delta(2, 3), 67);
+        assert_eq!(cpu_percent_from_delta(100, 100), 100);
     }
 }

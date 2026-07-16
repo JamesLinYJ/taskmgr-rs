@@ -4,11 +4,11 @@
 //! snapshot becomes visible. This type only centralizes thread/channel lifetime,
 //! completion notification, and orderly shutdown.
 
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::{self, JoinHandle};
 
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_BROKEN_PIPE, ERROR_GEN_FAILURE, ERROR_NOT_ENOUGH_MEMORY, HWND,
+    ERROR_BROKEN_PIPE, ERROR_GEN_FAILURE, ERROR_NOT_ENOUGH_MEMORY, GetLastError, HWND,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
@@ -46,7 +46,11 @@ where
         let thread = thread::Builder::new()
             .name(thread_name.to_string())
             .spawn(move || {
-                while let Ok(command) = command_receiver.recv() {
+                loop {
+                    let command = match command_receiver.recv() {
+                        Ok(command) => command,
+                        Err(_) => break,
+                    };
                     match command {
                         WorkerCommand::Run {
                             request,
@@ -100,10 +104,10 @@ impl<Request, Completion> Drop for BackgroundWorker<Request, Completion> {
         if self.command_sender.send(WorkerCommand::Shutdown).is_err() {
             record_win32_error("background worker shutdown request", ERROR_BROKEN_PIPE);
         }
-        if let Some(thread) = self.thread.take() {
-            if thread.join().is_err() {
-                record_win32_error("background worker shutdown join", ERROR_GEN_FAILURE);
-            }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            record_win32_error("background worker shutdown join", ERROR_GEN_FAILURE);
         }
     }
 }
@@ -126,7 +130,7 @@ mod tests {
 
     #[test]
     fn worker_delivers_completion_even_when_notification_window_is_gone() {
-        let worker = BackgroundWorker::spawn("rtaskmgr-worker-test", 0, |value: u32| value * 2)
+        let worker = BackgroundWorker::spawn("taskmgr-rs-worker-test", 0, |value: u32| value * 2)
             .expect("worker should start");
 
         worker.submit(21, null_mut()).expect("request should queue");

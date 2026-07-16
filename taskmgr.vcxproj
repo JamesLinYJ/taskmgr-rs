@@ -77,15 +77,21 @@
 
   <ItemGroup>
     <None Include=".cargo\config.toml" />
+    <None Include="AGENTS.md" />
     <None Include="Cargo.toml" />
     <None Include="Cargo.lock" />
     <None Include="build.rs" />
+    <None Include="rust-toolchain.toml" />
     <None Include="sysmon.manifest" />
     <None Include="scripts\release-clean.ps1" />
     <None Include="src\app.rs" />
+    <None Include="src\app_controllers.rs" />
     <None Include="src\assets.rs" />
+    <None Include="src\background_worker.rs" />
     <None Include="src\chart_renderer.rs" />
+    <None Include="src\cpu_sampler.rs" />
     <None Include="src\dialog_templates.rs" />
+    <None Include="src\drawing.rs" />
     <None Include="src\language.rs" />
     <None Include="src\localization_terms.rs" />
     <None Include="src\localization_ui.rs" />
@@ -94,22 +100,20 @@
     <None Include="src\netpage.rs" />
     <None Include="src\options.rs" />
     <None Include="src\pages.rs" />
+    <None Include="src\perf_drawing.rs" />
+    <None Include="src\perf_layout.rs" />
     <None Include="src\perfpage.rs" />
+    <None Include="src\process_identity.rs" />
     <None Include="src\procpage.rs" />
     <None Include="src\resource.rs" />
     <None Include="src\runtime_menu.rs" />
+    <None Include="src\system_sampler.rs" />
     <None Include="src\taskpage.rs" />
+    <None Include="src\text_key_parser.rs" />
     <None Include="src\userpage.rs" />
     <None Include="src\winutil.rs" />
-    <None Include="src\localization\de.rs" />
-    <None Include="src\localization\en_us.rs" />
-    <None Include="src\localization\es.rs" />
-    <None Include="src\localization\fr.rs" />
-    <None Include="src\localization\pt.rs" />
-    <None Include="src\localization\ru.rs" />
     <None Include="src\localization\text_key.rs" />
-    <None Include="src\localization\zh_cn.rs" />
-    <None Include="src\localization\zh_tw.rs" />
+    <None Include="tests\text_key_parse.rs" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

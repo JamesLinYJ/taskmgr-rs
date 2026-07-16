@@ -1,54 +1,53 @@
 // 性能页实现。
-// 该模块负责采样系统级 CPU/内存指标，并绘制经典任务管理器里的折线图、
-// 数值面板和状态快照。
+// 该模块消费后台系统快照，并绘制经典任务管理器里的折线图和数值面板。
 use std::cell::Cell;
-use std::mem::{size_of, zeroed};
+use std::mem::zeroed;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_GEN_FAILURE, HINSTANCE, HWND, POINT, RECT,
+    ERROR_ARITHMETIC_OVERFLOW, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_INVALID_WINDOW_HANDLE,
+    GetLastError, HINSTANCE, HWND, POINT, RECT,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, DrawTextW, GetDC,
-    GetStockObject, InvalidateRect, Rectangle, RedrawWindow, ReleaseDC, SelectObject, SetBkMode,
-    SetTextColor, UpdateWindow, BLACK_BRUSH, DT_BOTTOM, DT_CENTER, DT_SINGLELINE, HBITMAP, HBRUSH,
-    HDC, HGDIOBJ, RDW_ERASE, RDW_INVALIDATE, RDW_NOCHILDREN, RDW_UPDATENOW, SRCCOPY, TRANSPARENT,
+    BLACK_BRUSH, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DT_BOTTOM, DT_CENTER,
+    DT_SINGLELINE, DeleteDC, DeleteObject, DrawTextW, GetDC, GetStockObject, HBITMAP, HBRUSH, HDC,
+    HGDIOBJ, InvalidateRect, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW, Rectangle,
+    RedrawWindow, ReleaseDC, SRCCOPY, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
-use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetClientRect, GetDialogBaseUnits,
-    GetDlgCtrlID, GetDlgItem, IsIconic, IsWindowVisible, SendMessageW, ShowWindow, HDWP,
-    SWP_NOACTIVATE, SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WM_SETREDRAW,
+    BS_OWNERDRAW, BeginDeferWindowPos, CreateWindowExW, DeferWindowPos, EndDeferWindowPos,
+    GetClientRect, GetDialogBaseUnits, GetDlgItem, HDWP, HMENU, IsWindowVisible, SW_HIDE, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, ShowWindow, WM_SETREDRAW,
+    WS_CHILD, WS_DISABLED,
 };
 
 use crate::assets::{
-    load_bitmap_resource, STRIP_LIT_BITMAP_RESOURCE, STRIP_LIT_RED_BITMAP_RESOURCE,
-    STRIP_UNLIT_BITMAP_RESOURCE,
+    STRIP_LIT_BITMAP_RESOURCE, STRIP_LIT_RED_BITMAP_RESOURCE, STRIP_UNLIT_BITMAP_RESOURCE,
+    load_bitmap_resource,
 };
 use crate::chart_renderer::{ChartColor, ChartRenderer};
-use crate::cpu_sampler::{query_processor_performance, ProcessorPerformance};
-use crate::drawing::{fill_black, rgb, HistoryBuffer};
+use crate::drawing::{HistoryBuffer, fill_black, rgb};
 use crate::options::{CpuHistoryMode, Options};
 use crate::perf_drawing::{
-    current_font_height, defer_resize, draw_grid_width, draw_grid_width_gpu, draw_history_series,
-    draw_history_series_gpu, draw_meter, format_mem_meter_text, set_numeric_text,
-    HistoryPlotLayout, HistorySeries, GRAPH_GRID, HIST_SIZE,
+    GRAPH_GRID, HIST_SIZE, HistoryPlotLayout, HistorySeries, current_font_height, defer_resize,
+    draw_grid_width, draw_grid_width_gpu, draw_history_series, draw_history_series_gpu, draw_meter,
+    format_mem_meter_text, set_numeric_text,
 };
 use crate::perf_layout::{
-    compute_perf_layout, next_graph_surface_extent, PerfDialogSpacing, PerfLayoutAnchors,
+    PerfDialogSpacing, PerfLayoutAnchors, compute_perf_layout, next_graph_surface_extent,
 };
 use crate::resource::{
     IDC_AVAIL_PHYSICAL, IDC_COMMIT_LIMIT, IDC_COMMIT_PEAK, IDC_COMMIT_TOTAL, IDC_CPUGRAPH,
     IDC_CPUMETER, IDC_CPUUSAGEFRAME, IDC_FILE_CACHE, IDC_KERNEL_NONPAGED, IDC_KERNEL_PAGED,
-    IDC_KERNEL_TOTAL, IDC_LAST_CPUGRAPH, IDC_MEMBARFRAME, IDC_MEMFRAME, IDC_MEMGRAPH, IDC_MEMMETER,
-    IDC_STATIC1, IDC_STATIC10, IDC_STATIC11, IDC_STATIC12, IDC_STATIC13, IDC_STATIC14,
-    IDC_STATIC15, IDC_STATIC16, IDC_STATIC17, IDC_STATIC2, IDC_STATIC3, IDC_STATIC4, IDC_STATIC5,
-    IDC_STATIC6, IDC_STATIC8, IDC_STATIC9, IDC_TOTAL_HANDLES, IDC_TOTAL_PHYSICAL,
-    IDC_TOTAL_PROCESSES, IDC_TOTAL_THREADS, STATIC_CPU_GRAPH_COUNT,
+    IDC_KERNEL_TOTAL, IDC_MEMBARFRAME, IDC_MEMFRAME, IDC_MEMGRAPH, IDC_MEMMETER, IDC_STATIC1,
+    IDC_STATIC2, IDC_STATIC3, IDC_STATIC4, IDC_STATIC5, IDC_STATIC6, IDC_STATIC8, IDC_STATIC9,
+    IDC_STATIC10, IDC_STATIC11, IDC_STATIC12, IDC_STATIC13, IDC_STATIC14, IDC_STATIC15,
+    IDC_STATIC16, IDC_STATIC17, IDC_TOTAL_HANDLES, IDC_TOTAL_PHYSICAL, IDC_TOTAL_PROCESSES,
+    IDC_TOTAL_THREADS, TEMPLATE_CPU_GRAPH_COUNT,
 };
+use crate::system_sampler::SystemSample;
 use crate::winutil::{
-    hiword, loword, record_ntstatus_error, record_win32_error, to_wide_null,
-    window_rect_relative_to_page,
+    hiword, loword, record_win32_error, to_wide_null, window_rect_relative_to_page,
 };
 
 const STRIP_HEIGHT: i32 = 75;
@@ -61,6 +60,7 @@ const DLG_SCALE_Y: i32 = 8;
 const CPU_USAGE_FRAME_ID: i32 = IDC_CPUUSAGEFRAME;
 const GRAPH_SURFACE_WIDTH_QUANTUM: i32 = 128;
 const GRAPH_SURFACE_HEIGHT_QUANTUM: i32 = 64;
+const DYNAMIC_CPU_GRAPH_ID_BASE: i32 = 3000;
 
 const PERF_TEXT_CONTROLS: [i32; 28] = [
     // 这些文本控件在“无标题模式”下会整体隐藏。
@@ -95,32 +95,12 @@ const PERF_TEXT_CONTROLS: [i32; 28] = [
 ];
 
 const PERF_LAYOUT_CONTROLS: [i32; 28] = PERF_TEXT_CONTROLS;
-const PERF_FRAME_CONTROLS: [i32; 8] = [
-    crate::resource::IDC_CPUFRAME,
-    CPU_USAGE_FRAME_ID,
-    IDC_MEMBARFRAME,
-    IDC_MEMFRAME,
-    IDC_STATIC1,
-    IDC_STATIC5,
-    IDC_STATIC10,
-    IDC_STATIC13,
-];
-
-#[derive(Clone, Copy, Default)]
-pub struct PerformanceSnapshot {
-    // 主框架只需要这一小部分汇总信息来更新状态栏和托盘。
-    pub cpu_usage: u8,
-    pub mem_usage_kb: u64,
-    pub mem_limit_kb: u64,
-    pub process_count: u32,
-    pub processor_count: usize,
-}
-
 #[derive(Default)]
 pub struct PerformancePageState {
     // 页面级缓存包含采样结果、图表历史和绘制时会复用的 GDI 资源句柄。
     hinstance: HINSTANCE,
     processor_count: usize,
+    cpu_graph_hwnds: Vec<HWND>,
     cpu_usage: u8,
     kernel_usage: u8,
     physical_mem_usage_kb: u64,
@@ -141,14 +121,9 @@ pub struct PerformancePageState {
     show_kernel_times: bool,
     no_title: bool,
     scroll_offset: i32,
-    previous_idle_times: Vec<i64>,
-    previous_total_times: Vec<i64>,
-    previous_kernel_times: Vec<i64>,
-    cpu_samples_initialized: bool,
     cpu_history: Vec<HistoryBuffer>,
     kernel_history: Vec<HistoryBuffer>,
     mem_history: HistoryBuffer,
-    processor_info: Vec<ProcessorPerformance>,
     averaged_cpu_history: HistoryBuffer,
     averaged_kernel_history: HistoryBuffer,
     gdi_history_points: Vec<POINT>,
@@ -161,8 +136,6 @@ pub struct PerformancePageState {
     graph_bitmap_old: HGDIOBJ,
     graph_bitmap_width: i32,
     graph_bitmap_height: i32,
-    last_cpu_refresh_error: Option<i32>,
-    last_system_refresh_error: Option<u32>,
     last_meter_draw_error: Cell<Option<u32>>,
 }
 
@@ -185,6 +158,57 @@ impl PerformancePageState {
             );
         }
         self.chart_renderer = ChartRenderer::new();
+        Ok(())
+    }
+
+    pub fn complete_initialize(&mut self, hwnd_page: HWND) -> Result<(), u32> {
+        // Build the complete control set before the page can be activated. The dialog template
+        // supplies the first 32 panes; larger systems receive additional native owner-draw
+        // buttons with the same lifetime as the page window.
+        let control_count = self.processor_count.max(1).max(TEMPLATE_CPU_GRAPH_COUNT);
+        let mut controls = Vec::with_capacity(control_count);
+        for index in 0..TEMPLATE_CPU_GRAPH_COUNT {
+            let control = unsafe { GetDlgItem(hwnd_page, IDC_CPUGRAPH + index as i32) };
+            if control.is_null() {
+                return Err(ERROR_INVALID_WINDOW_HANDLE);
+            }
+            controls.push(control);
+        }
+
+        if control_count > TEMPLATE_CPU_GRAPH_COUNT {
+            let button_class = to_wide_null("Button");
+            for index in TEMPLATE_CPU_GRAPH_COUNT..control_count {
+                let offset = i32::try_from(index - TEMPLATE_CPU_GRAPH_COUNT)
+                    .map_err(|_| ERROR_ARITHMETIC_OVERFLOW)?;
+                let control_id = DYNAMIC_CPU_GRAPH_ID_BASE
+                    .checked_add(offset)
+                    .ok_or(ERROR_ARITHMETIC_OVERFLOW)?;
+                // 安全性: the class name is NUL-terminated, the parent page and module instance
+                // are live, and Windows owns each successful child window until the page dies.
+                let control = unsafe {
+                    CreateWindowExW(
+                        0,
+                        button_class.as_ptr(),
+                        null(),
+                        WS_CHILD | WS_DISABLED | BS_OWNERDRAW as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                        hwnd_page,
+                        control_id as usize as HMENU,
+                        self.hinstance,
+                        null(),
+                    )
+                };
+                if control.is_null() {
+                    return Err(last_error_or_gen_failure());
+                }
+                controls.push(control);
+            }
+        }
+
+        self.cpu_graph_hwnds = controls;
         Ok(())
     }
 
@@ -212,34 +236,8 @@ impl PerformancePageState {
                 return false;
             }
 
-            if layout_changed {
-                let pane_count = self.visible_cpu_graph_count();
-
-                for index in 0..self.cpu_graph_slot_count() {
-                    let control = self.cpu_graph_hwnd(hwnd_page, index);
-                    if !control.is_null() {
-                        ShowWindow(control, if index < pane_count { SW_SHOW } else { SW_HIDE });
-                    }
-                }
-
-                let detail_state = if self.no_title { SW_HIDE } else { SW_SHOW };
-                for control_id in PERF_TEXT_CONTROLS {
-                    let control = GetDlgItem(hwnd_page, control_id);
-                    if !control.is_null() {
-                        ShowWindow(control, detail_state);
-                    }
-                }
-
-                for control_id in [IDC_MEMGRAPH, IDC_MEMFRAME, IDC_MEMBARFRAME, IDC_MEMMETER] {
-                    let control = GetDlgItem(hwnd_page, control_id);
-                    if !control.is_null() {
-                        ShowWindow(control, detail_state);
-                    }
-                }
-
-                if !self.no_title {
-                    self.update_detail_texts(hwnd_page);
-                }
+            if layout_changed && !self.no_title {
+                self.update_detail_texts(hwnd_page);
             }
 
             InvalidateRect(hwnd_page, null(), 0);
@@ -247,27 +245,71 @@ impl PerformancePageState {
         }
     }
 
-    pub fn timer_event(&mut self, hwnd_page: HWND, main_hwnd: HWND) {
-        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
-        unsafe {
-            // 定时器事件先刷新底层采样，再推动图表滚动与数值文本更新。
-            self.refresh_measurements(hwnd_page);
-            self.scroll_offset = (self.scroll_offset + 2) % GRAPH_GRID;
+    pub fn apply_system_sample(
+        &mut self,
+        hwnd_page: HWND,
+        sample: &SystemSample,
+        redraw: bool,
+    ) -> Result<(), u32> {
+        if sample.processor_count == 0
+            || sample.processor_cpu_usage.len() != sample.processor_count
+            || sample.processor_kernel_usage.len() != sample.processor_count
+        {
+            return Err(ERROR_INVALID_DATA);
+        }
+        self.ensure_history_capacity(sample.processor_count);
+        self.cpu_usage = sample.cpu_usage;
+        self.kernel_usage = sample.kernel_usage;
+        self.physical_mem_usage_kb = sample.physical_mem_usage_kb;
+        self.physical_mem_limit_kb = sample.physical_mem_limit_kb;
+        self.commit_total_kb = sample.commit_total_kb;
+        self.commit_limit_kb = sample.commit_limit_kb;
+        self.commit_peak_kb = sample.commit_peak_kb;
+        self.total_physical_kb = sample.total_physical_kb;
+        self.avail_physical_kb = sample.avail_physical_kb;
+        self.file_cache_kb = sample.file_cache_kb;
+        self.kernel_total_kb = sample.kernel_total_kb;
+        self.kernel_paged_kb = sample.kernel_paged_kb;
+        self.kernel_nonpaged_kb = sample.kernel_nonpaged_kb;
+        self.handle_count = sample.handle_count;
+        self.thread_count = sample.thread_count;
+        self.process_count = sample.process_count;
 
-            if IsIconic(main_hwnd) == 0 {
-                self.invalidate_graph_controls(hwnd_page);
+        if sample.cpu_delta_valid {
+            for (history, usage) in self
+                .cpu_history
+                .iter_mut()
+                .zip(sample.processor_cpu_usage.iter().copied())
+            {
+                history.push(usage);
             }
+            for (history, usage) in self
+                .kernel_history
+                .iter_mut()
+                .zip(sample.processor_kernel_usage.iter().copied())
+            {
+                history.push(usage);
+            }
+            self.averaged_cpu_history.push(sample.cpu_usage);
+            self.averaged_kernel_history.push(sample.kernel_usage);
         }
-    }
+        let mem_percent = if sample.physical_mem_limit_kb == 0 {
+            0
+        } else {
+            ((u128::from(sample.physical_mem_usage_kb) * 100)
+                / u128::from(sample.physical_mem_limit_kb))
+            .min(100) as u8
+        };
+        self.mem_history.push(mem_percent);
+        self.scroll_offset = (self.scroll_offset + 2) % GRAPH_GRID;
 
-    pub fn snapshot(&self) -> PerformanceSnapshot {
-        PerformanceSnapshot {
-            cpu_usage: self.cpu_usage,
-            mem_usage_kb: self.physical_mem_usage_kb,
-            mem_limit_kb: self.physical_mem_limit_kb,
-            process_count: self.process_count,
-            processor_count: self.processor_count,
+        if !self.no_title {
+            self.update_detail_texts(hwnd_page);
         }
+        if redraw {
+            self.invalidate_graph_controls(hwnd_page);
+        }
+        Ok(())
     }
 
     pub fn no_title(&self) -> bool {
@@ -281,17 +323,17 @@ impl PerformancePageState {
     }
 
     pub fn cpu_graph_pane_index(&self, control_id: i32) -> Option<usize> {
-        // 连续控件 ID 可以直接映射成 CPU pane 下标。
-        if (IDC_CPUGRAPH..=IDC_LAST_CPUGRAPH).contains(&control_id) {
-            let pane_index = (control_id - IDC_CPUGRAPH) as usize;
-            if pane_index < self.cpu_graph_slot_count() {
-                Some(pane_index)
-            } else {
-                None
-            }
+        let pane_index = if (IDC_CPUGRAPH..IDC_CPUGRAPH + TEMPLATE_CPU_GRAPH_COUNT as i32)
+            .contains(&control_id)
+        {
+            usize::try_from(control_id - IDC_CPUGRAPH).ok()?
+        } else if control_id >= DYNAMIC_CPU_GRAPH_ID_BASE {
+            TEMPLATE_CPU_GRAPH_COUNT
+                .checked_add(usize::try_from(control_id - DYNAMIC_CPU_GRAPH_ID_BASE).ok()?)?
         } else {
-            None
-        }
+            return None;
+        };
+        (pane_index < self.cpu_graph_slot_count()).then_some(pane_index)
     }
 
     fn invalidate_graph_controls(&self, hwnd_page: HWND) {
@@ -623,12 +665,10 @@ impl PerformancePageState {
 
     pub fn draw_mem_meter(&self, hdc: HDC, rect: RECT) {
         // 内存仪表显示的是已用内存字节量文本，而不是百分比文本。
-        let mem_percent = if self.physical_mem_limit_kb == 0 {
-            0
-        } else {
-            ((self.physical_mem_usage_kb.saturating_mul(100)) / self.physical_mem_limit_kb).min(100)
-                as u8
-        };
+        let mem_percent = (u128::from(self.physical_mem_usage_kb) * 100)
+            .checked_div(u128::from(self.physical_mem_limit_kb))
+            .unwrap_or(0)
+            .min(100) as u8;
         let mem_usage_text = format_mem_meter_text(self.physical_mem_usage_kb);
         if self.draw_strip_meter(hdc, rect, &mem_usage_text, mem_percent, 0) {
             return;
@@ -706,7 +746,7 @@ impl PerformancePageState {
                 return;
             }
             let redraw_windows = self.redraw_windows(hwnd_page);
-            set_redraw_for_windows(&redraw_windows, false);
+            let paused_redraw_windows = pause_redraw_for_visible_windows(&redraw_windows);
 
             let resize_flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW;
             let move_flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW;
@@ -819,7 +859,18 @@ impl PerformancePageState {
                 );
             }
 
-            EndDeferWindowPos(hdwp);
+            if EndDeferWindowPos(hdwp) == 0 {
+                let error = last_error_or_gen_failure();
+                resume_redraw_for_windows(&paused_redraw_windows);
+                record_win32_error("performance layout commit", error);
+                return;
+            }
+            resume_redraw_for_windows(&paused_redraw_windows);
+            // Newly visible CPU panes must not be exposed at their template positions. Visibility
+            // changes happen only after every move and resize has committed and redraw state has
+            // been restored. WM_SETREDRAW(TRUE) can restore WS_VISIBLE, so applying show/hide
+            // before it would corrupt the final visibility set.
+            self.sync_control_visibility(hwnd_page);
             if self.chart_renderer.is_available() {
                 self.destroy_graph_surface();
             } else {
@@ -829,8 +880,6 @@ impl PerformancePageState {
                     layout.graph_surface_height,
                 );
             }
-            set_redraw_for_windows(&redraw_windows, true);
-            self.redraw_after_layout(hwnd_page);
         }
     }
 
@@ -841,6 +890,7 @@ impl PerformancePageState {
             self.destroy_graph_surface();
             self.destroy_meter_bitmaps();
         }
+        self.cpu_graph_hwnds.clear();
     }
 
     fn ensure_history_capacity(&mut self, processor_count: usize) {
@@ -854,10 +904,6 @@ impl PerformancePageState {
         }
 
         self.processor_count = processor_count;
-        self.previous_idle_times.resize(processor_count, 0);
-        self.previous_total_times.resize(processor_count, 0);
-        self.previous_kernel_times.resize(processor_count, 0);
-        self.cpu_samples_initialized = false;
         self.cpu_history = (0..processor_count)
             .map(|_| HistoryBuffer::zeroed(HIST_SIZE))
             .collect();
@@ -867,147 +913,6 @@ impl PerformancePageState {
         self.averaged_cpu_history = HistoryBuffer::zeroed(HIST_SIZE);
         self.averaged_kernel_history = HistoryBuffer::zeroed(HIST_SIZE);
         self.mem_history = HistoryBuffer::zeroed(HIST_SIZE);
-    }
-
-    fn refresh_measurements(&mut self, hwnd_page: HWND) {
-        // 这里集中采集所有性能相关数据，确保一次刷新内各图表看到的是同一时刻的快照。
-        if self.processor_count == 0 {
-            self.ensure_history_capacity(1);
-        }
-
-        self.refresh_cpu_histories();
-        self.refresh_system_info(hwnd_page);
-    }
-
-    fn refresh_cpu_histories(&mut self) {
-        // 内核返回的是累积 CPU 时间，所以这里必须与上一轮做差，
-        // 再换算成本轮使用率和内核时间占比。
-        if let Err(status) =
-            query_processor_performance(self.processor_count, &mut self.processor_info)
-        {
-            if self.last_cpu_refresh_error != Some(status) {
-                record_ntstatus_error("performance CPU sampling", status);
-            }
-            self.last_cpu_refresh_error = Some(status);
-            return;
-        }
-        self.last_cpu_refresh_error = None;
-        if self.processor_info.len() != self.processor_count && !self.processor_info.is_empty() {
-            self.ensure_history_capacity(self.processor_info.len());
-        }
-
-        let mut sum_idle = 0i64;
-        let mut sum_total = 0i64;
-        let mut sum_kernel = 0i64;
-        let first_sample = !self.cpu_samples_initialized;
-
-        for (index, entry) in self.processor_info.iter().enumerate() {
-            let idle_time = entry.idle_time;
-            let kernel_time = entry.kernel_time.saturating_sub(entry.idle_time);
-            let total_time = entry.kernel_time.saturating_add(entry.user_time);
-
-            if first_sample {
-                self.previous_idle_times[index] = idle_time;
-                self.previous_total_times[index] = total_time;
-                self.previous_kernel_times[index] = kernel_time;
-                continue;
-            }
-
-            let delta_idle = idle_time.saturating_sub(self.previous_idle_times[index]);
-            let delta_kernel = kernel_time.saturating_sub(self.previous_kernel_times[index]);
-            let delta_total = total_time.saturating_sub(self.previous_total_times[index]);
-
-            sum_idle = sum_idle.saturating_add(delta_idle);
-            sum_kernel = sum_kernel.saturating_add(delta_kernel);
-            sum_total = sum_total.saturating_add(delta_total);
-
-            let cpu_percent = if delta_total > 0 {
-                (100 - ((delta_idle * 100) / delta_total)).clamp(0, 100) as u8
-            } else {
-                0
-            };
-            let kernel_percent = if delta_total > 0 {
-                ((delta_kernel * 100) / delta_total).clamp(0, 100) as u8
-            } else {
-                0
-            };
-
-            self.cpu_history[index].push(cpu_percent);
-            self.kernel_history[index].push(kernel_percent);
-
-            self.previous_idle_times[index] = idle_time;
-            self.previous_total_times[index] = total_time;
-            self.previous_kernel_times[index] = kernel_time;
-        }
-
-        self.cpu_usage = if sum_total > 0 {
-            (100 - ((sum_idle * 100) / sum_total)).clamp(0, 100) as u8
-        } else {
-            0
-        };
-        self.kernel_usage = if sum_total > 0 {
-            ((sum_kernel * 100) / sum_total).clamp(0, 100) as u8
-        } else {
-            0
-        };
-        if !first_sample {
-            self.averaged_cpu_history.push(self.cpu_usage);
-            self.averaged_kernel_history.push(self.kernel_usage);
-        }
-        self.cpu_samples_initialized = true;
-    }
-
-    fn refresh_system_info(&mut self, hwnd_page: HWND) {
-        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
-        unsafe {
-            // 系统级内存、Commit、句柄、线程、进程总数都来源于同一份快照，
-            // 统一在这里采样可以保证页面上的数字属于同一个刷新时刻。
-            let mut perf = zeroed::<PERFORMANCE_INFORMATION>();
-            perf.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
-            if K32GetPerformanceInfo(&mut perf, perf.cb) == 0 {
-                let error = GetLastError();
-                let error = if error == 0 { ERROR_GEN_FAILURE } else { error };
-                if self.last_system_refresh_error != Some(error) {
-                    record_win32_error("performance system sampling", error);
-                }
-                self.last_system_refresh_error = Some(error);
-                return;
-            }
-            self.last_system_refresh_error = None;
-
-            let page_kb = ((perf.PageSize as u64) / 1024).max(1);
-            let pages_to_kb =
-                |page_count: usize| -> u64 { (page_count as u64).saturating_mul(page_kb) };
-
-            self.total_physical_kb = pages_to_kb(perf.PhysicalTotal);
-            self.avail_physical_kb = pages_to_kb(perf.PhysicalAvailable);
-            self.file_cache_kb = pages_to_kb(perf.SystemCache);
-            self.physical_mem_limit_kb = self.total_physical_kb;
-            self.physical_mem_usage_kb = self
-                .total_physical_kb
-                .saturating_sub(self.avail_physical_kb);
-            self.commit_total_kb = pages_to_kb(perf.CommitTotal);
-            self.commit_limit_kb = pages_to_kb(perf.CommitLimit);
-            self.commit_peak_kb = pages_to_kb(perf.CommitPeak);
-            self.kernel_total_kb = pages_to_kb(perf.KernelTotal);
-            self.kernel_paged_kb = pages_to_kb(perf.KernelPaged);
-            self.kernel_nonpaged_kb = pages_to_kb(perf.KernelNonpaged);
-            self.handle_count = perf.HandleCount;
-            self.process_count = perf.ProcessCount;
-            self.thread_count = perf.ThreadCount;
-
-            let mem_percent = if self.physical_mem_limit_kb == 0 {
-                0
-            } else {
-                ((self.physical_mem_usage_kb.saturating_mul(100)) / self.physical_mem_limit_kb)
-                    .min(100) as u8
-            };
-            self.mem_history.push(mem_percent);
-
-            if !self.no_title {
-                self.update_detail_texts(hwnd_page);
-            }
-        }
     }
 
     fn update_detail_texts(&self, hwnd_page: HWND) {
@@ -1068,14 +973,16 @@ impl PerformancePageState {
     }
 
     unsafe fn destroy_meter_bitmaps(&mut self) {
-        for bitmap in [
-            &mut self.strip_lit_bitmap,
-            &mut self.strip_lit_red_bitmap,
-            &mut self.strip_unlit_bitmap,
-        ] {
-            if !bitmap.is_null() {
-                DeleteObject(*bitmap as _);
-                *bitmap = null_mut();
+        unsafe {
+            for bitmap in [
+                &mut self.strip_lit_bitmap,
+                &mut self.strip_lit_red_bitmap,
+                &mut self.strip_unlit_bitmap,
+            ] {
+                if !bitmap.is_null() {
+                    DeleteObject(*bitmap as _);
+                    *bitmap = null_mut();
+                }
             }
         }
     }
@@ -1341,32 +1248,51 @@ impl PerformancePageState {
     }
 
     fn cpu_graph_slot_count(&self) -> usize {
-        // 页面模板里预留的 CPU 图槽位数是固定上限。
-        STATIC_CPU_GRAPH_COUNT
+        self.cpu_graph_hwnds.len()
     }
 
-    fn cpu_graph_control_id(&self, pane_index: usize) -> i32 {
-        // CPU pane 控件 ID 在资源编号上是连续分配的。
-        IDC_CPUGRAPH + pane_index as i32
-    }
-
-    fn cpu_graph_hwnd(&self, hwnd_page: HWND, pane_index: usize) -> HWND {
-        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
-        unsafe {
-            if pane_index < self.cpu_graph_slot_count() {
-                GetDlgItem(hwnd_page, self.cpu_graph_control_id(pane_index))
-            } else {
-                null_mut()
-            }
-        }
+    fn cpu_graph_hwnd(&self, _hwnd_page: HWND, pane_index: usize) -> HWND {
+        self.cpu_graph_hwnds
+            .get(pane_index)
+            .copied()
+            .unwrap_or(null_mut())
     }
 
     fn visible_cpu_graph_count(&self) -> usize {
-        // 汇总模式只显示一张图，多窗格模式按 CPU 数量受上限约束。
+        // 汇总模式只显示一张图，多窗格模式按实际创建的处理器图控件显示。
         if self.cpu_history_mode == CpuHistoryMode::Panes as i32 {
             self.processor_count.max(1).min(self.cpu_graph_slot_count())
         } else {
             1
+        }
+    }
+
+    fn sync_control_visibility(&self, hwnd_page: HWND) {
+        // 安全性: all controls belong to the performance page and are positioned before this
+        // method is called. Redraw remains disabled until the complete visibility set is applied.
+        unsafe {
+            let pane_count = self.visible_cpu_graph_count();
+            for index in 0..self.cpu_graph_slot_count() {
+                let control = self.cpu_graph_hwnd(hwnd_page, index);
+                if !control.is_null() {
+                    ShowWindow(control, if index < pane_count { SW_SHOW } else { SW_HIDE });
+                }
+            }
+
+            let detail_state = if self.no_title { SW_HIDE } else { SW_SHOW };
+            for control_id in PERF_TEXT_CONTROLS {
+                let control = GetDlgItem(hwnd_page, control_id);
+                if !control.is_null() {
+                    ShowWindow(control, detail_state);
+                }
+            }
+
+            for control_id in [IDC_MEMGRAPH, IDC_MEMFRAME, IDC_MEMBARFRAME, IDC_MEMMETER] {
+                let control = GetDlgItem(hwnd_page, control_id);
+                if !control.is_null() {
+                    ShowWindow(control, detail_state);
+                }
+            }
         }
     }
 
@@ -1405,20 +1331,11 @@ impl PerformancePageState {
 
         windows
     }
-
-    pub fn redraw_after_layout(&self, hwnd_page: HWND) {
-        let redraw_windows = self.redraw_windows(hwnd_page);
-        redraw_performance_page(hwnd_page, &redraw_windows);
-    }
 }
 
 fn last_error_or_gen_failure() -> u32 {
     let error = unsafe { GetLastError() };
-    if error == 0 {
-        ERROR_GEN_FAILURE
-    } else {
-        error
-    }
+    if error == 0 { ERROR_GEN_FAILURE } else { error }
 }
 
 fn push_unique_window(windows: &mut Vec<HWND>, hwnd: HWND) {
@@ -1428,73 +1345,44 @@ fn push_unique_window(windows: &mut Vec<HWND>, hwnd: HWND) {
     windows.push(hwnd);
 }
 
-fn set_redraw_for_windows(windows: &[HWND], enabled: bool) {
-    // 安全性: callers pass HWNDs collected from the active performance page; WM_SETREDRAW only
-    // toggles paint dispatch for those windows and does not transfer ownership.
+fn pause_redraw_for_visible_windows(windows: &[HWND]) -> Vec<HWND> {
+    let mut paused = Vec::with_capacity(windows.len());
+    // Only visible windows may be paused. DefWindowProc can remove/add WS_VISIBLE while handling
+    // WM_SETREDRAW, so sending the enable message to an originally hidden pane would show it.
     unsafe {
         for &hwnd in windows {
-            SendMessageW(hwnd, WM_SETREDRAW, usize::from(enabled), 0);
+            if IsWindowVisible(hwnd) != 0 {
+                SendMessageW(hwnd, WM_SETREDRAW, 0, 0);
+                paused.push(hwnd);
+            }
+        }
+    }
+    paused
+}
+
+fn resume_redraw_for_windows(windows: &[HWND]) {
+    // 安全性: this list contains exactly the live page windows paused by the matching helper.
+    unsafe {
+        for &hwnd in windows {
+            SendMessageW(hwnd, WM_SETREDRAW, 1, 0);
         }
     }
 }
 
-fn redraw_performance_page(hwnd_page: HWND, redraw_windows: &[HWND]) {
+pub fn redraw_performance_page(hwnd_page: HWND) {
     if hwnd_page.is_null() {
         return;
     }
 
-    // 安全性: the HWNDs belong to the active performance page. The parent clears stale child
-    // positions first, then only visible children repaint from their final layout.
+    // Redraw the committed child tree as one operation. Owner-draw buttons that become visible
+    // while their parent is hidden do not reliably receive a first paint from child-level
+    // UpdateWindow calls; RDW_ALLCHILDREN makes that first frame part of the page redraw.
     unsafe {
         RedrawWindow(
             hwnd_page,
             null(),
             null_mut(),
-            RDW_INVALIDATE | RDW_ERASE | RDW_NOCHILDREN | RDW_UPDATENOW,
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
         );
-
-        for &hwnd in redraw_windows {
-            if hwnd == hwnd_page || IsWindowVisible(hwnd) == 0 {
-                continue;
-            }
-
-            InvalidateRect(
-                hwnd,
-                null(),
-                if should_erase_redraw_window(hwnd) {
-                    1
-                } else {
-                    0
-                },
-            );
-            UpdateWindow(hwnd);
-        }
-    }
-}
-
-fn should_erase_redraw_window(hwnd: HWND) -> bool {
-    should_erase_redraw_control(unsafe { GetDlgCtrlID(hwnd) })
-}
-
-fn should_erase_redraw_control(control_id: i32) -> bool {
-    // Frame controls paint a gray interior during WM_ERASEBKGND. Erasing them after a resize
-    // clears old chart pixels that can otherwise remain inside group-box interiors.
-    PERF_FRAME_CONTROLS.contains(&control_id)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn performance_frames_are_erased_after_layout_redraw() {
-        for control_id in PERF_FRAME_CONTROLS {
-            assert!(should_erase_redraw_control(control_id));
-        }
-    }
-
-    #[test]
-    fn non_frame_text_controls_do_not_request_erasing_redraw() {
-        assert!(!should_erase_redraw_control(IDC_STATIC2));
     }
 }

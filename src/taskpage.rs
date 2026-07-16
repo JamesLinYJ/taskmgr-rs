@@ -8,9 +8,9 @@ use std::collections::{HashMap, HashSet};
 // 图标流动：
 //   1. Worker 线程在工作站/桌面枚举期间通过 fetch_window_icon() 抓取窗口图标（后台线程）。
 //   2. 图标句柄通过 mpsc channel 传递回 UI 线程。
-//   3. UI 线程在 refresh_tasks() 中将图标加入 ImageList，并在 TaskEntry 中记录图标索引。
+//   3. UI 线程把大小图标写入同一个稳定槽位，并在 TaskEntry 中只记录一个槽位 ID。
 //   4. 默认图标 (default.ico) 用于没有自定义图标的窗口，作为 ImageList 的索引 0。
-//   5. 任务移除时，remove_stale_tasks() 回收对应的 ImageList 槽位并调整剩余条目的图标索引。
+//   5. 任务移除时，remove_stale_tasks() 把槽位放回空闲表；其它任务索引不会移动。
 //
 // 线程模型：
 //   一个 BackgroundWorker 枚举窗口，另一个 BackgroundWorker 并行抓取图标。
@@ -26,8 +26,7 @@ use std::sync::mpsc::TryRecvError;
 use std::thread;
 
 use windows_sys::Win32::Foundation::{
-    GetLastError, BOOL, ERROR_GEN_FAILURE, ERROR_RESOURCE_DATA_NOT_FOUND, HANDLE, HINSTANCE, HWND,
-    LPARAM, RECT,
+    ERROR_INVALID_DATA, ERROR_RESOURCE_DATA_NOT_FOUND, HANDLE, HINSTANCE, HWND, LPARAM, RECT,
 };
 use windows_sys::Win32::System::StationsAndDesktops::{
     EnumDesktopWindows, GetProcessWindowStation, GetThreadDesktop, GetUserObjectInformationW,
@@ -35,48 +34,51 @@ use windows_sys::Win32::System::StationsAndDesktops::{
 };
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Controls::{
-    ImageList_Create, ImageList_Destroy, ImageList_GetImageCount, ImageList_Remove,
-    ImageList_ReplaceIcon, HIMAGELIST, LVCFMT_LEFT, LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH,
-    LVCOLUMNW, LVIF_IMAGE, LVIF_PARAM, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW,
+    HIMAGELIST, ImageList_Create, ImageList_Destroy, ImageList_GetImageCount, ImageList_Remove,
+    ImageList_ReplaceIcon, LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCOLUMNW,
+    LVIF_IMAGE, LVIF_PARAM, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW,
     LVM_DELETEALLITEMS, LVM_DELETECOLUMN, LVM_DELETEITEM, LVM_GETITEMCOUNT, LVM_GETNEXTITEM,
     LVM_GETSELECTEDCOUNT, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_REDRAWITEMS, LVM_SETIMAGELIST,
-    LVM_SETITEMW, LVNI_SELECTED, LVN_COLUMNCLICK, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVSIL_NORMAL,
-    LVSIL_SMALL, LVS_AUTOARRANGE, LVS_ICON, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SMALLICON,
-    LVS_TYPEMASK, NMHDR, NMLISTVIEW, NMLVDISPINFOW, NM_DBLCLK,
+    LVM_SETITEMW, LVN_COLUMNCLICK, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVNI_SELECTED,
+    LVS_AUTOARRANGE, LVS_ICON, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SMALLICON, LVS_TYPEMASK,
+    LVSIL_NORMAL, LVSIL_SMALL, NM_DBLCLK, NMHDR, NMLISTVIEW, NMLVDISPINFOW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetKeyState, SetFocus, VK_CONTROL,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, CascadeWindows, CheckMenuRadioItem, CopyIcon, DeferWindowPos, DrawMenuBar,
-    EnableMenuItem, EndDeferWindowPos, GetClassLongPtrW, GetClientRect, GetDesktopWindow,
-    GetDlgItem, GetWindow, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow, IsWindowVisible, MessageBoxW,
-    SendMessageTimeoutW, SendMessageW, SetForegroundWindow, SetMenuDefaultItem, SetWindowLongW,
-    SetWindowPos, ShowWindow, ShowWindowAsync, TileWindows, TrackPopupMenuEx, GCL_HICON,
-    GCL_HICONSM, HICON, MB_ICONERROR, MB_OK, MDITILE_HORIZONTAL, MDITILE_VERTICAL, MF_BYCOMMAND,
-    MF_DISABLED, MF_GRAYED, SMTO_ABORTIFHUNG, SMTO_NORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, TPM_RETURNCMD, WM_COMMAND, WM_GETICON,
+    EnableMenuItem, EndDeferWindowPos, GCL_HICON, GCL_HICONSM, GetClassLongPtrW, GetClientRect,
+    GetDesktopWindow, GetDlgItem, GetWindow, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, HICON, IsHungAppWindow, IsIconic, IsWindow, IsWindowVisible,
+    MB_ICONERROR, MB_OK, MDITILE_HORIZONTAL, MDITILE_VERTICAL, MF_BYCOMMAND, MF_DISABLED,
+    MF_GRAYED, MessageBoxW, SMTO_ABORTIFHUNG, SMTO_NORMAL, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageTimeoutW, SendMessageW,
+    SetForegroundWindow, SetMenuDefaultItem, SetWindowLongW, SetWindowPos, ShowWindow,
+    ShowWindowAsync, TPM_RETURNCMD, TileWindows, TrackPopupMenuEx, WM_COMMAND, WM_GETICON,
     WM_SETREDRAW,
 };
+use windows_sys::core::BOOL;
 
-use crate::assets::{load_icon_resource, DEFAULT_ICON_RESOURCE};
+use crate::assets::{DEFAULT_ICON_RESOURCE, load_icon_resource};
 use crate::background_worker::BackgroundWorker;
-use crate::language::{text, TextKey};
+use crate::language::{TextKey, text};
 use crate::menus::build_popup_menu;
 use crate::options::{Options, ViewMode};
-use crate::procpage::{query_process_identity_for_pid, ProcIdentity};
+use crate::process_identity::{
+    ProcIdentity, query_process_identity_for_pid, query_process_is_32_bit,
+};
 use crate::resource::{
     IDC_CASCADE, IDC_ENDTASK, IDC_MAXIMIZE, IDC_MINIMIZE, IDC_SWITCHTO, IDC_TASKLIST, IDC_TILEHORZ,
     IDC_TILEVERT, IDM_DETAILS, IDM_LARGEICONS, IDM_RUN, IDM_SMALLICONS, IDM_TASK_BRINGTOFRONT,
     IDM_TASK_CASCADE, IDM_TASK_ENDTASK, IDM_TASK_FINDPROCESS, IDM_TASK_MAXIMIZE, IDM_TASK_MINIMIZE,
-    IDM_TASK_SWITCHTO, IDM_TASK_TILEHORZ, IDM_TASK_TILEVERT, IDR_TASKVIEW, IDR_TASK_CONTEXT,
+    IDM_TASK_SWITCHTO, IDM_TASK_TILEHORZ, IDM_TASK_TILEVERT, IDR_TASK_CONTEXT, IDR_TASKVIEW,
     PWM_TASK_WORKER_COMPLETE,
 };
 use crate::winutil::{
-    append_32_bit_suffix, copy_text_to_callback_buffer, destroy_icon_handle, destroy_menu_handle,
-    finish_list_view_update, is_32_bit_process_pid, record_win32_error, subclass_list_view,
-    to_wide_null, window_rect_relative_to_page,
+    append_32_bit_suffix, copy_text_to_callback_buffer, destroy_icon_handle,
+    finish_list_view_update, record_win32_error, subclass_list_view, to_wide_null,
+    window_rect_relative_to_page,
 };
 const TASK_COLUMNS: [TaskColumn; 4] = [
     // 应用程序页默认只展示经典任务管理器里的四列。
@@ -143,14 +145,13 @@ pub struct TaskEntry {
     pub title: String,
     display_title: String,
     title_lower: String,
-    pub is_32_bit: bool,
+    pub is_32_bit: Option<bool>,
     pub winstation: String,
     winstation_lower: String,
     pub desktop: String,
     desktop_lower: String,
     pub is_hung: bool,
-    pub small_icon: usize,
-    pub large_icon: usize,
+    pub icon_slot: usize,
     icons_loaded: bool,
     pass_count: u64,
     dirty_columns: DirtyTaskColumns,
@@ -160,13 +161,24 @@ pub struct TaskEntry {
 struct WorkerTaskEntry {
     identity: TaskIdentity,
     title: String,
-    is_32_bit: bool,
+    is_32_bit: Option<bool>,
     winstation: String,
     desktop: String,
     is_hung: bool,
 }
 
-type TaskWorkerResult = Result<Vec<WorkerTaskEntry>, u32>;
+#[derive(Default)]
+struct TaskSamplerCache {
+    desktop_names: Option<(String, String)>,
+    bitness_by_process: HashMap<ProcIdentity, bool>,
+}
+
+struct TaskWorkerSnapshot {
+    tasks: Vec<WorkerTaskEntry>,
+    row_error: Option<u32>,
+}
+
+type TaskWorkerResult = Result<TaskWorkerSnapshot, u32>;
 
 #[derive(Clone, Copy)]
 struct TaskIconRequest {
@@ -210,6 +222,208 @@ impl Drop for TaskIconResult {
     }
 }
 
+#[derive(Default)]
+struct TaskIconStore {
+    small: HIMAGELIST,
+    large: HIMAGELIST,
+    default_small: HICON,
+    default_large: HICON,
+    free_slots: Vec<usize>,
+}
+
+impl TaskIconStore {
+    fn initialize(&mut self) -> Result<(), u32> {
+        let mut next = Self::default();
+        unsafe {
+            next.small = ImageList_Create(
+                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                    windows_sys::Win32::UI::WindowsAndMessaging::SM_CXSMICON,
+                ),
+                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                    windows_sys::Win32::UI::WindowsAndMessaging::SM_CYSMICON,
+                ),
+                0x21,
+                1,
+                1,
+            );
+            next.large = ImageList_Create(
+                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                    windows_sys::Win32::UI::WindowsAndMessaging::SM_CXICON,
+                ),
+                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                    windows_sys::Win32::UI::WindowsAndMessaging::SM_CYICON,
+                ),
+                0x21,
+                1,
+                1,
+            );
+            if next.small == 0 || next.large == 0 {
+                return Err(last_error_or_gen_failure());
+            }
+
+            next.default_small = load_icon_resource(
+                DEFAULT_ICON_RESOURCE,
+                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                    windows_sys::Win32::UI::WindowsAndMessaging::SM_CXSMICON,
+                ),
+                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                    windows_sys::Win32::UI::WindowsAndMessaging::SM_CYSMICON,
+                ),
+                0,
+            );
+            next.default_large = load_icon_resource(
+                DEFAULT_ICON_RESOURCE,
+                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                    windows_sys::Win32::UI::WindowsAndMessaging::SM_CXICON,
+                ),
+                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                    windows_sys::Win32::UI::WindowsAndMessaging::SM_CYICON,
+                ),
+                0,
+            );
+            if next.default_small.is_null() || next.default_large.is_null() {
+                return Err(last_error_or_gen_failure());
+            }
+            next.reset()?;
+        }
+        *self = next;
+        Ok(())
+    }
+
+    fn small(&self) -> HIMAGELIST {
+        self.small
+    }
+
+    fn large(&self) -> HIMAGELIST {
+        self.large
+    }
+
+    fn allocate(&mut self, small_icon: HICON, large_icon: HICON) -> Result<usize, u32> {
+        if small_icon.is_null() && large_icon.is_null() {
+            return Ok(0);
+        }
+        let requested_slot = self.free_slots.last().copied();
+        let appended = requested_slot.is_none();
+        let target = match requested_slot {
+            Some(slot) => match i32::try_from(slot) {
+                Ok(slot) => slot,
+                Err(_) => {
+                    destroy_icon_handle(small_icon);
+                    destroy_icon_handle(large_icon);
+                    return Err(ERROR_INVALID_DATA);
+                }
+            },
+            None => -1,
+        };
+
+        let small_index =
+            match replace_owned_icon(self.small, target, small_icon, self.default_small) {
+                Ok(index) => index,
+                Err(error) => {
+                    destroy_icon_handle(large_icon);
+                    return Err(error);
+                }
+            };
+        let large_index =
+            match replace_owned_icon(self.large, target, large_icon, self.default_large) {
+                Ok(index) => index,
+                Err(error) => {
+                    rollback_icon_slot(
+                        self.small,
+                        small_index,
+                        self.default_small,
+                        appended,
+                        "task small icon rollback",
+                    );
+                    return Err(error);
+                }
+            };
+
+        if small_index != large_index || requested_slot.is_some_and(|slot| slot != small_index) {
+            rollback_icon_slot(
+                self.small,
+                small_index,
+                self.default_small,
+                appended,
+                "task small icon rollback",
+            );
+            rollback_icon_slot(
+                self.large,
+                large_index,
+                self.default_large,
+                appended,
+                "task large icon rollback",
+            );
+            return Err(ERROR_INVALID_DATA);
+        }
+        if requested_slot.is_some() {
+            self.free_slots.pop();
+        }
+        Ok(small_index)
+    }
+
+    fn release(&mut self, slot: usize) -> Result<(), u32> {
+        if slot == 0 {
+            return Ok(());
+        }
+        let Ok(slot_i32) = i32::try_from(slot) else {
+            return Err(ERROR_INVALID_DATA);
+        };
+        let small_result =
+            unsafe { ImageList_ReplaceIcon(self.small, slot_i32, self.default_small) };
+        let small_error = (small_result < 0).then(last_error_or_gen_failure);
+        let large_result =
+            unsafe { ImageList_ReplaceIcon(self.large, slot_i32, self.default_large) };
+        let large_error = (large_result < 0).then(last_error_or_gen_failure);
+        if let Some(error) = small_error.or(large_error) {
+            return Err(error);
+        }
+        self.free_slots.push(slot);
+        Ok(())
+    }
+
+    unsafe fn reset(&mut self) -> Result<(), u32> {
+        unsafe {
+            ImageList_Remove(self.small, -1);
+            ImageList_Remove(self.large, -1);
+            let small_index = ImageList_ReplaceIcon(self.small, -1, self.default_small);
+            let large_index = ImageList_ReplaceIcon(self.large, -1, self.default_large);
+            if small_index != 0 || large_index != 0 {
+                let error = last_error_or_gen_failure();
+                ImageList_Remove(self.small, -1);
+                ImageList_Remove(self.large, -1);
+                return Err(error);
+            }
+            self.free_slots.clear();
+            Ok(())
+        }
+    }
+
+    fn destroy(&mut self) {
+        unsafe {
+            if self.small != 0 {
+                ImageList_Destroy(self.small);
+                self.small = 0;
+            }
+            if self.large != 0 {
+                ImageList_Destroy(self.large);
+                self.large = 0;
+            }
+        }
+        destroy_icon_handle(self.default_small);
+        destroy_icon_handle(self.default_large);
+        self.default_small = null_mut();
+        self.default_large = null_mut();
+        self.free_slots.clear();
+    }
+}
+
+impl Drop for TaskIconStore {
+    fn drop(&mut self) {
+        self.destroy();
+    }
+}
+
 impl TaskEntry {
     fn status_text(&self) -> &'static str {
         // 任务状态在当前实现里只区分“响应”和“未响应”两种。
@@ -250,10 +464,7 @@ pub struct TaskPageState {
     main_hwnd: HWND,
     tasks: Vec<TaskEntry>,
     displayed_identities: Vec<TaskIdentity>,
-    small_icons: HIMAGELIST,
-    large_icons: HIMAGELIST,
-    default_small_icon: HICON,
-    default_large_icon: HICON,
+    icons: TaskIconStore,
     selected_count: u32,
     current_view_mode: i32,
     minimize_on_use: bool,
@@ -268,6 +479,7 @@ pub struct TaskPageState {
     collection_in_flight: bool,
     refresh_requested: bool,
     last_refresh_error: Option<u32>,
+    last_row_error: Option<u32>,
     last_icon_error: Option<u32>,
 }
 
@@ -279,10 +491,7 @@ impl Default for TaskPageState {
             main_hwnd: null_mut(),
             tasks: Vec::with_capacity(128),
             displayed_identities: Vec::with_capacity(128),
-            small_icons: 0,
-            large_icons: 0,
-            default_small_icon: null_mut(),
-            default_large_icon: null_mut(),
+            icons: TaskIconStore::default(),
             selected_count: 0,
             current_view_mode: ViewMode::Details as i32,
             minimize_on_use: true,
@@ -297,6 +506,7 @@ impl Default for TaskPageState {
             collection_in_flight: false,
             refresh_requested: false,
             last_refresh_error: None,
+            last_row_error: None,
             last_icon_error: None,
         }
     }
@@ -316,67 +526,10 @@ impl TaskPageState {
         // 避免页面显示出来后才临时分配这些较重的对象。
         // 安全性: this pre-initialization runs on the UI thread and only creates resources owned
         // by this page state.
-        unsafe {
-            self.hinstance = hinstance;
-            self.main_hwnd = main_hwnd;
-            self.start_worker_thread()?;
-
-            self.small_icons = ImageList_Create(
-                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-                    windows_sys::Win32::UI::WindowsAndMessaging::SM_CXSMICON,
-                ),
-                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-                    windows_sys::Win32::UI::WindowsAndMessaging::SM_CYSMICON,
-                ),
-                0x21, // ILC_COLOR32 | ILC_MASK（32 位色深 + 掩码）
-                1,
-                1,
-            );
-            self.large_icons = ImageList_Create(
-                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-                    windows_sys::Win32::UI::WindowsAndMessaging::SM_CXICON,
-                ),
-                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-                    windows_sys::Win32::UI::WindowsAndMessaging::SM_CYICON,
-                ),
-                0x21, // ILC_COLOR32 | ILC_MASK（32 位色深 + 掩码）
-                1,
-                1,
-            );
-            if self.small_icons == 0 || self.large_icons == 0 {
-                let error = last_error_or_gen_failure();
-                self.destroy();
-                return Err(error);
-            }
-
-            self.default_small_icon = load_icon_resource(
-                DEFAULT_ICON_RESOURCE,
-                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-                    windows_sys::Win32::UI::WindowsAndMessaging::SM_CXSMICON,
-                ),
-                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-                    windows_sys::Win32::UI::WindowsAndMessaging::SM_CYSMICON,
-                ),
-                0,
-            );
-            self.default_large_icon = load_icon_resource(
-                DEFAULT_ICON_RESOURCE,
-                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-                    windows_sys::Win32::UI::WindowsAndMessaging::SM_CXICON,
-                ),
-                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-                    windows_sys::Win32::UI::WindowsAndMessaging::SM_CYICON,
-                ),
-                0,
-            );
-            if self.default_small_icon.is_null() || self.default_large_icon.is_null() {
-                let error = last_error_or_gen_failure();
-                self.destroy();
-                return Err(error);
-            }
-
-            Ok(())
-        }
+        self.hinstance = hinstance;
+        self.main_hwnd = main_hwnd;
+        self.start_worker_thread()?;
+        self.icons.initialize()
     }
 
     pub fn handle_init_dialog(&mut self, hwnd_page: HWND) -> isize {
@@ -385,7 +538,6 @@ impl TaskPageState {
         // this page and run synchronously on the UI thread.
         unsafe {
             self.hwnd_page = hwnd_page;
-            self.reset_imagelists();
 
             let list_hwnd = self.list_hwnd();
             if !list_hwnd.is_null() {
@@ -394,7 +546,7 @@ impl TaskPageState {
                     list_hwnd,
                     LVM_SETIMAGELIST,
                     LVSIL_SMALL as usize,
-                    self.small_icons,
+                    self.icons.small(),
                 );
                 let current_style = GetWindowLongW(
                     list_hwnd,
@@ -414,8 +566,8 @@ impl TaskPageState {
     pub fn complete_initialize(&mut self) -> Result<(), u32> {
         // 后置初始化统一负责“建列 -> 应用视图模式 -> 首次布局”；首次采样由页面激活
         // 或后台预热入口统一触发，避免初始化与激活连续排两轮 worker。
-        if unsafe { ImageList_GetImageCount(self.small_icons) } < 1
-            || unsafe { ImageList_GetImageCount(self.large_icons) } < 1
+        if unsafe { ImageList_GetImageCount(self.icons.small()) } < 1
+            || unsafe { ImageList_GetImageCount(self.icons.large()) } < 1
         {
             return Err(ERROR_RESOURCE_DATA_NOT_FOUND);
         }
@@ -451,22 +603,7 @@ impl TaskPageState {
                 SendMessageW(list_hwnd, LVM_SETIMAGELIST, LVSIL_SMALL as usize, 0);
                 SendMessageW(list_hwnd, LVM_SETIMAGELIST, LVSIL_NORMAL as usize, 0);
             }
-            if self.small_icons != 0 {
-                ImageList_Destroy(self.small_icons);
-                self.small_icons = 0;
-            }
-            if self.large_icons != 0 {
-                ImageList_Destroy(self.large_icons);
-                self.large_icons = 0;
-            }
-            if !self.default_small_icon.is_null() {
-                destroy_icon_handle(self.default_small_icon);
-                self.default_small_icon = null_mut();
-            }
-            if !self.default_large_icon.is_null() {
-                destroy_icon_handle(self.default_large_icon);
-                self.default_large_icon = null_mut();
-            }
+            self.icons.destroy();
             self.tasks.clear();
             self.displayed_identities.clear();
         }
@@ -602,15 +739,15 @@ impl TaskPageState {
                     }
                 }
                 IDM_TASK_FINDPROCESS => {
-                    if let Some(identity) = self.selected_task_identities(true).first().copied() {
-                        if window_matches_actionable_identity(identity) {
-                            SendMessageW(
-                                self.main_hwnd,
-                                crate::resource::WM_FINDPROC,
-                                identity.process.pid as usize,
-                                identity.process.creation_time_100ns as isize,
-                            );
-                        }
+                    if let Some(identity) = self.selected_task_identities(true).first().copied()
+                        && window_matches_actionable_identity(identity)
+                    {
+                        SendMessageW(
+                            self.main_hwnd,
+                            crate::resource::WM_FINDPROC,
+                            identity.process.pid as usize,
+                            identity.process.creation_time_100ns as isize,
+                        );
                     }
                 }
                 _ => {}
@@ -633,9 +770,14 @@ impl TaskPageState {
                 build_popup_menu(IDR_TASKVIEW)
             };
 
-            let Some(popup) = popup else {
-                return;
+            let popup = match popup {
+                Ok(popup) => popup,
+                Err(error) => {
+                    record_win32_error("task popup menu creation", error);
+                    return;
+                }
             };
+            let popup_handle = popup.as_raw();
 
             if !has_selection {
                 let checked_id = match self.current_view_mode {
@@ -644,14 +786,14 @@ impl TaskPageState {
                     _ => IDM_DETAILS,
                 };
                 CheckMenuRadioItem(
-                    popup,
+                    popup_handle,
                     u32::from(IDM_LARGEICONS),
                     u32::from(IDM_DETAILS),
                     u32::from(checked_id),
                     MF_BYCOMMAND,
                 );
             } else {
-                SetMenuDefaultItem(popup, u32::from(IDM_TASK_SWITCHTO), 0);
+                SetMenuDefaultItem(popup_handle, u32::from(IDM_TASK_SWITCHTO), 0);
                 if selected_hwnds.is_empty() {
                     for command_id in [
                         IDM_TASK_SWITCHTO,
@@ -665,7 +807,7 @@ impl TaskPageState {
                         IDM_TASK_FINDPROCESS,
                     ] {
                         EnableMenuItem(
-                            popup,
+                            popup_handle,
                             u32::from(command_id),
                             MF_BYCOMMAND | MF_GRAYED | MF_DISABLED,
                         );
@@ -674,7 +816,7 @@ impl TaskPageState {
                 if selected_hwnds.len() < 2 {
                     for command_id in [IDM_TASK_CASCADE, IDM_TASK_TILEHORZ, IDM_TASK_TILEVERT] {
                         EnableMenuItem(
-                            popup,
+                            popup_handle,
                             u32::from(command_id),
                             MF_BYCOMMAND | MF_GRAYED | MF_DISABLED,
                         );
@@ -684,9 +826,9 @@ impl TaskPageState {
 
             self.paused = true;
             SendMessageW(self.main_hwnd, crate::resource::PWM_INPOPUP, 1, 0);
-            let command = TrackPopupMenuEx(popup, TPM_RETURNCMD, x, y, self.hwnd_page, null());
+            let command =
+                TrackPopupMenuEx(popup_handle, TPM_RETURNCMD, x, y, self.hwnd_page, null());
             SendMessageW(self.main_hwnd, crate::resource::PWM_INPOPUP, 0, 0);
-            destroy_menu_handle(popup);
 
             if command != 0 {
                 self.handle_command(command as u16);
@@ -839,9 +981,9 @@ impl TaskPageState {
                     LVSIL_SMALL as usize
                 },
                 if view_mode == ViewMode::LargeIcon as i32 {
-                    self.large_icons
+                    self.icons.large()
                 } else {
-                    self.small_icons
+                    self.icons.small()
                 },
             );
             if !self.tasks.is_empty() {
@@ -850,11 +992,7 @@ impl TaskPageState {
                     let mut item = LVITEMW {
                         mask: LVIF_IMAGE,
                         iItem: index as i32,
-                        iImage: if view_mode == ViewMode::LargeIcon as i32 {
-                            task.large_icon as i32
-                        } else {
-                            task.small_icon as i32
-                        },
+                        iImage: task.icon_slot as i32,
                         ..zeroed()
                     };
                     SendMessageW(list_hwnd, LVM_SETITEMW, 0, &mut item as *mut _ as LPARAM);
@@ -914,9 +1052,10 @@ impl TaskPageState {
     fn apply_task_worker_result(&mut self, result: TaskWorkerResult) {
         self.collection_in_flight = false;
         match result {
-            Ok(tasks) => {
+            Ok(snapshot) => {
                 self.last_refresh_error = None;
-                self.apply_task_snapshot(tasks);
+                self.set_row_error(snapshot.row_error);
+                self.apply_task_snapshot(snapshot.tasks);
             }
             Err(error) => self.set_refresh_error(error),
         }
@@ -991,6 +1130,15 @@ impl TaskPageState {
         self.last_refresh_error = Some(error);
     }
 
+    fn set_row_error(&mut self, error: Option<u32>) {
+        if let Some(error) = error
+            && self.last_row_error != Some(error)
+        {
+            record_win32_error("task row sampling", error);
+        }
+        self.last_row_error = error;
+    }
+
     fn set_icon_error(&mut self, error: u32) {
         if self.last_icon_error != Some(error) {
             record_win32_error("task icon refresh", error);
@@ -1041,45 +1189,39 @@ impl TaskPageState {
 
     fn apply_task_icon_results(&mut self, results: Vec<TaskIconResult>) {
         let list_hwnd = self.list_hwnd();
+        let index_by_identity = self
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(index, task)| (task.identity, index))
+            .collect::<HashMap<_, _>>();
         for mut result in results {
-            let Some(index) = self
-                .tasks
-                .iter()
-                .position(|task| task.identity == result.identity)
-            else {
+            let Some(&index) = index_by_identity.get(&result.identity) else {
                 continue;
             };
             if !window_matches_identity(result.identity) {
                 continue;
             }
 
-            let icons = add_icon_pair(
-                self.small_icons,
-                self.large_icons,
-                result.take_small_icon(),
-                result.take_large_icon(),
-            );
-            let (small_icon, large_icon) = match icons {
-                Ok(icons) => icons,
+            let icon_slot = match self
+                .icons
+                .allocate(result.take_small_icon(), result.take_large_icon())
+            {
+                Ok(slot) => slot,
                 Err(error) => {
                     self.set_icon_error(error);
                     continue;
                 }
             };
             let task = &mut self.tasks[index];
-            task.small_icon = small_icon;
-            task.large_icon = large_icon;
+            task.icon_slot = icon_slot;
             task.icons_loaded = true;
 
             if !list_hwnd.is_null() {
                 let mut item = LVITEMW {
                     mask: LVIF_IMAGE,
                     iItem: index as i32,
-                    iImage: if self.current_view_mode == ViewMode::LargeIcon as i32 {
-                        large_icon as i32
-                    } else {
-                        small_icon as i32
-                    },
+                    iImage: icon_slot as i32,
                     ..unsafe { zeroed() }
                 };
                 unsafe {
@@ -1113,15 +1255,16 @@ impl TaskPageState {
         }
 
         if self.snapshot_worker.is_none() {
+            let mut cache = TaskSamplerCache::default();
             self.snapshot_worker = Some(BackgroundWorker::spawn(
-                "rtaskmgr-task-sampler",
+                "taskmgr-rs-task-sampler",
                 PWM_TASK_WORKER_COMPLETE,
-                |main_hwnd: isize| collect_tasks_worker(main_hwnd),
+                move |main_hwnd: isize| collect_tasks_worker(main_hwnd, &mut cache),
             )?);
         }
         if self.icon_worker.is_none() {
             self.icon_worker = Some(BackgroundWorker::spawn(
-                "rtaskmgr-task-icons",
+                "taskmgr-rs-task-icons",
                 PWM_TASK_WORKER_COMPLETE,
                 collect_task_icons,
             )?);
@@ -1138,35 +1281,31 @@ impl TaskPageState {
     }
 
     fn remove_stale_tasks(&mut self, current_pass: u64) -> bool {
-        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
-        unsafe {
-            let previous_len = self.tasks.len();
-            let mut removed_small = Vec::with_capacity(self.tasks.len());
-            let mut removed_large = Vec::with_capacity(self.tasks.len());
-
-            self.tasks.retain(|task| {
-                if task.pass_count == current_pass {
-                    true
-                } else {
-                    removed_small.push(task.small_icon);
-                    removed_large.push(task.large_icon);
-                    false
+        let previous_len = self.tasks.len();
+        let mut released_slots = Vec::new();
+        self.tasks.retain(|task| {
+            if task.pass_count == current_pass {
+                true
+            } else {
+                if task.icon_slot != 0 {
+                    released_slots.push(task.icon_slot);
                 }
-            });
-
-            normalize_removed_icon_indices(&mut removed_small);
-            normalize_removed_icon_indices(&mut removed_large);
-            remove_imagelist_indices(self.small_icons, &removed_small);
-            remove_imagelist_indices(self.large_icons, &removed_large);
-
-            if !removed_small.is_empty() || !removed_large.is_empty() {
-                for task in &mut self.tasks {
-                    task.small_icon = adjusted_icon_index(task.small_icon, &removed_small);
-                    task.large_icon = adjusted_icon_index(task.large_icon, &removed_large);
-                }
+                false
             }
-            previous_len != self.tasks.len()
+        });
+        released_slots.sort_unstable();
+        released_slots.dedup();
+
+        let mut release_error = None;
+        for slot in released_slots {
+            if let Err(error) = self.icons.release(slot) {
+                release_error.get_or_insert(error);
+            }
         }
+        if let Some(error) = release_error {
+            self.set_icon_error(error);
+        }
+        previous_len != self.tasks.len()
     }
 
     fn update_task_listview(&mut self, selected_identities: &HashSet<TaskIdentity>) {
@@ -1226,18 +1365,13 @@ impl TaskPageState {
     fn insert_row(&self, list_hwnd: HWND, index: usize, task: &TaskEntry, selected: bool) {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
-            let image_index = if self.current_view_mode == ViewMode::LargeIcon as i32 {
-                task.large_icon as i32
-            } else {
-                task.small_icon as i32
-            };
             let mut item = LVITEMW {
                 mask: LVIF_TEXT | LVIF_PARAM | LVIF_IMAGE,
                 iItem: index as i32,
                 iSubItem: 0,
                 pszText: TEXT_CALLBACK_WIDE,
                 cchTextMax: 0,
-                iImage: image_index,
+                iImage: task.icon_slot as i32,
                 lParam: task.identity.hwnd,
                 ..zeroed()
             };
@@ -1253,18 +1387,13 @@ impl TaskPageState {
     fn replace_row(&self, list_hwnd: HWND, index: usize, task: &TaskEntry, selected: bool) {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
-            let image_index = if self.current_view_mode == ViewMode::LargeIcon as i32 {
-                task.large_icon as i32
-            } else {
-                task.small_icon as i32
-            };
             let mut item = LVITEMW {
                 mask: LVIF_TEXT | LVIF_PARAM | LVIF_IMAGE | LVIF_STATE,
                 iItem: index as i32,
                 iSubItem: 0,
                 pszText: TEXT_CALLBACK_WIDE,
                 cchTextMax: 0,
-                iImage: image_index,
+                iImage: task.icon_slot as i32,
                 lParam: task.identity.hwnd,
                 stateMask: LVIS_SELECTED | LVIS_FOCUSED,
                 state: if selected {
@@ -1307,16 +1436,6 @@ impl TaskPageState {
                 TaskColumnId::Desktop => task.desktop.as_str(),
             };
             copy_text_to_callback_buffer(item.pszText, item.cchTextMax as usize, text);
-        }
-    }
-
-    fn reset_imagelists(&self) {
-        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
-        unsafe {
-            ImageList_Remove(self.small_icons, -1);
-            ImageList_Remove(self.large_icons, -1);
-            ImageList_ReplaceIcon(self.small_icons, -1, self.default_small_icon);
-            ImageList_ReplaceIcon(self.large_icons, -1, self.default_large_icon);
         }
     }
 
@@ -1427,10 +1546,11 @@ impl TaskPageState {
     }
 }
 
-fn collect_tasks_worker(main_hwnd: isize) -> TaskWorkerResult {
+fn collect_tasks_worker(main_hwnd: isize, cache: &mut TaskSamplerCache) -> TaskWorkerResult {
     // 应用程序页只展示当前交互桌面的顶层窗口。直接枚举 worker 所属桌面，避免把
     // Winlogon 等不可访问安全桌面误判成整轮采样失败。
-    let tasks = collect_tasks_current_winsta_worker(main_hwnd as HWND)?;
+    let TaskWorkerSnapshot { tasks, row_error } =
+        collect_tasks_current_winsta_worker(main_hwnd as HWND, cache)?;
     let mut valid_tasks = Vec::with_capacity(tasks.len());
     // 首先提交轻量窗口快照；图标由独立 worker 补全，慢窗口不会再阻塞列表出现。
     for task in tasks {
@@ -1439,7 +1559,10 @@ fn collect_tasks_worker(main_hwnd: isize) -> TaskWorkerResult {
         }
         valid_tasks.push(task);
     }
-    Ok(valid_tasks)
+    Ok(TaskWorkerSnapshot {
+        tasks: valid_tasks,
+        row_error,
+    })
 }
 
 fn collect_task_icons(requests: Vec<TaskIconRequest>) -> TaskIconCompletion {
@@ -1506,7 +1629,8 @@ fn collect_task_icons_parallel(requests: &[TaskIconRequest]) -> Result<Vec<TaskI
         let mut results = Vec::with_capacity(requests.len());
         let mut worker_failed = false;
         for worker in workers {
-            match worker.join() {
+            let joined = worker.join();
+            match joined {
                 Ok(mut worker_results) => results.append(&mut worker_results),
                 Err(_) => worker_failed = true,
             }
@@ -1526,30 +1650,41 @@ fn io_error_code(error: std::io::Error) -> u32 {
         .unwrap_or(windows_sys::Win32::Foundation::ERROR_GEN_FAILURE)
 }
 
-fn collect_tasks_current_winsta_worker(main_hwnd: HWND) -> TaskWorkerResult {
+fn collect_tasks_current_winsta_worker(
+    main_hwnd: HWND,
+    cache: &mut TaskSamplerCache,
+) -> TaskWorkerResult {
     // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
-        let mut tasks = Vec::with_capacity(64);
+        let mut tasks = Vec::<WorkerTaskEntry>::with_capacity(64);
         let mut seen_tasks = HashSet::new();
-        let mut bitness_by_pid = HashMap::with_capacity(64);
         let mut process_identities = HashMap::with_capacity(64);
-        let window_station = GetProcessWindowStation();
-        if window_station.is_null() {
-            return Err(last_error_or_gen_failure());
-        }
-        let winstation = current_user_object_name(window_station as HANDLE)?;
         let desktop_handle = GetThreadDesktop(GetCurrentThreadId());
         if desktop_handle.is_null() {
             return Err(last_error_or_gen_failure());
         }
-        let desktop = current_user_object_name(desktop_handle as HANDLE)?;
+        if cache.desktop_names.is_none() {
+            let window_station = GetProcessWindowStation();
+            if window_station.is_null() {
+                return Err(last_error_or_gen_failure());
+            }
+            cache.desktop_names = Some((
+                current_user_object_name(window_station as HANDLE)?,
+                current_user_object_name(desktop_handle as HANDLE)?,
+            ));
+        }
+        let (winstation, desktop) = cache
+            .desktop_names
+            .as_ref()
+            .cloned()
+            .ok_or(ERROR_INVALID_DATA)?;
         let mut context = WindowEnumContext {
             tasks: &mut tasks as *mut Vec<WorkerTaskEntry>,
             seen_tasks: &mut seen_tasks as *mut HashSet<TaskIdentity>,
-            bitness_by_pid: &mut bitness_by_pid as *mut HashMap<u32, bool>,
+            bitness_by_process: &mut cache.bitness_by_process as *mut HashMap<ProcIdentity, bool>,
             process_identities: &mut process_identities
                 as *mut HashMap<u32, Result<ProcIdentity, u32>>,
-            error: None,
+            row_error: None,
             main_hwnd,
             winstation,
             desktop,
@@ -1559,13 +1694,20 @@ fn collect_tasks_current_winsta_worker(main_hwnd: HWND) -> TaskWorkerResult {
             Some(enum_window_proc),
             &mut context as *mut WindowEnumContext as LPARAM,
         );
-        if let Some(error) = context.error {
-            return Err(error);
-        }
         if enumerated == 0 {
             return Err(last_error_or_gen_failure());
         }
-        Ok(tasks)
+        let current_processes = tasks
+            .iter()
+            .map(|task| task.identity.process)
+            .collect::<HashSet<_>>();
+        cache
+            .bitness_by_process
+            .retain(|identity, _| current_processes.contains(identity));
+        Ok(TaskWorkerSnapshot {
+            tasks,
+            row_error: context.row_error,
+        })
     }
 }
 
@@ -1573,127 +1715,139 @@ fn collect_tasks_current_winsta_worker(main_hwnd: HWND) -> TaskWorkerResult {
 struct WindowEnumContext {
     tasks: *mut Vec<WorkerTaskEntry>,
     seen_tasks: *mut HashSet<TaskIdentity>,
-    bitness_by_pid: *mut HashMap<u32, bool>,
+    bitness_by_process: *mut HashMap<ProcIdentity, bool>,
     process_identities: *mut HashMap<u32, Result<ProcIdentity, u32>>,
-    error: Option<u32>,
+    row_error: Option<u32>,
     main_hwnd: HWND,
     winstation: String,
     desktop: String,
 }
 
 unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    // 任务列表只关心可见、无 owner 的顶层窗口，并显式排除我们自己的主窗口。
-    let context = &mut *(lparam as *mut WindowEnumContext);
+    unsafe {
+        // 任务列表只关心可见、无 owner 的顶层窗口，并显式排除我们自己的主窗口。
+        let context = &mut *(lparam as *mut WindowEnumContext);
 
-    if !GetWindow(hwnd, windows_sys::Win32::UI::WindowsAndMessaging::GW_OWNER).is_null()
-        || IsWindowVisible(hwnd) == 0
-        || hwnd == context.main_hwnd
-    {
-        return 1;
-    }
-
-    let title = window_title(hwnd);
-    if title.is_empty() || title.eq_ignore_ascii_case("Program Manager") {
-        return 1;
-    }
-
-    let mut pid = 0u32;
-    let thread_id = GetWindowThreadProcessId(hwnd, &mut pid);
-    if pid == 0 || thread_id == 0 {
-        return 1;
-    }
-    let process_identities = &mut *context.process_identities;
-    let process_result = if let Some(identity) = process_identities.get(&pid).copied() {
-        identity
-    } else {
-        let identity = query_process_identity_for_pid(pid);
-        process_identities.insert(pid, identity);
-        identity
-    };
-    let process = match process_result {
-        Ok(identity) => identity,
-        Err(error) => {
-            if !window_still_has_identity(hwnd, pid, thread_id) {
-                return 1;
-            }
-            context.error = Some(error);
-            // Returning FALSE stops EnumDesktopWindows. The caller reads `context.error`
-            // instead of relying on GetLastError, which callbacks are not required to set.
-            return 0;
+        if !GetWindow(hwnd, windows_sys::Win32::UI::WindowsAndMessaging::GW_OWNER).is_null()
+            || IsWindowVisible(hwnd) == 0
+            || hwnd == context.main_hwnd
+        {
+            return 1;
         }
-    };
-    if !process.is_verified() {
-        context.error = Some(windows_sys::Win32::Foundation::ERROR_INVALID_DATA);
-        return 0;
-    }
-    let identity = TaskIdentity {
-        hwnd: hwnd as isize,
-        process,
-        thread_id,
-    };
-    let seen_tasks = &mut *context.seen_tasks;
-    if !seen_tasks.insert(identity) {
-        return 1;
-    }
-    let bitness_by_pid = &mut *context.bitness_by_pid;
-    let is_32_bit = if let Some(&cached) = bitness_by_pid.get(&pid) {
-        cached
-    } else {
-        let detected = match is_32_bit_process_pid(pid) {
-            Ok(detected) => detected,
+
+        let title = window_title(hwnd);
+        if title.is_empty() || title.eq_ignore_ascii_case("Program Manager") {
+            return 1;
+        }
+
+        let mut pid = 0u32;
+        let thread_id = GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == 0 || thread_id == 0 {
+            return 1;
+        }
+        let process_identities = &mut *context.process_identities;
+        let process_result = if let Some(identity) = process_identities.get(&pid).copied() {
+            identity
+        } else {
+            let identity = query_process_identity_for_pid(pid);
+            process_identities.insert(pid, identity);
+            identity
+        };
+        let process = match process_result {
+            Ok(identity) => identity,
             Err(error) => {
                 if !window_still_has_identity(hwnd, pid, thread_id) {
                     return 1;
                 }
-                context.error = Some(error);
-                return 0;
+                context.row_error.get_or_insert(if error == 0 {
+                    ERROR_INVALID_DATA
+                } else {
+                    error
+                });
+                return 1;
             }
         };
-        bitness_by_pid.insert(pid, detected);
-        detected
-    };
-    let tasks = &mut *context.tasks;
-    tasks.push(WorkerTaskEntry {
-        identity,
-        title,
-        is_32_bit,
-        winstation: context.winstation.clone(),
-        desktop: context.desktop.clone(),
-        is_hung: IsHungAppWindow(hwnd) != 0,
-    });
-    1
+        if !process.is_verified() {
+            context.row_error.get_or_insert(ERROR_INVALID_DATA);
+            return 1;
+        }
+        let identity = TaskIdentity {
+            hwnd: hwnd as isize,
+            process,
+            thread_id,
+        };
+        let seen_tasks = &mut *context.seen_tasks;
+        if !seen_tasks.insert(identity) {
+            return 1;
+        }
+        let bitness_by_process = &mut *context.bitness_by_process;
+        let is_32_bit = if let Some(&cached) = bitness_by_process.get(&process) {
+            Some(cached)
+        } else {
+            match query_process_is_32_bit(process) {
+                Ok(detected) => {
+                    bitness_by_process.insert(process, detected);
+                    Some(detected)
+                }
+                Err(error) => {
+                    if window_still_has_identity(hwnd, pid, thread_id) {
+                        context.row_error.get_or_insert(if error == 0 {
+                            ERROR_INVALID_DATA
+                        } else {
+                            error
+                        });
+                    }
+                    None
+                }
+            }
+        };
+        let tasks = &mut *context.tasks;
+        tasks.push(WorkerTaskEntry {
+            identity,
+            title,
+            is_32_bit,
+            winstation: context.winstation.clone(),
+            desktop: context.desktop.clone(),
+            is_hung: IsHungAppWindow(hwnd) != 0,
+        });
+        1
+    }
 }
 
 unsafe fn window_still_has_identity(hwnd: HWND, pid: u32, thread_id: u32) -> bool {
-    if IsWindow(hwnd) == 0 {
-        return false;
+    unsafe {
+        if IsWindow(hwnd) == 0 {
+            return false;
+        }
+        let mut current_pid = 0u32;
+        let current_thread_id = GetWindowThreadProcessId(hwnd, &mut current_pid);
+        current_thread_id == thread_id && current_pid == pid
     }
-    let mut current_pid = 0u32;
-    let current_thread_id = GetWindowThreadProcessId(hwnd, &mut current_pid);
-    current_thread_id == thread_id && current_pid == pid
 }
 
 unsafe fn window_title(hwnd: HWND) -> String {
-    let length = GetWindowTextLengthW(hwnd);
-    let Ok(length) = usize::try_from(length) else {
-        return String::new();
-    };
-    if length == 0 {
-        return String::new();
-    }
-
-    let capacity = length.saturating_add(1);
-    if capacity <= 260 {
-        let mut buffer = [0u16; 260];
-        let actual = GetWindowTextW(hwnd, buffer.as_mut_ptr(), capacity as i32).max(0) as usize;
-        String::from_utf16_lossy(&buffer[..actual.min(length)])
-    } else {
-        let Ok(capacity_i32) = i32::try_from(capacity) else {
+    unsafe {
+        let length = GetWindowTextLengthW(hwnd);
+        let Ok(length) = usize::try_from(length) else {
             return String::new();
         };
-        let mut buffer = vec![0u16; capacity];
-        let actual = GetWindowTextW(hwnd, buffer.as_mut_ptr(), capacity_i32).max(0) as usize;
-        String::from_utf16_lossy(&buffer[..actual.min(length)])
+        if length == 0 {
+            return String::new();
+        }
+
+        let capacity = length.saturating_add(1);
+        if capacity <= 260 {
+            let mut buffer = [0u16; 260];
+            let actual = GetWindowTextW(hwnd, buffer.as_mut_ptr(), capacity as i32).max(0) as usize;
+            String::from_utf16_lossy(&buffer[..actual.min(length)])
+        } else {
+            let Ok(capacity_i32) = i32::try_from(capacity) else {
+                return String::new();
+            };
+            let mut buffer = vec![0u16; capacity];
+            let actual = GetWindowTextW(hwnd, buffer.as_mut_ptr(), capacity_i32).max(0) as usize;
+            String::from_utf16_lossy(&buffer[..actual.min(length)])
+        }
     }
 }
 
@@ -1851,77 +2005,47 @@ fn compare_tasks(
     }
 }
 
-fn add_icon_pair(
-    small_imagelist: HIMAGELIST,
-    large_imagelist: HIMAGELIST,
-    small_icon: HICON,
-    large_icon: HICON,
-) -> Result<(usize, usize), u32> {
-    let small_index = match append_owned_icon(small_imagelist, small_icon) {
-        Ok(index) => index,
-        Err(error) => {
-            destroy_icon_handle(large_icon);
-            return Err(error);
-        }
+fn replace_owned_icon(
+    imagelist: HIMAGELIST,
+    target: i32,
+    owned_icon: HICON,
+    default_icon: HICON,
+) -> Result<usize, u32> {
+    let source = if owned_icon.is_null() {
+        default_icon
+    } else {
+        owned_icon
     };
-    match append_owned_icon(large_imagelist, large_icon) {
-        Ok(large_index) => Ok((small_index, large_index)),
-        Err(error) => {
-            if small_index > 0
-                && unsafe { ImageList_Remove(small_imagelist, small_index as i32) } == 0
-            {
-                let rollback_error = unsafe { GetLastError() };
-                record_win32_error(
-                    "task small icon rollback",
-                    if rollback_error == 0 {
-                        ERROR_GEN_FAILURE
-                    } else {
-                        rollback_error
-                    },
-                );
-            }
-            Err(error)
-        }
-    }
-}
-
-fn append_owned_icon(imagelist: HIMAGELIST, icon: HICON) -> Result<usize, u32> {
-    // Index 0 is the shared default icon; a null custom icon explicitly selects that index.
-    if icon.is_null() {
-        return Ok(0);
-    }
-    let index = unsafe { ImageList_ReplaceIcon(imagelist, -1, icon) };
-    destroy_icon_handle(icon);
+    let index = unsafe { ImageList_ReplaceIcon(imagelist, target, source) };
+    destroy_icon_handle(owned_icon);
     if index < 0 {
-        let error = unsafe { GetLastError() };
-        Err(if error == 0 { ERROR_GEN_FAILURE } else { error })
+        Err(last_error_or_gen_failure())
     } else {
         Ok(index as usize)
     }
 }
 
-// 规范化删除的图标索引：排除索引 0（默认图标）、去重、排序。
-fn normalize_removed_icon_indices(indices: &mut Vec<usize>) {
-    indices.retain(|index| *index > 0);
-    indices.sort_unstable();
-    indices.dedup();
-}
-
-// 从 ImageList 中删除指定索引的图标。必须从大到小删除，避免索引错位。
-unsafe fn remove_imagelist_indices(imagelist: HIMAGELIST, indices: &[usize]) {
-    for &index in indices.iter().rev() {
-        ImageList_Remove(imagelist, index as i32);
+fn rollback_icon_slot(
+    imagelist: HIMAGELIST,
+    slot: usize,
+    default_icon: HICON,
+    appended: bool,
+    context: &str,
+) {
+    let Ok(slot) = i32::try_from(slot) else {
+        record_win32_error(context, ERROR_INVALID_DATA);
+        return;
+    };
+    let succeeded = unsafe {
+        if appended {
+            ImageList_Remove(imagelist, slot) != 0
+        } else {
+            ImageList_ReplaceIcon(imagelist, slot, default_icon) >= 0
+        }
+    };
+    if !succeeded {
+        record_win32_error(context, last_error_or_gen_failure());
     }
-}
-
-// 调整条目图标索引：删除某些图标后，后续图标的索引需要前移。
-fn adjusted_icon_index(index: usize, removed_indices: &[usize]) -> usize {
-    if index == 0 {
-        return 0;
-    }
-
-    let removed_before = removed_indices.partition_point(|&removed| removed < index);
-    index.saturating_sub(removed_before)
 }
 
 // 将工作线程采集的 WorkerTaskEntry 转换为 UI 线程的 TaskEntry。
@@ -1935,7 +2059,7 @@ impl TaskEntry {
             desktop,
             is_hung,
         } = worker;
-        let display_title = append_32_bit_suffix(&title, is_32_bit).into_owned();
+        let display_title = task_display_title(&title, is_32_bit);
         Self {
             identity,
             title_lower: title.to_lowercase(),
@@ -1947,8 +2071,7 @@ impl TaskEntry {
             desktop_lower: desktop.to_lowercase(),
             desktop,
             is_hung,
-            small_icon: 0,
-            large_icon: 0,
+            icon_slot: 0,
             icons_loaded: false,
             pass_count,
             dirty_columns: DirtyTaskColumns::all(),
@@ -1985,7 +2108,7 @@ fn update_task_entry(
         task.is_32_bit = worker.is_32_bit;
     }
     if title_changed || bitness_changed {
-        task.display_title = append_32_bit_suffix(&task.title, task.is_32_bit).into_owned();
+        task.display_title = task_display_title(&task.title, task.is_32_bit);
         mark_task_column_changed(task, &mut changed, TaskColumnId::Name);
     }
     if task.is_hung != worker.is_hung {
@@ -1994,6 +2117,13 @@ fn update_task_entry(
     }
 
     changed
+}
+
+fn task_display_title(title: &str, is_32_bit: Option<bool>) -> String {
+    match is_32_bit {
+        Some(true) => append_32_bit_suffix(title, true).into_owned(),
+        Some(false) | None => title.to_string(),
+    }
 }
 
 fn mark_task_column_changed(
@@ -2043,20 +2173,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_removed_icon_indices_keeps_sorted_unique_non_default_indices() {
-        let mut indices = vec![5, 0, 2, 5, 1];
-        normalize_removed_icon_indices(&mut indices);
-
-        assert_eq!(indices, vec![1, 2, 5]);
-    }
-
-    #[test]
-    fn adjusted_icon_index_accounts_for_lower_removed_indices() {
-        let removed = vec![1, 3, 7];
-
-        assert_eq!(adjusted_icon_index(0, &removed), 0);
-        assert_eq!(adjusted_icon_index(2, &removed), 1);
-        assert_eq!(adjusted_icon_index(8, &removed), 5);
+    fn missing_custom_icons_share_the_default_slot() {
+        let mut store = TaskIconStore::default();
+        assert_eq!(store.allocate(null_mut(), null_mut()), Ok(0));
+        assert!(store.free_slots.is_empty());
     }
 
     #[test]
@@ -2067,6 +2187,19 @@ mod tests {
             thread_id: 2,
         };
         assert!(!window_matches_actionable_identity(identity));
+    }
+
+    #[test]
+    fn unknown_bitness_does_not_claim_a_process_architecture() {
+        assert_eq!(task_display_title("Editor", None), "Editor");
+        assert_eq!(
+            task_display_title("Editor", None),
+            task_display_title("Editor", Some(false))
+        );
+        assert_ne!(
+            task_display_title("Editor", Some(true)),
+            task_display_title("Editor", None)
+        );
     }
 
     #[test]

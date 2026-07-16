@@ -2,7 +2,7 @@ use std::mem::zeroed;
 use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_GEN_FAILURE, ERROR_INVALID_WINDOW_HANDLE, HINSTANCE, HWND, LPARAM, RECT,
+    ERROR_GEN_FAILURE, ERROR_INVALID_WINDOW_HANDLE, GetLastError, HINSTANCE, HWND, LPARAM, RECT,
     WPARAM,
 };
 
@@ -11,27 +11,28 @@ use windows_sys::Win32::Foundation::{
 // 激活、焦点切换、菜单切换以及 Win32 消息分发。
 
 use windows_sys::Win32::Graphics::Gdi::{
-    FillRect, GetStockObject, GetSysColorBrush, InvalidateRect, UpdateWindow, BLACK_BRUSH,
-    COLOR_3DFACE, HDC,
+    BLACK_BRUSH, COLOR_3DFACE, FillRect, GetStockObject, GetSysColorBrush, HDC, InvalidateRect,
+    UpdateWindow,
 };
 use windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, DrawMenuBar, GetClientRect, GetDlgCtrlID, GetDlgItem, GetWindowLongW,
-    SendMessageW, SetMenu, SetWindowLongW, SetWindowPos, ShowWindow, GWL_STYLE, HMENU, HTCAPTION,
-    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW, WM_COMMAND, WM_CONTEXTMENU, WM_CTLCOLORBTN,
+    DestroyWindow, DrawMenuBar, GWL_STYLE, GetClientRect, GetDlgCtrlID, GetDlgItem, GetWindowLongW,
+    HMENU, HTCAPTION, SW_HIDE, SW_SHOW, SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetMenu,
+    SetWindowLongW, SetWindowPos, ShowWindow, WM_COMMAND, WM_CONTEXTMENU, WM_CTLCOLORBTN,
     WM_DRAWITEM, WM_ERASEBKGND, WM_INITDIALOG, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEWHEEL, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NOTIFY, WM_SHOWWINDOW,
     WM_SIZE, WM_VSCROLL, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
 };
 
 use crate::dialog_templates::create_dialog;
-use crate::language::{localize_dialog, text, TextKey};
+use crate::language::{TextKey, localize_dialog, text};
 use crate::menus::build_main_menu;
 use crate::netpage::NetworkPageState;
 use crate::options::Options;
-use crate::perfpage::{PerformancePageState, PerformanceSnapshot};
-use crate::procpage::{ProcIdentity, ProcessPageState};
+use crate::perfpage::{PerformancePageState, redraw_performance_page};
+use crate::process_identity::ProcIdentity;
+use crate::procpage::ProcessPageState;
 use crate::resource::{
     IDC_CPUMETER, IDC_MEMGRAPH, IDC_MEMMETER, IDC_NICTOTALS, IDC_PROCLIST, IDC_TASKLIST,
     IDC_USERLIST, IDD_NETPAGE, IDD_PERFPAGE, IDD_PROCPAGE, IDD_TASKPAGE, IDD_USERSPAGE,
@@ -39,9 +40,11 @@ use crate::resource::{
     PWM_NET_WORKER_COMPLETE, PWM_PROC_WORKER_COMPLETE, PWM_TASK_WORKER_COMPLETE,
     PWM_USER_WORKER_COMPLETE,
 };
+use crate::runtime_menu::MenuBar;
+use crate::system_sampler::SystemSample;
 use crate::taskpage::TaskPageState;
 use crate::userpage::UserPageState;
-use crate::winutil::{destroy_menu_handle, get_window_userdata, set_window_userdata};
+use crate::winutil::{get_window_userdata, set_window_userdata};
 
 enum PageFocusTarget {
     // 每个页面激活后都有一个更自然的初始焦点目标。
@@ -95,11 +98,11 @@ impl PageState {
             Self::Process(state) => unsafe {
                 state.initialize(hinstance, hwnd, main_hwnd)?;
             },
+            Self::Performance(state) => state.complete_initialize(hwnd)?,
             Self::Network(state) => unsafe {
                 state.initialize(hwnd, main_hwnd, hwnd_tabs)?;
             },
             Self::Users(state) => state.initialize(hwnd)?,
-            _ => {}
         }
         Ok(())
     }
@@ -111,34 +114,45 @@ impl PageState {
         options: &Options,
         processor_count: usize,
     ) {
-        match self {
-            Self::Task(state) => state.apply_options(options),
-            Self::Process(state) => unsafe { state.apply_options(options, processor_count) },
+        let redraw_performance = match self {
+            Self::Task(state) => {
+                state.apply_options(options);
+                false
+            }
+            Self::Process(state) => unsafe {
+                state.apply_options(options, processor_count);
+                false
+            },
             Self::Performance(state) => {
                 if state.apply_options(hwnd, options, processor_count) {
                     state.size_page(hwnd, main_hwnd);
+                    true
+                } else {
+                    false
                 }
             }
-            Self::Network(state) => unsafe { state.apply_options(options) },
-            Self::Users(state) => state.apply_options(options),
+            Self::Network(state) => unsafe {
+                state.apply_options(options);
+                false
+            },
+            Self::Users(state) => {
+                state.apply_options(options);
+                false
+            }
+        };
+        if redraw_performance {
+            redraw_performance_page(hwnd);
         }
     }
 
-    fn timer_event(
-        &mut self,
-        hwnd: HWND,
-        main_hwnd: HWND,
-        options: &Options,
-        processor_count: usize,
-        force: bool,
-    ) {
+    fn timer_event(&mut self, options: &Options, processor_count: usize, force: bool) {
         match self {
             Self::Task(state) => state.timer_event(options, force),
             Self::Process(state) => unsafe {
                 state.apply_options(options, processor_count);
                 state.timer_event(options, force);
             },
-            Self::Performance(state) => state.timer_event(hwnd, main_hwnd),
+            Self::Performance(_) => {}
             Self::Network(state) => unsafe {
                 state.apply_options(options);
                 state.timer_event();
@@ -168,10 +182,15 @@ impl PageState {
         }
     }
 
-    fn performance_snapshot(&self) -> Option<PerformanceSnapshot> {
+    fn apply_system_sample(
+        &mut self,
+        hwnd: HWND,
+        sample: &SystemSample,
+        redraw: bool,
+    ) -> Result<(), u32> {
         match self {
-            Self::Performance(state) => Some(state.snapshot()),
-            _ => None,
+            Self::Performance(state) => state.apply_system_sample(hwnd, sample, redraw),
+            _ => Ok(()),
         }
     }
 
@@ -286,19 +305,37 @@ impl PageState {
     }
 
     fn handle_size_or_show(&mut self, hwnd: HWND, main_hwnd: HWND) -> isize {
-        match self {
-            Self::Task(state) => state.size_page(),
-            Self::Process(state) => unsafe { state.size_page() },
-            Self::Performance(state) => state.size_page(hwnd, main_hwnd),
-            Self::Network(state) => unsafe { state.size_page() },
-            Self::Users(state) => state.size_page(),
+        let redraw_performance = match self {
+            Self::Task(state) => {
+                state.size_page();
+                false
+            }
+            Self::Process(state) => unsafe {
+                state.size_page();
+                false
+            },
+            Self::Performance(state) => {
+                state.size_page(hwnd, main_hwnd);
+                true
+            }
+            Self::Network(state) => unsafe {
+                state.size_page();
+                false
+            },
+            Self::Users(state) => {
+                state.size_page();
+                false
+            }
+        };
+        if redraw_performance {
+            redraw_performance_page(hwnd);
         }
         1
     }
 
     fn redraw_after_layout(&self, hwnd: HWND) {
         match self {
-            Self::Performance(state) => state.redraw_after_layout(hwnd),
+            Self::Performance(_) => redraw_performance_page(hwnd),
             _ => redraw_plain_page(hwnd),
         }
     }
@@ -313,6 +350,7 @@ pub struct DialogPage {
     main_hwnd: HWND,
     dialog_id: u16,
     menu_id: u16,
+    menu: Option<MenuBar>,
     title_key: TextKey,
     initial_focus: PageFocusTarget,
     state: PageState,
@@ -328,6 +366,7 @@ impl DialogPage {
             main_hwnd: null_mut(),
             dialog_id: IDD_TASKPAGE,
             menu_id: IDR_MAINMENU_TASK,
+            menu: None,
             title_key: TextKey::ApplicationsPageTitle,
             initial_focus: PageFocusTarget::Control(IDC_TASKLIST),
             state: PageState::Task(Box::new(TaskPageState::new())),
@@ -342,6 +381,7 @@ impl DialogPage {
             main_hwnd: null_mut(),
             dialog_id: IDD_PROCPAGE,
             menu_id: IDR_MAINMENU_PROC,
+            menu: None,
             title_key: TextKey::ProcessesPageTitle,
             initial_focus: PageFocusTarget::Tabs,
             state: PageState::Process(Box::new(ProcessPageState::new())),
@@ -356,6 +396,7 @@ impl DialogPage {
             main_hwnd: null_mut(),
             dialog_id: IDD_PERFPAGE,
             menu_id: IDR_MAINMENU_PERF,
+            menu: None,
             title_key: TextKey::PerformancePageTitle,
             initial_focus: PageFocusTarget::None,
             state: PageState::Performance(Box::new(PerformancePageState::new())),
@@ -370,6 +411,7 @@ impl DialogPage {
             main_hwnd: null_mut(),
             dialog_id: IDD_NETPAGE,
             menu_id: IDR_MAINMENU_NET,
+            menu: None,
             title_key: TextKey::NetworkingPageTitle,
             initial_focus: PageFocusTarget::Control(IDC_NICTOTALS),
             state: PageState::Network(Box::new(NetworkPageState::new())),
@@ -384,6 +426,7 @@ impl DialogPage {
             main_hwnd: null_mut(),
             dialog_id: IDD_USERSPAGE,
             menu_id: IDR_MAINMENU_USER,
+            menu: None,
             title_key: TextKey::UsersPageTitle,
             initial_focus: PageFocusTarget::Control(IDC_USERLIST),
             state: PageState::Users(Box::new(UserPageState::new())),
@@ -392,11 +435,6 @@ impl DialogPage {
 
     pub fn hwnd(&self) -> HWND {
         self.hwnd
-    }
-
-    pub fn performance_snapshot(&self) -> Option<PerformanceSnapshot> {
-        // 主框架只从性能页取轻量快照，不直接读它的内部状态。
-        self.state.performance_snapshot()
     }
 
     pub fn title(&self, _hinstance: HINSTANCE) -> String {
@@ -434,34 +472,45 @@ impl DialogPage {
                 Some(dialog_page_proc)
             };
 
-        self.hwnd = create_dialog(
+        self.hwnd = match create_dialog(
             hinstance,
             self.dialog_id,
             main_hwnd,
             proc,
             self as *mut DialogPage as LPARAM,
-        );
+        ) {
+            Ok(hwnd) => hwnd,
+            Err(error) => {
+                self.state.destroy();
+                return Err(error);
+            }
+        };
 
-        if self.hwnd.is_null() {
+        localize_dialog(self.hwnd, self.dialog_id);
+        if let Err(error) = self.state.complete_initialize(
+            self.hinstance,
+            self.hwnd,
+            self.main_hwnd,
+            self.hwnd_tabs,
+        ) {
+            // 安全性: `self.hwnd` is the just-created dialog owned by this page.
+            unsafe { DestroyWindow(self.hwnd) };
+            self.hwnd = null_mut();
             self.state.destroy();
-            // 安全性: retrieving the last-error code immediately after dialog creation failed.
-            Err(unsafe { GetLastError() })
-        } else {
-            localize_dialog(self.hwnd, self.dialog_id);
-            if let Err(error) = self.state.complete_initialize(
-                self.hinstance,
-                self.hwnd,
-                self.main_hwnd,
-                self.hwnd_tabs,
-            ) {
-                // 安全性: `self.hwnd` is the just-created dialog owned by this page.
+            return Err(error);
+        }
+        let menu = match build_main_menu(self.menu_id, processor_count) {
+            Ok(menu) => menu,
+            Err(error) => {
+                // 安全性: `self.hwnd` is still the page dialog owned by this object.
                 unsafe { DestroyWindow(self.hwnd) };
                 self.hwnd = null_mut();
                 self.state.destroy();
                 return Err(error);
             }
-            Ok(())
-        }
+        };
+        self.menu = Some(menu);
+        Ok(())
     }
 
     pub fn activate(
@@ -478,28 +527,23 @@ impl DialogPage {
             return Err(ERROR_INVALID_WINDOW_HANDLE);
         }
 
-        let previous_menu = *current_menu;
-        let Some(next_menu) = build_main_menu(self.menu_id, processor_count) else {
-            let error = unsafe { GetLastError() };
-            return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+        let Some(menu) = self.menu.as_ref() else {
+            return Err(ERROR_INVALID_WINDOW_HANDLE);
         };
+        let menu = menu.as_raw();
 
         if !options.no_title() {
-            // 安全性: `next_menu` is a valid menu handle transferred to the main window.
+            // 安全性: the page owns `menu` for the full lifetime of the main window.
             unsafe {
-                if SetMenu(main_hwnd, next_menu) == 0 {
+                if SetMenu(main_hwnd, menu) == 0 {
                     let error = GetLastError();
-                    destroy_menu_handle(next_menu);
                     return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
                 }
                 DrawMenuBar(main_hwnd);
             }
         }
 
-        *current_menu = next_menu;
-        if !previous_menu.is_null() {
-            destroy_menu_handle(previous_menu);
-        }
+        *current_menu = menu;
 
         self.apply_options(options, processor_count);
 
@@ -515,6 +559,11 @@ impl DialogPage {
         unsafe {
             ShowWindow(self.hwnd, SW_SHOW);
             SetWindowPos(self.hwnd, null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        }
+        if matches!(&self.state, PageState::Performance(_)) {
+            // Hidden-page prewarming cannot paint child windows. Commit the complete performance
+            // surface synchronously after it becomes visible so no template-layout frame escapes.
+            redraw_performance_page(self.hwnd);
         }
 
         match self.initial_focus {
@@ -542,8 +591,11 @@ impl DialogPage {
 
     pub fn timer_event(&mut self, options: &Options, processor_count: usize, force: bool) {
         // 定时刷新同样走统一入口，避免主框架需要知道每个页面各自的刷新细节。
-        self.state
-            .timer_event(self.hwnd, self.main_hwnd, options, processor_count, force);
+        self.state.timer_event(options, processor_count, force);
+    }
+
+    pub fn apply_system_sample(&mut self, sample: &SystemSample, redraw: bool) -> Result<(), u32> {
+        self.state.apply_system_sample(self.hwnd, sample, redraw)
     }
 
     pub fn redraw_after_layout(&self) {
@@ -573,6 +625,7 @@ impl DialogPage {
             unsafe { DestroyWindow(self.hwnd) };
             self.hwnd = null_mut();
         }
+        self.menu = None;
     }
 
     pub fn handle_process_command(
@@ -758,10 +811,10 @@ unsafe extern "system" fn task_page_proc(
                 }
             }
             PWM_TASK_WORKER_COMPLETE => {
-                if !page.is_null() {
-                    if let PageState::Task(state) = &mut (*page).state {
-                        state.handle_worker_completion();
-                    }
+                if !page.is_null()
+                    && let PageState::Task(state) = &mut (*page).state
+                {
+                    state.handle_worker_completion();
                 }
                 1
             }
@@ -839,10 +892,10 @@ unsafe extern "system" fn proc_page_proc(
                 }
             }
             PWM_PROC_WORKER_COMPLETE => {
-                if !page.is_null() {
-                    if let PageState::Process(state) = &mut (*page).state {
-                        state.handle_worker_completion();
-                    }
+                if !page.is_null()
+                    && let PageState::Process(state) = &mut (*page).state
+                {
+                    state.handle_worker_completion();
                 }
                 1
             }
@@ -888,12 +941,11 @@ unsafe extern "system" fn performance_page_proc(
             }
             WM_CTLCOLORBTN => {
                 let control_id = GetDlgCtrlID(lparam as HWND);
-                if !page.is_null() {
-                    if let PageState::Performance(perf_state) = &(*page).state {
-                        if perf_state.is_graph_control(control_id) {
-                            return GetStockObject(BLACK_BRUSH) as isize;
-                        }
-                    }
+                if !page.is_null()
+                    && let PageState::Performance(perf_state) = &(*page).state
+                    && perf_state.is_graph_control(control_id)
+                {
+                    return GetStockObject(BLACK_BRUSH) as isize;
                 }
                 0
             }
@@ -1010,26 +1062,26 @@ unsafe extern "system" fn network_page_proc(
                 }
             }
             WM_VSCROLL => {
-                if !page.is_null() {
-                    if let PageState::Network(net_state) = &mut (*page).state {
-                        return net_state.handle_vscroll(wparam);
-                    }
+                if !page.is_null()
+                    && let PageState::Network(net_state) = &mut (*page).state
+                {
+                    return net_state.handle_vscroll(wparam);
                 }
                 0
             }
             WM_MOUSEWHEEL => {
-                if !page.is_null() {
-                    if let PageState::Network(net_state) = &mut (*page).state {
-                        return net_state.handle_mouse_wheel(wparam);
-                    }
+                if !page.is_null()
+                    && let PageState::Network(net_state) = &mut (*page).state
+                {
+                    return net_state.handle_mouse_wheel(wparam);
                 }
                 0
             }
             PWM_NET_WORKER_COMPLETE => {
-                if !page.is_null() {
-                    if let PageState::Network(net_state) = &mut (*page).state {
-                        net_state.handle_worker_completion();
-                    }
+                if !page.is_null()
+                    && let PageState::Network(net_state) = &mut (*page).state
+                {
+                    net_state.handle_worker_completion();
                 }
                 0
             }
@@ -1104,10 +1156,10 @@ unsafe extern "system" fn users_page_proc(
                 }
             }
             PWM_USER_WORKER_COMPLETE => {
-                if !page.is_null() {
-                    if let PageState::Users(user_state) = &mut (*page).state {
-                        user_state.handle_worker_completion();
-                    }
+                if !page.is_null()
+                    && let PageState::Users(user_state) = &mut (*page).state
+                {
+                    user_state.handle_worker_completion();
                 }
                 0
             }

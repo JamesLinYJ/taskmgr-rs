@@ -4,6 +4,7 @@
 
 use std::ptr::null;
 
+use windows_sys::Win32::Foundation::{ERROR_GEN_FAILURE, GetLastError};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateMenu, CreatePopupMenu, DestroyMenu, HMENU, MF_CHECKED, MF_DISABLED,
     MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
@@ -44,14 +45,14 @@ pub struct PopupMenu {
 }
 
 impl PopupMenu {
-    pub fn new() -> Option<Self> {
+    pub fn new() -> Result<Self, u32> {
         // `PopupMenu` 拥有一个独立的弹出菜单句柄。
         // 安全性: creating a new menu has no preconditions beyond process Win32 availability.
         let handle = unsafe { CreatePopupMenu() };
         if handle.is_null() {
-            None
+            Err(last_error_or_gen_failure())
         } else {
-            Some(Self { handle })
+            Ok(Self { handle })
         }
     }
 
@@ -67,7 +68,12 @@ impl PopupMenu {
         handle
     }
 
-    pub fn append_item(&mut self, command_id: u16, label: &str, state: MenuItemState) -> bool {
+    pub fn append_item(
+        &mut self,
+        command_id: u16,
+        label: &str,
+        state: MenuItemState,
+    ) -> Result<(), u32> {
         // 统一在这里把 Rust 侧状态翻译成 Win32 `AppendMenuW` 标志位。
         let wide = to_wide_null(label);
         let mut flags = MF_STRING;
@@ -78,16 +84,24 @@ impl PopupMenu {
             flags |= MF_CHECKED;
         }
         // 安全性: `self.handle` is owned by this menu and `wide` is a live NUL-terminated label.
-        unsafe { AppendMenuW(self.handle, flags, usize::from(command_id), wide.as_ptr()) != 0 }
+        if unsafe { AppendMenuW(self.handle, flags, usize::from(command_id), wide.as_ptr()) } == 0 {
+            Err(last_error_or_gen_failure())
+        } else {
+            Ok(())
+        }
     }
 
-    pub fn append_separator(&mut self) -> bool {
+    pub fn append_separator(&mut self) -> Result<(), u32> {
         // 分隔线不携带文本和命令 ID。
         // 安全性: appending a separator does not dereference the null text pointer.
-        unsafe { AppendMenuW(self.handle, MF_SEPARATOR, 0, null()) != 0 }
+        if unsafe { AppendMenuW(self.handle, MF_SEPARATOR, 0, null()) } == 0 {
+            Err(last_error_or_gen_failure())
+        } else {
+            Ok(())
+        }
     }
 
-    pub fn append_submenu(&mut self, label: &str, submenu: PopupMenu) -> bool {
+    pub fn append_submenu(&mut self, label: &str, submenu: PopupMenu) -> Result<(), u32> {
         // 子菜单会接管传入 `PopupMenu` 的句柄所有权。
         let wide = to_wide_null(label);
         let submenu_handle = submenu.into_raw();
@@ -101,10 +115,13 @@ impl PopupMenu {
             ) != 0
         };
         if !appended {
+            let error = last_error_or_gen_failure();
             // 安全性: ownership was taken from `submenu`; on failure this function must release it.
             unsafe { DestroyMenu(submenu_handle) };
+            Err(error)
+        } else {
+            Ok(())
         }
-        appended
     }
 }
 
@@ -125,25 +142,22 @@ pub struct MenuBar {
 }
 
 impl MenuBar {
-    pub fn new() -> Option<Self> {
+    pub fn new() -> Result<Self, u32> {
         // `MenuBar` 对应窗口主菜单，而不是右键弹出菜单。
         // 安全性: creating a new menu bar has no additional preconditions.
         let handle = unsafe { CreateMenu() };
         if handle.is_null() {
-            None
+            Err(last_error_or_gen_failure())
         } else {
-            Some(Self { handle })
+            Ok(Self { handle })
         }
     }
 
-    pub fn into_raw(mut self) -> HMENU {
-        // 转移所有权给窗口，防止 `Drop` 在附加后再次销毁。
-        let handle = self.handle;
-        self.handle = std::ptr::null_mut();
-        handle
+    pub fn as_raw(&self) -> HMENU {
+        self.handle
     }
 
-    pub fn append_submenu(&mut self, label: &str, submenu: PopupMenu) -> bool {
+    pub fn append_submenu(&mut self, label: &str, submenu: PopupMenu) -> Result<(), u32> {
         // 主菜单只接受子级弹出菜单，不直接追加普通命令项。
         let wide = to_wide_null(label);
         let submenu_handle = submenu.into_raw();
@@ -157,11 +171,20 @@ impl MenuBar {
             ) != 0
         };
         if !appended {
+            let error = last_error_or_gen_failure();
             // 安全性: ownership was transferred out of `submenu`; release it on append failure.
             unsafe { DestroyMenu(submenu_handle) };
+            Err(error)
+        } else {
+            Ok(())
         }
-        appended
     }
+}
+
+fn last_error_or_gen_failure() -> u32 {
+    // SAFETY: GetLastError has no preconditions and is called immediately after a menu API fails.
+    let error = unsafe { GetLastError() };
+    if error == 0 { ERROR_GEN_FAILURE } else { error }
 }
 
 impl Drop for MenuBar {

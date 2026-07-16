@@ -6,13 +6,15 @@ use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, RECT};
+use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromRect};
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_BINARY, REG_OPTION_NON_VOLATILE,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_BINARY, REG_OPTION_NON_VOLATILE, RegCloseKey,
+    RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SystemParametersInfoW, SM_CXMAXIMIZED, SM_CYMAXIMIZED, SPI_GETSCREENREADER,
+    GetSystemMetrics, SM_CXMAXIMIZED, SM_CXVIRTUALSCREEN, SM_CYMAXIMIZED, SM_CYVIRTUALSCREEN,
+    SPI_GETSCREENREADER, SystemParametersInfoW,
 };
 
 use crate::resource::{NUM_COLUMN, NUM_PAGES};
@@ -64,8 +66,29 @@ pub enum UpdateSpeed {
     Paused = 3,
 }
 
+impl UpdateSpeed {
+    const fn from_raw(value: i32) -> Option<Self> {
+        match value {
+            x if x == Self::High as i32 => Some(Self::High),
+            x if x == Self::Normal as i32 => Some(Self::Normal),
+            x if x == Self::Low as i32 => Some(Self::Low),
+            x if x == Self::Paused as i32 => Some(Self::Paused),
+            _ => None,
+        }
+    }
+
+    const fn timer_interval(self) -> u32 {
+        match self {
+            Self::High => 500,
+            Self::Normal => 2_000,
+            Self::Low => 4_000,
+            Self::Paused => 0,
+        }
+    }
+}
+
 #[repr(i32)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColumnId {
     // 进程页列枚举，顺序必须和持久化格式保持稳定。
     ImageName = 0,
@@ -109,8 +132,7 @@ impl Default for Options {
         // 默认值尽量贴近经典任务管理器的首次启动体验。
         let mut options = Self {
             cb_size: size_of::<Self>() as u32,
-            timer_interval: update_speed_timer_interval(UpdateSpeed::Normal as i32)
-                .expect("normal update speed has a timer interval"),
+            timer_interval: UpdateSpeed::Normal.timer_interval(),
             view_mode: ViewMode::Details as i32,
             cpu_history_mode: CpuHistoryMode::Panes as i32,
             update_speed: UpdateSpeed::Normal as i32,
@@ -201,15 +223,13 @@ impl Options {
                 return false;
             }
 
-            let loaded_was_valid = loaded.is_valid();
+            let loaded_was_valid = loaded.is_valid(min_width, min_height);
             if !loaded_was_valid {
                 loaded.normalize(min_width, min_height);
             }
             *self = loaded;
-            if !loaded_was_valid {
-                if let Err(error) = self.save() {
-                    record_win32_error("normalized options persistence", error);
-                }
+            if !loaded_was_valid && let Err(error) = self.save() {
+                record_win32_error("normalized options persistence", error);
             }
             loaded_was_valid
         }
@@ -306,21 +326,22 @@ impl Options {
         self.set_flag(FLAG_HIDE_WHEN_MIN, value);
     }
 
-    fn is_valid(&self) -> bool {
+    fn is_valid(&self, min_width: i32, min_height: i32) -> bool {
         // 这里显式校验所有会影响数组索引或窗口状态的字段，
         // 防止损坏的注册表值在后续刷新路径里触发越界或错误状态。
         // 安全性: querying system metrics has no pointer inputs or lifetime requirements.
-        let max_width = unsafe { GetSystemMetrics(SM_CXMAXIMIZED) };
+        let max_width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
         // 安全性: querying system metrics has no pointer inputs or lifetime requirements.
-        let max_height = unsafe { GetSystemMetrics(SM_CYMAXIMIZED) };
+        let max_height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
 
         self.cb_size == size_of::<Self>() as u32
-            && self.window_rect.left <= self.window_rect.right
-            && self.window_rect.top <= self.window_rect.bottom
-            && self.window_rect.left <= max_width
-            && self.window_rect.top <= max_height
-            && self.window_rect.right >= 0
-            && self.window_rect.bottom >= 0
+            && window_rect_is_valid(
+                &self.window_rect,
+                min_width,
+                min_height,
+                max_width,
+                max_height,
+            )
             && self.current_page >= -1
             && self.current_page < NUM_PAGES as i32
             && is_valid_view_mode(self.view_mode)
@@ -342,14 +363,18 @@ impl Options {
         if !is_valid_cpu_history_mode(self.cpu_history_mode) {
             self.cpu_history_mode = defaults.cpu_history_mode;
         }
-        if !is_valid_update_speed(self.update_speed) {
-            self.update_speed = defaults.update_speed;
-        }
+        let update_speed = match UpdateSpeed::from_raw(self.update_speed) {
+            Some(update_speed) => update_speed,
+            None => {
+                self.update_speed = UpdateSpeed::Normal as i32;
+                UpdateSpeed::Normal
+            }
+        };
         if !timer_interval_is_valid(self.update_speed, self.timer_interval) {
             self.timer_interval = if screen_reader_enabled() {
                 0
             } else {
-                update_speed_timer_interval(self.update_speed).unwrap_or(defaults.timer_interval)
+                update_speed.timer_interval()
             };
         }
         if self.current_page < -1 || self.current_page >= NUM_PAGES as i32 {
@@ -358,16 +383,16 @@ impl Options {
         self.flags &= ALL_VALID_FLAGS;
 
         // 安全性: querying system metrics has no pointer inputs or lifetime requirements.
-        let max_width = unsafe { GetSystemMetrics(SM_CXMAXIMIZED) };
+        let max_width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
         // 安全性: querying system metrics has no pointer inputs or lifetime requirements.
-        let max_height = unsafe { GetSystemMetrics(SM_CYMAXIMIZED) };
-        if self.window_rect.left > self.window_rect.right
-            || self.window_rect.top > self.window_rect.bottom
-            || self.window_rect.left > max_width
-            || self.window_rect.top > max_height
-            || self.window_rect.right < 0
-            || self.window_rect.bottom < 0
-        {
+        let max_height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+        if !window_rect_is_valid(
+            &self.window_rect,
+            min_width,
+            min_height,
+            max_width,
+            max_height,
+        ) {
             self.window_rect = defaults.window_rect;
         }
 
@@ -392,6 +417,33 @@ fn modifiers_force_defaults() -> bool {
     }
 }
 
+fn window_rect_is_valid(
+    rect: &RECT,
+    min_width: i32,
+    min_height: i32,
+    max_width: i32,
+    max_height: i32,
+) -> bool {
+    window_rect_dimensions_are_valid(rect, min_width, min_height, max_width, max_height)
+        // 安全性: `rect` is a live RECT and MonitorFromRect only reads it during the call.
+        && !unsafe { MonitorFromRect(rect, MONITOR_DEFAULTTONULL) }.is_null()
+}
+
+fn window_rect_dimensions_are_valid(
+    rect: &RECT,
+    min_width: i32,
+    min_height: i32,
+    max_width: i32,
+    max_height: i32,
+) -> bool {
+    let width = i64::from(rect.right) - i64::from(rect.left);
+    let height = i64::from(rect.bottom) - i64::from(rect.top);
+    width >= i64::from(min_width.max(1))
+        && height >= i64::from(min_height.max(1))
+        && width <= i64::from(max_width.max(min_width).max(1))
+        && height <= i64::from(max_height.max(min_height).max(1))
+}
+
 fn is_valid_view_mode(value: i32) -> bool {
     matches!(
         value,
@@ -409,22 +461,13 @@ fn is_valid_cpu_history_mode(value: i32) -> bool {
 }
 
 fn is_valid_update_speed(value: i32) -> bool {
-    matches!(
-        value,
-        x if x == UpdateSpeed::High as i32
-            || x == UpdateSpeed::Normal as i32
-            || x == UpdateSpeed::Low as i32
-            || x == UpdateSpeed::Paused as i32
-    )
+    UpdateSpeed::from_raw(value).is_some()
 }
 
 pub const fn update_speed_timer_interval(value: i32) -> Option<u32> {
-    match value {
-        x if x == UpdateSpeed::High as i32 => Some(500),
-        x if x == UpdateSpeed::Normal as i32 => Some(2_000),
-        x if x == UpdateSpeed::Low as i32 => Some(4_000),
-        x if x == UpdateSpeed::Paused as i32 => Some(0),
-        _ => None,
+    match UpdateSpeed::from_raw(value) {
+        Some(update_speed) => Some(update_speed.timer_interval()),
+        None => None,
     }
 }
 
@@ -526,9 +569,11 @@ fn screen_reader_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_process_columns, process_columns_are_valid, update_speed_timer_interval,
-        ColumnId, Options, UpdateSpeed, NUM_COLUMN,
+        ColumnId, NUM_COLUMN, Options, UpdateSpeed, normalize_process_columns,
+        process_columns_are_valid, update_speed_timer_interval, window_rect_dimensions_are_valid,
+        window_rect_is_valid,
     };
+    use windows_sys::Win32::Foundation::RECT;
 
     #[test]
     fn process_columns_reject_missing_primary_and_duplicates() {
@@ -600,5 +645,61 @@ mod tests {
             Some(0)
         );
         assert_eq!(update_speed_timer_interval(i32::MAX), None);
+    }
+
+    #[test]
+    fn saved_window_rect_must_meet_the_minimum_size_without_overflowing() {
+        assert!(window_rect_dimensions_are_valid(
+            &RECT {
+                left: 10,
+                top: 20,
+                right: 410,
+                bottom: 320,
+            },
+            300,
+            200,
+            1920,
+            1080,
+        ));
+        assert!(!window_rect_dimensions_are_valid(
+            &RECT {
+                left: 10,
+                top: 20,
+                right: 10,
+                bottom: 320,
+            },
+            300,
+            200,
+            1920,
+            1080,
+        ));
+        assert!(!window_rect_dimensions_are_valid(
+            &RECT {
+                left: i32::MIN,
+                top: 0,
+                right: i32::MAX,
+                bottom: 300,
+            },
+            300,
+            200,
+            1920,
+            1080,
+        ));
+    }
+
+    #[test]
+    fn saved_window_rect_must_intersect_an_attached_monitor() {
+        assert!(!window_rect_is_valid(
+            &RECT {
+                left: i32::MAX - 400,
+                top: i32::MAX - 300,
+                right: i32::MAX,
+                bottom: i32::MAX,
+            },
+            300,
+            200,
+            i32::MAX,
+            i32::MAX,
+        ));
     }
 }

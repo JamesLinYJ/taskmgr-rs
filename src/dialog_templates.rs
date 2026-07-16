@@ -2,11 +2,13 @@
 //! 项目已经移除了 `.rc`，因此主窗口、页面和辅助对话框都通过这里生成内存模板，
 //! 再交给 Win32 的 `CreateDialogIndirectParamW` / `DialogBoxIndirectParamW` 创建。
 
-use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM};
+use windows_sys::Win32::Foundation::{
+    ERROR_GEN_FAILURE, ERROR_RESOURCE_DATA_NOT_FOUND, GetLastError, HINSTANCE, HWND, LPARAM,
+};
 use windows_sys::Win32::UI::Controls::{LVS_OWNERDATA, LVS_REPORT, LVS_SINGLESEL};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateDialogIndirectParamW, DialogBoxIndirectParamW, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON,
-    BS_GROUPBOX, BS_OWNERDRAW, ES_AUTOVSCROLL, ES_MULTILINE, SBS_VERT, WS_BORDER, WS_CAPTION,
+    BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_GROUPBOX, BS_OWNERDRAW, CreateDialogIndirectParamW,
+    DialogBoxIndirectParamW, ES_AUTOVSCROLL, ES_MULTILINE, SBS_VERT, WS_BORDER, WS_CAPTION,
     WS_CHILD, WS_DISABLED, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_THICKFRAME, WS_VISIBLE,
 };
 
@@ -316,7 +318,7 @@ fn build_perf_dialog() -> DialogSpec<'static> {
         frame_control("Totals", IDC_STATIC13, 8, 129, 113, 39),
     ];
 
-    for index in 0..STATIC_CPU_GRAPH_COUNT {
+    for index in 0..TEMPLATE_CPU_GRAPH_COUNT {
         controls.push(ownerdraw_button(
             IDC_CPUGRAPH + index as i32,
             index == 0,
@@ -826,14 +828,14 @@ pub fn create_dialog(
     parent: HWND,
     dialog_proc: DialogProc,
     init_param: LPARAM,
-) -> HWND {
+) -> Result<HWND, u32> {
     let Some(spec) = dialog_spec(dialog_id) else {
-        return std::ptr::null_mut();
+        return Err(ERROR_RESOURCE_DATA_NOT_FOUND);
     };
     let template = DialogTemplateBuilder::new().build(spec);
     // 安全性: the generated template buffer is valid for the duration of the call; Win32 copies
     // or consumes it before returning the dialog handle.
-    unsafe {
+    let hwnd = unsafe {
         CreateDialogIndirectParamW(
             hinstance,
             template.as_ptr() as *const _,
@@ -841,6 +843,13 @@ pub fn create_dialog(
             dialog_proc,
             init_param,
         )
+    };
+    if hwnd.is_null() {
+        // SAFETY: GetLastError is read immediately after CreateDialogIndirectParamW failed.
+        let error = unsafe { GetLastError() };
+        Err(if error == 0 { ERROR_GEN_FAILURE } else { error })
+    } else {
+        Ok(hwnd)
     }
 }
 
@@ -850,14 +859,14 @@ pub fn dialog_box(
     parent: HWND,
     dialog_proc: DialogProc,
     init_param: LPARAM,
-) -> isize {
+) -> Result<isize, u32> {
     let Some(spec) = dialog_spec(dialog_id) else {
-        return -1;
+        return Err(ERROR_RESOURCE_DATA_NOT_FOUND);
     };
     let template = DialogTemplateBuilder::new().build(spec);
     // 安全性: the generated template buffer remains alive while the modal dialog is created and
     // run by `DialogBoxIndirectParamW`.
-    unsafe {
+    let result = unsafe {
         DialogBoxIndirectParamW(
             hinstance,
             template.as_ptr() as *const _,
@@ -865,12 +874,19 @@ pub fn dialog_box(
             dialog_proc,
             init_param,
         )
+    };
+    if result == -1 {
+        // SAFETY: GetLastError is read immediately after DialogBoxIndirectParamW failed.
+        let error = unsafe { GetLastError() };
+        Err(if error == 0 { ERROR_GEN_FAILURE } else { error })
+    } else {
+        Ok(result)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{dialog_spec, DialogTemplateBuilder};
+    use super::{DialogTemplateBuilder, dialog_spec};
     use crate::resource::{
         IDC_NICTOTALS, IDC_PROCLIST, IDC_TASKLIST, IDD_AFFINITY, IDD_MAINWND, IDD_MESSAGE,
         IDD_NETPAGE, IDD_PERFPAGE, IDD_PROCPAGE, IDD_SELECTPROCCOLS, IDD_TASKPAGE, IDD_USERSPAGE,

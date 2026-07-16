@@ -2,7 +2,7 @@
 // 性能页和网络页共享这些底层绘制原语，避免代码重复。
 use windows_sys::Win32::Foundation::RECT;
 use windows_sys::Win32::Graphics::Gdi::{
-    FillRect, GetStockObject, SetDCBrushColor, BLACK_BRUSH, DC_BRUSH, HBRUSH, HDC,
+    BLACK_BRUSH, DC_BRUSH, FillRect, GetStockObject, HBRUSH, HDC, SetDCBrushColor,
 };
 
 #[derive(Clone, Default)]

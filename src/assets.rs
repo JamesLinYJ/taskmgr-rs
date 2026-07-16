@@ -10,32 +10,35 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_DELETE, VK_ESCAPE, VK_F5, VK_RETURN, VK_TAB,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateAcceleratorTableW, LoadImageW, ACCEL, FCONTROL, FNOINVERT, FSHIFT, FVIRTKEY, HACCEL,
-    HICON, IMAGE_BITMAP, IMAGE_ICON,
+    ACCEL, CreateAcceleratorTableW, FCONTROL, FNOINVERT, FSHIFT, FVIRTKEY, HACCEL, HICON,
+    IMAGE_BITMAP, IMAGE_ICON, LoadImageW,
 };
 
-use crate::resource::{IDC_ENDTASK, IDC_NEXTTAB, IDC_PREVTAB, IDC_SWITCHTO, IDM_HIDE, IDM_REFRESH};
+use crate::resource::{
+    IDC_ENDTASK, IDC_NEXTTAB, IDC_PREVTAB, IDC_SWITCHTO, IDI_DEFAULT, IDI_MAIN, IDI_TRAY0,
+    IDI_TRAY1, IDI_TRAY2, IDI_TRAY3, IDI_TRAY4, IDI_TRAY5, IDI_TRAY6, IDI_TRAY7, IDI_TRAY8,
+    IDI_TRAY9, IDI_TRAY10, IDI_TRAY11, IDM_HIDE, IDM_REFRESH,
+};
 
-pub const MAIN_ICON_RESOURCE: &str = "APP_MAIN_ICON";
-pub const DEFAULT_ICON_RESOURCE: &str = "APP_DEFAULT_ICON";
+pub const MAIN_ICON_RESOURCE: u16 = IDI_MAIN;
+pub const DEFAULT_ICON_RESOURCE: u16 = IDI_DEFAULT;
 pub const STRIP_LIT_BITMAP_RESOURCE: &str = "APP_BITMAP_STRIP_LIT";
 pub const STRIP_LIT_RED_BITMAP_RESOURCE: &str = "APP_BITMAP_STRIP_LIT_RED";
 pub const STRIP_UNLIT_BITMAP_RESOURCE: &str = "APP_BITMAP_STRIP_UNLIT";
 
-pub const TRAY_ICON_RESOURCES: [&str; 12] = [
-    "APP_TRAY_0_ICON",
-    "APP_TRAY_1_ICON",
-    "APP_TRAY_2_ICON",
-    "APP_TRAY_3_ICON",
-    "APP_TRAY_4_ICON",
-    "APP_TRAY_5_ICON",
-    "APP_TRAY_6_ICON",
-    "APP_TRAY_7_ICON",
-    "APP_TRAY_8_ICON",
-    "APP_TRAY_9_ICON",
-    "APP_TRAY_10_ICON",
-    "APP_TRAY_11_ICON",
+pub const TRAY_ICON_RESOURCES: [u16; 12] = [
+    IDI_TRAY0, IDI_TRAY1, IDI_TRAY2, IDI_TRAY3, IDI_TRAY4, IDI_TRAY5, IDI_TRAY6, IDI_TRAY7,
+    IDI_TRAY8, IDI_TRAY9, IDI_TRAY10, IDI_TRAY11,
 ];
+
+const _: () = {
+    assert!(MAIN_ICON_RESOURCE < DEFAULT_ICON_RESOURCE);
+    let mut index = 0;
+    while index < TRAY_ICON_RESOURCES.len() {
+        assert!(MAIN_ICON_RESOURCE < TRAY_ICON_RESOURCES[index]);
+        index += 1;
+    }
+};
 
 fn to_wide_resource_name(resource_name: &str) -> Vec<u16> {
     resource_name
@@ -49,16 +52,17 @@ fn current_module() -> HINSTANCE {
     unsafe { GetModuleHandleW(null::<u16>()) as HINSTANCE }
 }
 
-pub fn load_icon_resource(resource_name: &str, width: i32, height: i32, flags: u32) -> HICON {
+pub fn load_icon_resource(resource_id: u16, width: i32, height: i32, flags: u32) -> HICON {
     let module = current_module();
     if module.is_null() {
         return null_mut();
     }
 
-    let wide = to_wide_resource_name(resource_name);
-    // 安全性: `wide` is a live, NUL-terminated UTF-16 resource name and `LoadImageW` only
-    // borrows it for the duration of the call.
-    unsafe { LoadImageW(module, wide.as_ptr(), IMAGE_ICON, width, height, flags) as HICON }
+    // Win32 encodes integer resource IDs as pointer-sized values whose high word is zero.
+    let resource = resource_id as usize as *const u16;
+    // 安全性: `resource` is a valid MAKEINTRESOURCE-style value and `module` is the current
+    // executable image containing the compiled icon table.
+    unsafe { LoadImageW(module, resource, IMAGE_ICON, width, height, flags) as HICON }
 }
 
 pub fn load_bitmap_resource(resource_name: &str) -> HBITMAP {

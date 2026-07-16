@@ -9,37 +9,37 @@ use std::slice;
 use std::sync::mpsc::TryRecvError;
 
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_INVALID_PARAMETER, HWND, LPARAM,
+    ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_INVALID_PARAMETER, GetLastError, HWND, LPARAM,
     RECT, WPARAM,
 };
 
 use windows_sys::Win32::System::RemoteDesktop::{
-    WTSActive, WTSClientName, WTSConnectQuery, WTSConnected, WTSDisconnectSession, WTSDisconnected,
-    WTSDown, WTSEnumerateSessionsW, WTSIdle, WTSInit, WTSListen, WTSLogoffSession,
-    WTSQuerySessionInformationW, WTSReset, WTSSendMessageW, WTSSessionInfo, WTSShadow, WTSINFOW,
-    WTS_CONNECTSTATE_CLASS, WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW,
+    WTS_CONNECTSTATE_CLASS, WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW, WTSActive, WTSClientName,
+    WTSConnectQuery, WTSConnected, WTSDisconnectSession, WTSDisconnected, WTSDown,
+    WTSEnumerateSessionsW, WTSINFOW, WTSIdle, WTSInit, WTSListen, WTSLogoffSession,
+    WTSQuerySessionInformationW, WTSReset, WTSSendMessageW, WTSSessionInfo, WTSShadow,
 };
 use windows_sys::Win32::UI::Controls::{
-    LVCFMT_LEFT, LVCFMT_RIGHT, LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
+    LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW,
     LVIF_PARAM, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETECOLUMN,
     LVM_DELETEITEM, LVM_ENSUREVISIBLE, LVM_GETITEMCOUNT, LVM_GETITEMW, LVM_GETNEXTITEM,
-    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETITEMSTATE, LVM_SETITEMW, LVNI_SELECTED,
-    LVN_COLUMNCLICK, LVN_ITEMCHANGED, NMLISTVIEW,
+    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETITEMSTATE, LVM_SETITEMW, LVN_COLUMNCLICK,
+    LVN_ITEMCHANGED, LVNI_SELECTED, NMLISTVIEW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EndDialog, GetClientRect,
-    GetDialogBaseUnits, GetDlgItem, GetWindowTextLengthW, GetWindowTextW, MessageBoxW,
-    SendMessageW, TrackPopupMenuEx, HMENU, IDCANCEL, IDOK, IDYES, MB_DEFBUTTON2, MB_ICONERROR,
-    MB_ICONEXCLAMATION, MB_ICONINFORMATION, MB_OK, MB_TOPMOST, MB_YESNO, MF_BYCOMMAND, MF_CHECKED,
-    MF_DISABLED, MF_GRAYED, MF_UNCHECKED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    TPM_RETURNCMD, WM_COMMAND, WM_INITDIALOG, WM_SETREDRAW,
+    GetDialogBaseUnits, GetDlgItem, GetWindowTextLengthW, GetWindowTextW, HMENU, IDCANCEL, IDOK,
+    IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONEXCLAMATION, MB_ICONINFORMATION, MB_OK, MB_TOPMOST,
+    MB_YESNO, MF_BYCOMMAND, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_UNCHECKED, MessageBoxW,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, TPM_RETURNCMD,
+    TrackPopupMenuEx, WM_COMMAND, WM_INITDIALOG, WM_SETREDRAW,
 };
 
 use crate::background_worker::BackgroundWorker;
 use crate::dialog_templates::dialog_box;
 use crate::language::{
-    localize_dialog, session_state, text, user_column_titles, user_session_column_title, TextKey,
+    TextKey, localize_dialog, session_state, text, user_column_titles, user_session_column_title,
 };
 use crate::menus::build_popup_menu;
 use crate::options::Options;
@@ -48,9 +48,8 @@ use crate::resource::{
     IDM_SENDMESSAGE, IDM_SHOWDOMAINNAMES, IDR_USER_CONTEXT, PWM_USER_WORKER_COMPLETE,
 };
 use crate::winutil::{
-    destroy_menu_handle, finish_list_view_update, get_window_userdata, loword, record_win32_error,
+    OwnedWtsMemory, finish_list_view_update, get_window_userdata, loword, record_win32_error,
     set_window_userdata, subclass_list_view, to_wide_null, window_rect_relative_to_page,
-    OwnedWtsMemory,
 };
 const DEFSPACING_BASE: i32 = 3;
 const DLG_SCALE_X: i32 = 4;
@@ -61,6 +60,12 @@ struct UserSessionIdentity {
     logon_time_100ns: i64,
     user_name: String,
     domain_name: String,
+}
+
+impl UserSessionIdentity {
+    fn is_verified(&self) -> bool {
+        self.logon_time_100ns > 0 && !self.user_name.is_empty()
+    }
 }
 
 struct UserSessionSnapshot {
@@ -162,7 +167,7 @@ impl UserPageState {
         }
 
         self.worker = Some(BackgroundWorker::spawn(
-            "rtaskmgr-user-sampler",
+            "taskmgr-rs-user-sampler",
             PWM_USER_WORKER_COMPLETE,
             |()| collect_user_sessions(),
         )?);
@@ -298,13 +303,18 @@ impl UserPageState {
                 return;
             }
 
-            let Some(popup) = build_popup_menu(IDR_USER_CONTEXT) else {
-                return;
+            let popup = match build_popup_menu(IDR_USER_CONTEXT) {
+                Ok(popup) => popup,
+                Err(error) => {
+                    record_win32_error("user popup menu creation", error);
+                    return;
+                }
             };
+            let popup_handle = popup.as_raw();
 
-            self.update_menu_state(popup, &selected);
-            let command = TrackPopupMenuEx(popup, TPM_RETURNCMD, x, y, self.hwnd, null_mut());
-            destroy_menu_handle(popup);
+            self.update_menu_state(popup_handle, &selected);
+            let command =
+                TrackPopupMenuEx(popup_handle, TPM_RETURNCMD, x, y, self.hwnd, null_mut());
             if command != 0 {
                 self.handle_command(command as u16);
             }
@@ -677,19 +687,20 @@ impl UserPageState {
             // “发送消息”只要有选择就可用；
             // “断开”则不能对已经断开的会话再次执行。
             let selected = self.selected_session_identities();
-            let send_enabled = !selected.is_empty();
-            let mut disconnect_enabled = !selected.is_empty();
-            let logoff_enabled = !selected.is_empty();
+            let actionable =
+                !selected.is_empty() && selected.iter().all(UserSessionIdentity::is_verified);
+            let send_enabled = actionable;
+            let mut disconnect_enabled = actionable;
+            let logoff_enabled = actionable;
 
             for identity in &selected {
                 if let Some(session) = self
                     .sessions
                     .iter()
                     .find(|entry| entry.identity == *identity)
+                    && session.status == session_state("Disconnected")
                 {
-                    if session.status == session_state("Disconnected") {
-                        disconnect_enabled = false;
-                    }
+                    disconnect_enabled = false;
                 }
             }
 
@@ -754,19 +765,20 @@ impl UserPageState {
     fn update_menu_state(&self, popup: HMENU, selected: &[UserSessionIdentity]) {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
-            let send_enabled = !selected.is_empty();
-            let mut disconnect_enabled = !selected.is_empty();
-            let logoff_enabled = !selected.is_empty();
+            let actionable =
+                !selected.is_empty() && selected.iter().all(UserSessionIdentity::is_verified);
+            let send_enabled = actionable;
+            let mut disconnect_enabled = actionable;
+            let logoff_enabled = actionable;
 
             for identity in selected {
                 if let Some(session) = self
                     .sessions
                     .iter()
                     .find(|entry| entry.identity == *identity)
+                    && session.status == session_state("Disconnected")
                 {
-                    if session.status == session_state("Disconnected") {
-                        disconnect_enabled = false;
-                    }
+                    disconnect_enabled = false;
                 }
             }
 
@@ -814,15 +826,22 @@ impl UserPageState {
             }
 
             let mut result = MessageDialogResult::default();
-            if dialog_box(
+            match dialog_box(
                 self.hinstance as _,
                 IDD_MESSAGE,
                 self.hwnd,
                 Some(message_dialog_proc),
                 &mut result as *mut _ as LPARAM,
-            ) != IDOK as isize
-            {
-                return;
+            ) {
+                Ok(dialog_result) if dialog_result == IDOK as isize => {}
+                Ok(_) => return,
+                Err(error) => {
+                    self.show_command_failure_with_error(
+                        text(TextKey::MessageCouldNotBeSent),
+                        error,
+                    );
+                    return;
+                }
             }
 
             if let Err(error) = validate_session_identities(&selected) {
@@ -1081,7 +1100,7 @@ fn validate_observed_session_identity(
     expected: &UserSessionIdentity,
     current: &UserSessionIdentity,
 ) -> Result<(), u32> {
-    if current == expected {
+    if expected.is_verified() && current.is_verified() && current == expected {
         Ok(())
     } else {
         Err(ERROR_INVALID_PARAMETER)
@@ -1096,11 +1115,7 @@ fn validate_session_identities(expected: &[UserSessionIdentity]) -> Result<(), u
 }
 
 fn win32_error_or_gen_failure(error: u32) -> u32 {
-    if error == 0 {
-        ERROR_GEN_FAILURE
-    } else {
-        error
-    }
+    if error == 0 { ERROR_GEN_FAILURE } else { error }
 }
 
 fn query_session_string(session_id: u32, info_class: i32) -> Result<String, u32> {
@@ -1199,31 +1214,33 @@ unsafe extern "system" fn message_dialog_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> isize {
-    // 发送消息对话框只负责收集标题和正文，并通过窗口用户数据回写结果结构体。
-    match msg {
-        WM_INITDIALOG => {
-            set_window_userdata(hwnd, lparam);
-            localize_dialog(hwnd, IDD_MESSAGE);
-            1
-        }
-        WM_COMMAND => match i32::from(loword(wparam)) {
-            IDOK => {
-                let result = &mut *(get_window_userdata(hwnd) as *mut MessageDialogResult);
-                result.title = get_dialog_item_text(hwnd, IDC_MESSAGE_TITLE);
-                result.body = get_dialog_item_text(hwnd, IDC_MESSAGE_MESSAGE);
-                if result.body.trim().is_empty() {
-                    return 1;
+    unsafe {
+        // 发送消息对话框只负责收集标题和正文，并通过窗口用户数据回写结果结构体。
+        match msg {
+            WM_INITDIALOG => {
+                set_window_userdata(hwnd, lparam);
+                localize_dialog(hwnd, IDD_MESSAGE);
+                1
+            }
+            WM_COMMAND => match i32::from(loword(wparam)) {
+                IDOK => {
+                    let result = &mut *(get_window_userdata(hwnd) as *mut MessageDialogResult);
+                    result.title = get_dialog_item_text(hwnd, IDC_MESSAGE_TITLE);
+                    result.body = get_dialog_item_text(hwnd, IDC_MESSAGE_MESSAGE);
+                    if result.body.trim().is_empty() {
+                        return 1;
+                    }
+                    EndDialog(hwnd, IDOK as isize);
+                    1
                 }
-                EndDialog(hwnd, IDOK as isize);
-                1
-            }
-            IDCANCEL => {
-                EndDialog(hwnd, IDCANCEL as isize);
-                1
-            }
+                IDCANCEL => {
+                    EndDialog(hwnd, IDCANCEL as isize);
+                    1
+                }
+                _ => 0,
+            },
             _ => 0,
-        },
-        _ => 0,
+        }
     }
 }
 
@@ -1294,6 +1311,16 @@ mod tests {
 
         assert_eq!(
             validate_observed_session_identity(&expected, &current),
+            Err(ERROR_INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn session_without_logon_time_is_not_actionable() {
+        let expected = identity(1, 0);
+        assert!(!expected.is_verified());
+        assert_eq!(
+            validate_observed_session_identity(&expected, &expected),
             Err(ERROR_INVALID_PARAMETER)
         );
     }
