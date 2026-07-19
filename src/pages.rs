@@ -41,8 +41,9 @@ use crate::resource::{
     IDC_NICTOTALS, IDC_PROCLIST, IDC_TASKLIST, IDC_USERLIST, IDD_CPUPAGE, IDD_GPUPAGE, IDD_NETPAGE,
     IDD_PERFPAGE, IDD_PROCPAGE, IDD_TASKPAGE, IDD_USERSPAGE, IDR_MAINMENU_CPU, IDR_MAINMENU_GPU,
     IDR_MAINMENU_NET, IDR_MAINMENU_PERF, IDR_MAINMENU_PROC, IDR_MAINMENU_TASK, IDR_MAINMENU_USER,
-    PWM_CPU_WORKER_COMPLETE, PWM_GPU_WORKER_COMPLETE, PWM_NET_WORKER_COMPLETE,
-    PWM_PROC_WORKER_COMPLETE, PWM_TASK_WORKER_COMPLETE, PWM_USER_WORKER_COMPLETE,
+    PWM_CPU_FIRMWARE_WORKER_COMPLETE, PWM_CPU_WORKER_COMPLETE, PWM_GPU_METADATA_WORKER_COMPLETE,
+    PWM_GPU_WORKER_COMPLETE, PWM_NET_WORKER_COMPLETE, PWM_PROC_WORKER_COMPLETE,
+    PWM_TASK_WORKER_COMPLETE, PWM_USER_WORKER_COMPLETE,
 };
 use crate::runtime_menu::MenuBar;
 use crate::system_sampler::SystemSample;
@@ -1197,7 +1198,15 @@ unsafe extern "system" fn cpu_page_proc(
                 if !page.is_null()
                     && let PageState::Cpu(cpu_state) = &mut (*page).state
                 {
-                    cpu_state.handle_worker_completion();
+                    cpu_state.handle_native_worker_completion();
+                }
+                1
+            }
+            PWM_CPU_FIRMWARE_WORKER_COMPLETE => {
+                if !page.is_null()
+                    && let PageState::Cpu(cpu_state) = &mut (*page).state
+                {
+                    cpu_state.handle_firmware_worker_completion();
                 }
                 1
             }
@@ -1302,6 +1311,14 @@ unsafe extern "system" fn gpu_page_proc(
                     && let PageState::Gpu(gpu_state) = &mut (*page).state
                 {
                     gpu_state.handle_worker_completion();
+                }
+                1
+            }
+            PWM_GPU_METADATA_WORKER_COMPLETE => {
+                if !page.is_null()
+                    && let PageState::Gpu(gpu_state) = &mut (*page).state
+                {
+                    gpu_state.handle_metadata_worker_completion();
                 }
                 1
             }

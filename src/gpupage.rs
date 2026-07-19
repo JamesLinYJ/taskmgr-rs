@@ -8,11 +8,11 @@
 //   作者:       OpenAI Codex
 // --------------------------------------------------------------------------
 
-//! Owns the classic GPU page controls, histories, worker and layout.
+//! Owns the classic GPU page controls, histories, workers and layout.
 //!
 //! The page never performs DXGI, PDH, SetupAPI or D3D queries on the UI thread. Completed worker
-//! snapshots are committed atomically; a failed refresh leaves the previous histories and text
-//! visible while exposing a stale-data status.
+//! inventory, dynamic, and metadata snapshots are committed independently by generation. A failed
+//! source leaves other trusted content visible and exposes loading, partial, or stale state.
 
 use std::array;
 use std::collections::{HashMap, HashSet};
@@ -46,8 +46,9 @@ use crate::gpu_layout::{
     DETAIL_ROW_COUNT, ENGINE_SLOT_COUNT, GpuLayoutMetrics, GpuLayoutPlan, compute_gpu_layout,
 };
 use crate::gpu_sampler::{
-    GpuAdapterId, GpuAdapterSample, GpuCollectOutcome, GpuCollector, GpuEngineId, GpuEngineKind,
-    GpuSampleError, GpuSnapshot,
+    GpuAdapterId, GpuAdapterInfo, GpuAdapterMetadata, GpuAdapterSample, GpuCollectOutcome,
+    GpuCollector, GpuDynamicSnapshot, GpuEngineId, GpuEngineKind, GpuInventorySnapshot,
+    GpuMetadataCollector, GpuMetadataRequest, GpuMetadataSnapshot, GpuSampleError,
 };
 use crate::language::{TextKey, text};
 use crate::options::Options;
@@ -66,7 +67,7 @@ use crate::resource::{
     IDC_GPU_SHARED_MEMORY_LABEL, IDC_GPU_SHARED_MEMORY_VALUE, IDC_GPU_STATUS,
     IDC_GPU_TEMPERATURE_LABEL, IDC_GPU_TEMPERATURE_VALUE, IDC_GPU_TOTAL_MEMORY_LABEL,
     IDC_GPU_TOTAL_MEMORY_VALUE, IDC_GPU_UTILIZATION_LABEL, IDC_GPU_UTILIZATION_VALUE,
-    PWM_GPU_WORKER_COMPLETE,
+    PWM_GPU_METADATA_WORKER_COMPLETE, PWM_GPU_WORKER_COMPLETE,
 };
 use crate::winutil::{
     pause_redraw_for_visible_windows, record_win32_error, redraw_window_tree,
@@ -95,12 +96,16 @@ const GPU_DETAIL_ROWS: [(i32, i32); DETAIL_ROW_COUNT] = [
 ];
 
 type GpuWorkerCompletion = Result<GpuCollectOutcome, GpuSampleError>;
+type GpuMetadataCompletion = Result<GpuMetadataSnapshot, GpuSampleError>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum GpuPageStatus {
     #[default]
     Loading,
+    LoadingPerformance,
+    LoadingDetails,
     Ready,
+    Partial,
     NoHardware,
     Unsupported,
     Failed,
@@ -180,13 +185,20 @@ pub(crate) struct GpuPageState {
     no_title: bool,
     layout_metrics: Option<GpuLayoutMetrics>,
     chart_renderer: ChartRenderer,
-    worker: Option<BackgroundWorker<(), GpuWorkerCompletion>>,
-    collection_in_flight: bool,
-    refresh_requested: bool,
-    snapshot: Option<GpuSnapshot>,
+    sample_worker: Option<BackgroundWorker<(), GpuWorkerCompletion>>,
+    metadata_worker: Option<BackgroundWorker<GpuMetadataRequest, GpuMetadataCompletion>>,
+    sample_collection_in_flight: bool,
+    metadata_collection_in_flight: bool,
+    sample_refresh_requested: bool,
+    queued_metadata_request: Option<GpuMetadataRequest>,
+    inventory: Option<GpuInventorySnapshot>,
+    dynamic_snapshot: Option<GpuDynamicSnapshot>,
+    metadata: HashMap<GpuAdapterId, GpuAdapterMetadata>,
     status: GpuPageStatus,
-    last_refresh_error: Option<GpuSampleError>,
-    last_aux_errors: Vec<GpuSampleError>,
+    last_dynamic_error: Option<GpuSampleError>,
+    last_metadata_error: Option<GpuSampleError>,
+    last_dynamic_aux_errors: Vec<GpuSampleError>,
+    last_metadata_aux_errors: Vec<GpuSampleError>,
     selected_adapter: Option<GpuAdapterId>,
     adapter_signature: Vec<(GpuAdapterId, String)>,
     adapter_options: Vec<GpuAdapterId>,
@@ -209,13 +221,20 @@ impl GpuPageState {
             no_title: false,
             layout_metrics: None,
             chart_renderer: ChartRenderer::new(),
-            worker: None,
-            collection_in_flight: false,
-            refresh_requested: false,
-            snapshot: None,
+            sample_worker: None,
+            metadata_worker: None,
+            sample_collection_in_flight: false,
+            metadata_collection_in_flight: false,
+            sample_refresh_requested: false,
+            queued_metadata_request: None,
+            inventory: None,
+            dynamic_snapshot: None,
+            metadata: HashMap::new(),
             status: GpuPageStatus::Loading,
-            last_refresh_error: None,
-            last_aux_errors: Vec::new(),
+            last_dynamic_error: None,
+            last_metadata_error: None,
+            last_dynamic_aux_errors: Vec::new(),
+            last_metadata_aux_errors: Vec::new(),
             selected_adapter: None,
             adapter_signature: Vec::new(),
             adapter_options: Vec::new(),
@@ -246,7 +265,7 @@ impl GpuPageState {
         self.hwnd_tabs = hwnd_tabs;
         self.layout_metrics = Some(self.capture_layout_metrics()?);
         self.sync_graph_fonts()?;
-        self.start_worker()?;
+        self.start_workers()?;
         self.update_status_text();
         self.clear_visible_values();
         self.size_page();
@@ -279,18 +298,28 @@ impl GpuPageState {
         Ok(())
     }
 
-    fn start_worker(&mut self) -> Result<(), u32> {
-        if self.worker.is_some() {
+    fn start_workers(&mut self) -> Result<(), u32> {
+        if self.sample_worker.is_some() && self.metadata_worker.is_some() {
             return Ok(());
         }
-        self.worker = Some(BackgroundWorker::spawn_initialized(
+        let sample_worker = BackgroundWorker::spawn_initialized(
             "taskmgr-rs-gpu-worker",
             PWM_GPU_WORKER_COMPLETE,
             || {
                 let mut collector = GpuCollector::new();
                 move |()| collector.collect()
             },
-        )?);
+        )?;
+        let metadata_worker = BackgroundWorker::spawn_initialized(
+            "taskmgr-rs-gpu-metadata-worker",
+            PWM_GPU_METADATA_WORKER_COMPLETE,
+            || {
+                let mut collector = GpuMetadataCollector::new();
+                move |request| collector.collect(request)
+            },
+        )?;
+        self.sample_worker = Some(sample_worker);
+        self.metadata_worker = Some(metadata_worker);
         Ok(())
     }
 
@@ -313,60 +342,89 @@ impl GpuPageState {
         if self.hwnd.is_null() {
             return;
         }
-        if self.collection_in_flight {
-            self.refresh_requested = true;
+        if self.sample_collection_in_flight {
+            self.sample_refresh_requested = true;
             return;
         }
-        let Some(worker) = self.worker.as_ref() else {
-            self.handle_refresh_error(GpuSampleError::Win32 {
+        let Some(worker) = self.sample_worker.as_ref() else {
+            self.handle_dynamic_error(GpuSampleError::Win32 {
                 context: "GPU worker state",
                 code: ERROR_BROKEN_PIPE,
             });
             return;
         };
         match worker.submit((), self.hwnd) {
-            Ok(()) => self.collection_in_flight = true,
-            Err(code) => self.handle_refresh_error(GpuSampleError::Win32 {
+            Ok(()) => self.sample_collection_in_flight = true,
+            Err(code) => self.handle_dynamic_error(GpuSampleError::Win32 {
                 context: "GPU worker request",
                 code,
             }),
         }
     }
 
+    fn request_metadata(&mut self, request: GpuMetadataRequest) {
+        if self.metadata_collection_in_flight {
+            self.queued_metadata_request = Some(request);
+            return;
+        }
+        let Some(worker) = self.metadata_worker.as_ref() else {
+            self.handle_metadata_error(GpuSampleError::Win32 {
+                context: "GPU metadata worker state",
+                code: ERROR_BROKEN_PIPE,
+            });
+            return;
+        };
+        match worker.submit(request, self.hwnd) {
+            Ok(()) => {
+                self.metadata_collection_in_flight = true;
+                self.update_status();
+            }
+            Err(code) => self.handle_metadata_error(GpuSampleError::Win32 {
+                context: "GPU metadata worker request",
+                code,
+            }),
+        }
+    }
+
     pub(crate) fn handle_worker_completion(&mut self) {
-        let mut completion = None;
-        if let Some(worker) = self.worker.as_ref() {
+        let mut completions = Vec::new();
+        let mut disconnected = false;
+        if let Some(worker) = self.sample_worker.as_ref() {
             loop {
                 match worker.try_recv() {
-                    Ok(value) => completion = Some(value),
+                    Ok(value) => completions.push(value),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        if completion.is_none() {
-                            completion = Some(Err(GpuSampleError::Win32 {
-                                context: "GPU worker completion channel",
-                                code: ERROR_BROKEN_PIPE,
-                            }));
-                        }
+                        disconnected = true;
                         break;
                     }
                 }
             }
         }
-        self.collection_in_flight = false;
-        let mut request_follow_up = self.refresh_requested;
-        self.refresh_requested = false;
+        self.sample_collection_in_flight = false;
+        let mut request_follow_up = self.sample_refresh_requested;
+        self.sample_refresh_requested = false;
+        if disconnected {
+            self.sample_worker = None;
+            self.handle_dynamic_error(GpuSampleError::Win32 {
+                context: "GPU worker completion channel",
+                code: ERROR_BROKEN_PIPE,
+            });
+        }
 
-        if let Some(completion) = completion {
+        for completion in completions {
             match completion {
-                Ok(GpuCollectOutcome::Primed) => {
+                Ok(GpuCollectOutcome::Inventory(inventory)) => {
+                    self.commit_inventory(inventory);
                     request_follow_up = true;
-                    if self.snapshot.is_none() {
-                        self.status = GpuPageStatus::Loading;
-                        self.update_status_text();
+                }
+                Ok(GpuCollectOutcome::AwaitingBaseline { generation }) => {
+                    if self.inventory.as_ref().map(|value| value.generation) == Some(generation) {
+                        self.update_status();
                     }
                 }
-                Ok(GpuCollectOutcome::Snapshot(snapshot)) => self.commit_snapshot(snapshot),
-                Err(error) => self.handle_refresh_error(error),
+                Ok(GpuCollectOutcome::Dynamic(snapshot)) => self.commit_dynamic_snapshot(snapshot),
+                Err(error) => self.handle_dynamic_error(error),
             }
         }
 
@@ -375,82 +433,198 @@ impl GpuPageState {
         }
     }
 
-    fn commit_snapshot(&mut self, snapshot: GpuSnapshot) {
-        if !snapshot_timestamp_advances(
-            self.snapshot.as_ref().map(|current| current.timestamp_ms),
-            snapshot.timestamp_ms,
-        ) {
-            self.handle_refresh_error(GpuSampleError::InvalidData {
-                context: "GPU snapshot timestamp is not monotonic",
+    pub(crate) fn handle_metadata_worker_completion(&mut self) {
+        let mut completions = Vec::new();
+        let mut disconnected = false;
+        if let Some(worker) = self.metadata_worker.as_ref() {
+            loop {
+                match worker.try_recv() {
+                    Ok(value) => completions.push(value),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        self.metadata_collection_in_flight = false;
+        if disconnected {
+            self.metadata_worker = None;
+            self.handle_metadata_error(GpuSampleError::Win32 {
+                context: "GPU metadata worker completion channel",
+                code: ERROR_BROKEN_PIPE,
+            });
+        }
+        for completion in completions {
+            match completion {
+                Ok(snapshot) => self.commit_metadata_snapshot(snapshot),
+                Err(error) => self.handle_metadata_error(error),
+            }
+        }
+        if let Some(request) = self.queued_metadata_request.take() {
+            self.request_metadata(request);
+        } else {
+            self.update_status();
+        }
+    }
+
+    fn commit_inventory(&mut self, inventory: GpuInventorySnapshot) {
+        let active_ids: HashSet<_> = inventory.adapters.iter().map(|info| info.id).collect();
+        if active_ids.len() != inventory.adapters.len() {
+            self.handle_dynamic_error(GpuSampleError::InvalidData {
+                context: "duplicate GPU inventory adapter identity",
             });
             return;
         }
         let generation_changed = snapshot_generation_changed(
-            self.snapshot.as_ref().map(|current| current.generation),
-            snapshot.generation,
+            self.inventory.as_ref().map(|current| current.generation),
+            inventory.generation,
         );
         if generation_changed {
+            self.dynamic_snapshot = None;
+            self.metadata.clear();
             self.histories.clear();
             self.current_engine_options.clear();
-            self.last_aux_errors.clear();
+            self.last_dynamic_aux_errors.clear();
+            self.last_metadata_aux_errors.clear();
+            self.last_dynamic_error = None;
+            self.last_metadata_error = None;
         }
-        self.record_aux_errors(&snapshot);
-
-        let active_ids: HashSet<_> = snapshot
-            .adapters
-            .iter()
-            .map(|adapter| adapter.info.id)
-            .collect();
         self.histories.retain(|id, _| active_ids.contains(id));
         self.engine_selections
             .retain(|id, _| active_ids.contains(id));
-        for adapter in &snapshot.adapters {
-            self.histories
-                .entry(adapter.info.id)
-                .or_insert_with(AdapterHistory::new)
-                .push(adapter);
-        }
 
-        let signature: Vec<_> = snapshot
+        let signature: Vec<_> = inventory
             .adapters
             .iter()
-            .map(|adapter| (adapter.info.id, adapter.info.name.clone()))
+            .map(|info| (info.id, info.name.clone()))
             .collect();
         let adapter_list_changed = self.adapter_signature != signature;
         self.adapter_signature = signature;
-        self.snapshot = Some(snapshot);
-        self.last_refresh_error = None;
-        self.status = if active_ids.is_empty() {
-            GpuPageStatus::NoHardware
-        } else {
-            GpuPageStatus::Ready
-        };
+        self.inventory = Some(inventory);
 
         if self
             .selected_adapter
             .is_none_or(|selected| !active_ids.contains(&selected))
         {
             self.selected_adapter = self
-                .snapshot
+                .inventory
                 .as_ref()
                 .and_then(|snapshot| snapshot.adapters.first())
-                .map(|adapter| adapter.info.id);
+                .map(|info| info.id);
         }
         if adapter_list_changed {
             self.rebuild_adapter_combo();
         }
-        self.graph_scroll_offset = (self.graph_scroll_offset + 2) % GRAPH_GRID;
+
+        if let Some(inventory) = self.inventory.as_ref()
+            && !inventory.adapters.is_empty()
+        {
+            self.request_metadata(GpuMetadataRequest {
+                generation: inventory.generation,
+                adapters: inventory.adapters.clone(),
+            });
+        }
+        self.update_status();
         self.sync_selected_adapter();
     }
 
-    fn handle_refresh_error(&mut self, error: GpuSampleError) {
-        if self.last_refresh_error.as_ref() != Some(&error) {
+    fn commit_dynamic_snapshot(&mut self, snapshot: GpuDynamicSnapshot) {
+        let Some(inventory) = self.inventory.as_ref() else {
+            self.handle_dynamic_error(GpuSampleError::InvalidData {
+                context: "GPU dynamic snapshot before inventory",
+            });
+            return;
+        };
+        if snapshot.generation != inventory.generation {
+            return;
+        }
+        if !snapshot_timestamp_advances(
+            self.dynamic_snapshot
+                .as_ref()
+                .map(|current| current.timestamp_ms),
+            snapshot.timestamp_ms,
+        ) {
+            self.handle_dynamic_error(GpuSampleError::InvalidData {
+                context: "GPU snapshot timestamp is not monotonic",
+            });
+            return;
+        }
+        let active_ids: HashSet<_> = snapshot
+            .adapters
+            .iter()
+            .map(|adapter| adapter.info.id)
+            .collect();
+        let inventory_ids: HashSet<_> = inventory.adapters.iter().map(|info| info.id).collect();
+        if active_ids.len() != snapshot.adapters.len() || active_ids != inventory_ids {
+            self.handle_dynamic_error(GpuSampleError::InvalidData {
+                context: "GPU dynamic adapter completeness",
+            });
+            return;
+        }
+        for adapter in &snapshot.adapters {
+            self.histories
+                .entry(adapter.info.id)
+                .or_insert_with(AdapterHistory::new)
+                .push(adapter);
+        }
+        self.record_dynamic_aux_errors(&snapshot);
+        self.dynamic_snapshot = Some(snapshot);
+        self.last_dynamic_error = None;
+        self.graph_scroll_offset = (self.graph_scroll_offset + 2) % GRAPH_GRID;
+        self.update_status();
+        self.sync_selected_adapter();
+    }
+
+    fn commit_metadata_snapshot(&mut self, snapshot: GpuMetadataSnapshot) {
+        let Some(inventory) = self.inventory.as_ref() else {
+            return;
+        };
+        if snapshot.generation != inventory.generation {
+            return;
+        }
+        let expected: HashSet<_> = inventory.adapters.iter().map(|info| info.id).collect();
+        let actual: HashSet<_> = snapshot
+            .adapters
+            .iter()
+            .map(|metadata| metadata.id)
+            .collect();
+        if actual.len() != snapshot.adapters.len() || actual != expected {
+            self.handle_metadata_error(GpuSampleError::InvalidData {
+                context: "GPU metadata adapter completeness",
+            });
+            return;
+        }
+        self.record_metadata_aux_errors(&snapshot);
+        self.metadata = snapshot
+            .adapters
+            .into_iter()
+            .map(|metadata| (metadata.id, metadata))
+            .collect();
+        self.last_metadata_error = None;
+        self.update_status();
+        self.sync_selected_adapter();
+    }
+
+    fn handle_dynamic_error(&mut self, error: GpuSampleError) {
+        if self.last_dynamic_error.as_ref() != Some(&error) {
             error.record();
         }
         let unsupported = error.is_unsupported();
-        self.last_refresh_error = Some(error);
-        self.status = status_after_refresh_error(self.snapshot.is_some(), unsupported);
+        self.last_dynamic_error = Some(error);
+        self.status = status_after_refresh_error(self.dynamic_snapshot.is_some(), unsupported);
         self.update_status_text();
+        self.sync_selected_adapter();
+    }
+
+    fn handle_metadata_error(&mut self, error: GpuSampleError) {
+        if self.last_metadata_error.as_ref() != Some(&error) {
+            error.record();
+        }
+        self.last_metadata_error = Some(error);
+        self.update_status();
+        self.sync_selected_adapter();
     }
 
     fn rebuild_adapter_combo(&mut self) {
@@ -461,12 +635,12 @@ impl GpuPageState {
         self.adapter_options.clear();
         unsafe { SendMessageW(selector, WM_SETREDRAW, 0, 0) };
         unsafe { SendMessageW(selector, CB_RESETCONTENT, 0, 0) };
-        if let Some(snapshot) = self.snapshot.as_ref() {
-            for (index, adapter) in snapshot.adapters.iter().enumerate() {
-                let label = format!("GPU {index} - {}", adapter.info.name);
+        if let Some(inventory) = self.inventory.as_ref() {
+            for (index, info) in inventory.adapters.iter().enumerate() {
+                let label = format!("GPU {index} - {}", info.name);
                 let wide = to_wide_null(&label);
                 unsafe { SendMessageW(selector, CB_ADDSTRING, 0, wide.as_ptr() as isize) };
-                self.adapter_options.push(adapter.info.id);
+                self.adapter_options.push(info.id);
             }
         }
         let selected_index = self
@@ -484,35 +658,50 @@ impl GpuPageState {
 
     fn sync_selected_adapter(&mut self) {
         self.update_status_text();
-        let Some(sample) = self.selected_sample().cloned() else {
+        let Some(info) = self.selected_info().cloned() else {
             self.current_engine_options.clear();
             self.clear_engine_combos();
             self.clear_visible_values();
             self.invalidate_graphs();
             return;
         };
+        let sample = self.selected_sample().cloned();
+        let metadata = self.metadata.get(&info.id).cloned();
 
-        set_control_text(self.control(IDC_GPU_MODEL), &sample.info.name);
-        let engine_options = self
-            .histories
-            .get(&sample.info.id)
-            .map(AdapterHistory::engine_options)
-            .unwrap_or_default();
-        if self.current_engine_options != engine_options {
-            self.current_engine_options = engine_options;
-            self.rebuild_engine_combos(sample.info.id);
+        set_control_text(self.control(IDC_GPU_MODEL), &info.name);
+        if sample.is_some() {
+            let engine_options = self
+                .histories
+                .get(&info.id)
+                .map(AdapterHistory::engine_options)
+                .unwrap_or_default();
+            if self.current_engine_options != engine_options {
+                self.current_engine_options = engine_options;
+                self.rebuild_engine_combos(info.id);
+            } else {
+                self.ensure_engine_selections(info.id);
+                self.sync_engine_combo_selection(info.id);
+            }
+            self.update_graph_labels(info.id);
         } else {
-            self.ensure_engine_selections(sample.info.id);
-            self.sync_engine_combo_selection(sample.info.id);
+            self.clear_engine_combos();
         }
-        self.update_graph_labels(sample.info.id);
-        self.update_visible_values(&sample);
+        self.update_visible_values(&info, sample.as_ref(), metadata.as_ref());
         self.invalidate_graphs();
+    }
+
+    fn selected_info(&self) -> Option<&std::sync::Arc<GpuAdapterInfo>> {
+        let selected = self.selected_adapter?;
+        self.inventory
+            .as_ref()?
+            .adapters
+            .iter()
+            .find(|info| info.id == selected)
     }
 
     fn selected_sample(&self) -> Option<&GpuAdapterSample> {
         let selected = self.selected_adapter?;
-        self.snapshot
+        self.dynamic_snapshot
             .as_ref()?
             .adapters
             .iter()
@@ -613,36 +802,66 @@ impl GpuPageState {
         );
     }
 
-    fn update_visible_values(&self, sample: &GpuAdapterSample) {
+    fn update_visible_values(
+        &self,
+        info: &GpuAdapterInfo,
+        sample: Option<&GpuAdapterSample>,
+        metadata: Option<&GpuAdapterMetadata>,
+    ) {
         let unavailable = text(TextKey::NotAvailable);
+        let dynamic_placeholder = if self.last_dynamic_error.is_some() {
+            unavailable
+        } else {
+            "--"
+        };
+        let metadata_placeholder = if self.last_metadata_error.is_some() {
+            unavailable
+        } else {
+            "--"
+        };
         let usage_by_engine: HashMap<_, _> = sample
-            .engines
-            .iter()
-            .map(|engine| (engine.id, engine.utilization_percent))
-            .collect();
+            .map(|sample| {
+                sample
+                    .engines
+                    .iter()
+                    .map(|engine| (engine.id, engine.utilization_percent))
+                    .collect()
+            })
+            .unwrap_or_default();
         let selections = self
             .engine_selections
-            .get(&sample.info.id)
+            .get(&info.id)
             .copied()
             .unwrap_or([None; ENGINE_SLOT_COUNT]);
         for (slot, selected) in selections.into_iter().enumerate() {
-            let value = selected
-                .and_then(|id| usage_by_engine.get(&id).copied())
-                .unwrap_or(0);
+            let value = sample.map_or_else(
+                || dynamic_placeholder.to_string(),
+                |_| {
+                    format!(
+                        "{}%",
+                        selected
+                            .and_then(|id| usage_by_engine.get(&id).copied())
+                            .unwrap_or(0)
+                    )
+                },
+            );
             set_control_text(
                 self.control(IDC_GPU_ENGINE_PERCENT_FIRST + slot as i32),
-                &format!("{value}%"),
+                &value,
             );
         }
 
+        let dedicated_usage = sample.map(|sample| sample.dedicated_usage_bytes);
+        let shared_usage = sample.map(|sample| sample.shared_usage_bytes);
         set_control_text(
             self.control(IDC_GPU_DEDICATED_CAPTION),
             &format!(
                 "{}   {}",
                 text(TextKey::GpuDedicatedMemory),
-                format_usage_limit(
-                    sample.dedicated_usage_bytes,
-                    sample.info.dedicated_limit_bytes
+                format_optional_usage_limit(
+                    dedicated_usage,
+                    info.dedicated_limit_bytes,
+                    dynamic_placeholder,
                 )
             ),
         );
@@ -651,78 +870,101 @@ impl GpuPageState {
             &format!(
                 "{}   {}",
                 text(TextKey::GpuSharedMemory),
-                format_usage_limit(sample.shared_usage_bytes, sample.info.shared_limit_bytes)
+                format_optional_usage_limit(
+                    shared_usage,
+                    info.shared_limit_bytes,
+                    dynamic_placeholder,
+                )
             ),
         );
 
-        let total_usage = sample
-            .dedicated_usage_bytes
-            .checked_add(sample.shared_usage_bytes);
-        let total_limit = sample
-            .info
+        let total_usage = dedicated_usage
+            .zip(shared_usage)
+            .and_then(|(dedicated, shared)| dedicated.checked_add(shared));
+        let total_limit = info
             .dedicated_limit_bytes
-            .zip(sample.info.shared_limit_bytes)
+            .zip(info.shared_limit_bytes)
             .and_then(|(dedicated, shared)| dedicated.checked_add(shared));
         set_control_text(
             self.control(IDC_GPU_UTILIZATION_VALUE),
-            &format!("{}%", sample.overall_utilization_percent),
+            &sample
+                .map(|sample| format!("{}%", sample.overall_utilization_percent))
+                .unwrap_or_else(|| dynamic_placeholder.to_string()),
         );
         set_control_text(
             self.control(IDC_GPU_TOTAL_MEMORY_VALUE),
-            &total_usage
-                .map(|usage| format_usage_limit(usage, total_limit))
-                .unwrap_or_else(|| unavailable.to_string()),
+            &format_optional_usage_limit(total_usage, total_limit, dynamic_placeholder),
         );
         set_control_text(
             self.control(IDC_GPU_DEDICATED_MEMORY_VALUE),
-            &format_usage_limit(
-                sample.dedicated_usage_bytes,
-                sample.info.dedicated_limit_bytes,
+            &format_optional_usage_limit(
+                dedicated_usage,
+                info.dedicated_limit_bytes,
+                dynamic_placeholder,
             ),
         );
         set_control_text(
             self.control(IDC_GPU_SHARED_MEMORY_VALUE),
-            &format_usage_limit(sample.shared_usage_bytes, sample.info.shared_limit_bytes),
+            &format_optional_usage_limit(
+                shared_usage,
+                info.shared_limit_bytes,
+                dynamic_placeholder,
+            ),
         );
         set_control_text(
             self.control(IDC_GPU_TEMPERATURE_VALUE),
             &sample
-                .temperature_deci_c
+                .and_then(|sample| sample.temperature_deci_c)
                 .map(format_temperature)
-                .unwrap_or_else(|| unavailable.to_string()),
+                .unwrap_or_else(|| {
+                    if sample.is_some() {
+                        unavailable.to_string()
+                    } else {
+                        dynamic_placeholder.to_string()
+                    }
+                }),
         );
         set_control_text(
             self.control(IDC_GPU_DRIVER_VERSION_VALUE),
-            sample.info.driver.version.as_deref().unwrap_or(unavailable),
+            metadata
+                .and_then(|metadata| metadata.driver.version.as_deref())
+                .unwrap_or_else(|| {
+                    metadata_value_placeholder(metadata, metadata_placeholder, unavailable)
+                }),
         );
         set_control_text(
             self.control(IDC_GPU_DRIVER_DATE_VALUE),
-            sample.info.driver.date.as_deref().unwrap_or(unavailable),
+            metadata
+                .and_then(|metadata| metadata.driver.date.as_deref())
+                .unwrap_or_else(|| {
+                    metadata_value_placeholder(metadata, metadata_placeholder, unavailable)
+                }),
         );
         set_control_text(
             self.control(IDC_GPU_DIRECTX_VALUE),
-            sample
-                .info
-                .directx_feature_level
-                .as_deref()
-                .unwrap_or(unavailable),
+            metadata
+                .and_then(|metadata| metadata.directx_feature_level.as_deref())
+                .unwrap_or_else(|| {
+                    metadata_value_placeholder(metadata, metadata_placeholder, unavailable)
+                }),
         );
         set_control_text(
             self.control(IDC_GPU_LOCATION_VALUE),
-            sample
-                .info
-                .driver
-                .location
-                .as_deref()
-                .unwrap_or(unavailable),
+            metadata
+                .and_then(|metadata| metadata.driver.location.as_deref())
+                .unwrap_or_else(|| {
+                    metadata_value_placeholder(metadata, metadata_placeholder, unavailable)
+                }),
         );
         set_control_text(
             self.control(IDC_GPU_RESERVED_MEMORY_VALUE),
-            &sample
-                .info
-                .hardware_reserved_bytes
+            &metadata
+                .and_then(|metadata| metadata.hardware_reserved_bytes)
                 .map(format_bytes)
-                .unwrap_or_else(|| unavailable.to_string()),
+                .unwrap_or_else(|| {
+                    metadata_value_placeholder(metadata, metadata_placeholder, unavailable)
+                        .to_string()
+                }),
         );
     }
 
@@ -745,7 +987,7 @@ impl GpuPageState {
         for slot in 0..ENGINE_SLOT_COUNT {
             set_control_text(
                 self.control(IDC_GPU_ENGINE_PERCENT_FIRST + slot as i32),
-                "0%",
+                "--",
             );
         }
         set_control_text(
@@ -773,7 +1015,10 @@ impl GpuPageState {
     fn update_status_text(&self) {
         let value = match self.status {
             GpuPageStatus::Loading => text(TextKey::GpuLoading),
+            GpuPageStatus::LoadingPerformance => text(TextKey::GpuLoadingPerformance),
+            GpuPageStatus::LoadingDetails => text(TextKey::GpuLoadingDetails),
             GpuPageStatus::Ready => "",
+            GpuPageStatus::Partial => text(TextKey::GpuPartialDetails),
             GpuPageStatus::NoHardware => text(TextKey::NoHardwareGpusFound),
             GpuPageStatus::Unsupported => text(TextKey::GpuRequiresWddm2),
             GpuPageStatus::Failed => text(TextKey::GpuRefreshFailed),
@@ -782,21 +1027,82 @@ impl GpuPageState {
         set_control_text(self.control(IDC_GPU_STATUS), value);
     }
 
-    fn record_aux_errors(&mut self, snapshot: &GpuSnapshot) {
+    fn update_status(&mut self) {
+        self.status = self.derive_status();
+        self.update_status_text();
+    }
+
+    fn derive_status(&self) -> GpuPageStatus {
+        let Some(inventory) = self.inventory.as_ref() else {
+            return match self.last_dynamic_error.as_ref() {
+                Some(error) if error.is_unsupported() => GpuPageStatus::Unsupported,
+                Some(_) => GpuPageStatus::Failed,
+                None => GpuPageStatus::Loading,
+            };
+        };
+        if inventory.adapters.is_empty() {
+            return GpuPageStatus::NoHardware;
+        }
+        if let Some(error) = self.last_dynamic_error.as_ref() {
+            return if self.dynamic_snapshot.is_some() {
+                GpuPageStatus::Stale
+            } else if error.is_unsupported() {
+                GpuPageStatus::Unsupported
+            } else {
+                GpuPageStatus::Failed
+            };
+        }
+        if self.dynamic_snapshot.is_none() {
+            return GpuPageStatus::LoadingPerformance;
+        }
+        if self.last_metadata_error.is_some()
+            || !self.last_dynamic_aux_errors.is_empty()
+            || self
+                .metadata
+                .values()
+                .any(|metadata| !metadata.metadata_errors.is_empty())
+        {
+            return GpuPageStatus::Partial;
+        }
+        if self.metadata_collection_in_flight || self.metadata.len() != inventory.adapters.len() {
+            GpuPageStatus::LoadingDetails
+        } else {
+            GpuPageStatus::Ready
+        }
+    }
+
+    fn record_dynamic_aux_errors(&mut self, snapshot: &GpuDynamicSnapshot) {
         let mut errors = Vec::new();
         for sample in &snapshot.adapters {
-            for error in sample.info.metadata_errors.iter().chain(&sample.row_errors) {
+            for error in &sample.row_errors {
                 if !errors.contains(error) {
                     errors.push(error.clone());
                 }
             }
         }
         for error in &errors {
-            if !self.last_aux_errors.contains(error) {
+            if !self.last_dynamic_aux_errors.contains(error) {
                 error.record();
             }
         }
-        self.last_aux_errors = errors;
+        self.last_dynamic_aux_errors = errors;
+    }
+
+    fn record_metadata_aux_errors(&mut self, snapshot: &GpuMetadataSnapshot) {
+        let mut errors = Vec::new();
+        for metadata in &snapshot.adapters {
+            for error in &metadata.metadata_errors {
+                if !errors.contains(error) {
+                    errors.push(error.clone());
+                }
+            }
+        }
+        for error in &errors {
+            if !self.last_metadata_aux_errors.contains(error) {
+                error.record();
+            }
+        }
+        self.last_metadata_aux_errors = errors;
     }
 
     pub(crate) fn handle_command(&mut self, wparam: WPARAM) -> isize {
@@ -1145,10 +1451,17 @@ impl GpuPageState {
     }
 
     pub(crate) fn destroy(&mut self) {
-        self.worker = None;
-        self.collection_in_flight = false;
-        self.refresh_requested = false;
-        self.snapshot = None;
+        self.sample_worker = None;
+        self.metadata_worker = None;
+        self.sample_collection_in_flight = false;
+        self.metadata_collection_in_flight = false;
+        self.sample_refresh_requested = false;
+        self.queued_metadata_request = None;
+        self.inventory = None;
+        self.dynamic_snapshot = None;
+        self.metadata.clear();
+        self.last_dynamic_aux_errors.clear();
+        self.last_metadata_aux_errors.clear();
         self.histories.clear();
         self.engine_selections.clear();
         self.layout_metrics = None;
@@ -1330,6 +1643,26 @@ fn format_usage_limit(usage: u64, limit: Option<u64>) -> String {
     }
 }
 
+fn format_optional_usage_limit(usage: Option<u64>, limit: Option<u64>, missing: &str) -> String {
+    match (usage, limit) {
+        (Some(usage), limit) => format_usage_limit(usage, limit),
+        (None, Some(limit)) => format!("{missing} / {}", format_bytes(limit)),
+        (None, None) => missing.to_string(),
+    }
+}
+
+fn metadata_value_placeholder<'a>(
+    metadata: Option<&GpuAdapterMetadata>,
+    pending: &'a str,
+    unavailable: &'a str,
+) -> &'a str {
+    if metadata.is_some() {
+        unavailable
+    } else {
+        pending
+    }
+}
+
 fn format_temperature(deci_c: u32) -> String {
     format!("{}.{:01} °C", deci_c / 10, deci_c % 10)
 }
@@ -1365,6 +1698,7 @@ fn set_control_text(hwnd: HWND, value: &str) {
 mod tests {
     use super::*;
     use crate::gpu_sampler::AdapterLuid;
+    use std::sync::Arc;
 
     fn engine(ordinal: u32, kind: GpuEngineKind) -> (GpuEngineId, GpuEngineKind) {
         (
@@ -1380,6 +1714,74 @@ mod tests {
             },
             kind,
         )
+    }
+
+    fn staged_adapter() -> Arc<GpuAdapterInfo> {
+        Arc::new(GpuAdapterInfo {
+            id: GpuAdapterId {
+                luid: AdapterLuid {
+                    high_part: 0,
+                    low_part: 7,
+                },
+                physical_index: 0,
+            },
+            enumeration_index: 0,
+            name: "Staged GPU".to_string(),
+            vendor_id: 1,
+            device_id: 2,
+            subsystem_id: 3,
+            revision: 4,
+            dedicated_limit_bytes: Some(8 * 1024 * 1024 * 1024),
+            shared_limit_bytes: Some(4 * 1024 * 1024 * 1024),
+        })
+    }
+
+    #[test]
+    fn staged_sources_make_trustworthy_content_visible_independently() {
+        let info = staged_adapter();
+        let mut state = GpuPageState::new();
+        state.inventory = Some(GpuInventorySnapshot {
+            generation: 1,
+            adapters: vec![Arc::clone(&info)],
+        });
+        assert_eq!(state.derive_status(), GpuPageStatus::LoadingPerformance);
+
+        state.dynamic_snapshot = Some(GpuDynamicSnapshot {
+            generation: 1,
+            timestamp_ms: 1,
+            adapters: vec![GpuAdapterSample {
+                info: Arc::clone(&info),
+                overall_utilization_percent: 5,
+                engines: Vec::new(),
+                dedicated_usage_bytes: 10,
+                shared_usage_bytes: 20,
+                temperature_deci_c: Some(420),
+                row_errors: Vec::new(),
+            }],
+        });
+        assert_eq!(state.derive_status(), GpuPageStatus::LoadingDetails);
+
+        state.metadata.insert(
+            info.id,
+            GpuAdapterMetadata {
+                id: info.id,
+                hardware_reserved_bytes: None,
+                driver: Default::default(),
+                directx_feature_level: None,
+                metadata_errors: Vec::new(),
+            },
+        );
+        assert_eq!(state.derive_status(), GpuPageStatus::Ready);
+
+        state
+            .metadata
+            .get_mut(&info.id)
+            .unwrap()
+            .metadata_errors
+            .push(GpuSampleError::InvalidData {
+                context: "GPU staged metadata test",
+            });
+        assert_eq!(state.derive_status(), GpuPageStatus::Partial);
     }
 
     #[test]

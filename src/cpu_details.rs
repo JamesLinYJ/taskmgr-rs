@@ -15,7 +15,7 @@
 //! failed optional source cannot erase unrelated trusted values or be applied to another CPU
 //! topology.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::mem::{ManuallyDrop, offset_of, size_of, zeroed};
 use std::ptr::{null_mut, read_unaligned};
 use std::slice;
@@ -29,8 +29,8 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE};
 use windows::Win32::System::Variant::{VARIANT, VT_BSTR, VT_EMPTY, VT_I4, VT_NULL, VariantClear};
 use windows::Win32::System::Wmi::{
-    CIM_STRING, CIM_UINT16, CIM_UINT32, IWbemClassObject, IWbemLocator, WBEM_FLAG_FORWARD_ONLY,
-    WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE, WbemLocator,
+    CIM_STRING, CIM_UINT16, CIM_UINT32, IWbemClassObject, IWbemLocator, IWbemServices,
+    WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE, WbemLocator,
 };
 use windows::core::{BSTR, PCWSTR};
 use windows_sys::Win32::Foundation::{
@@ -42,6 +42,7 @@ use windows_sys::Win32::System::Performance::{
     PDH_MORE_DATA, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
     PdhGetFormattedCounterArrayW, PdhGetFormattedCounterValue, PdhOpenQueryW,
 };
+use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::System::SystemInformation::{
     CACHE_RELATIONSHIP, CacheData, CacheInstruction, CacheTrace, CacheUnified, GROUP_AFFINITY,
     GROUP_RELATIONSHIP, GetLogicalProcessorInformationEx, GetNativeSystemInfo,
@@ -75,7 +76,9 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::cpu_topology::{LogicalProcessorId, ProcessorTopology, ProcessorTopologyIdentity};
-use crate::winutil::{record_hresult_error, record_pdh_error, record_win32_error, to_wide_null};
+use crate::winutil::{
+    record_hresult_error, record_pdh_error, record_startup_timing, record_win32_error, to_wide_null,
+};
 
 const FREQUENCY_COUNTER_PATH: &str = r"\Processor Information(*)\Processor Frequency";
 const PERFORMANCE_COUNTER_PATH: &str = r"\Processor Information(*)\% Processor Performance";
@@ -248,49 +251,66 @@ pub(crate) struct CpuDynamicInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CpuDetailSnapshot {
+pub(crate) struct CpuNativeSnapshot {
     pub(crate) topology_key: CpuTopologyKey,
     pub(crate) topology: CpuComponentUpdate<CpuSupplementalTopology>,
-    pub(crate) firmware: CpuComponentUpdate<Vec<CpuFirmwareProcessor>>,
     pub(crate) features: CpuComponentUpdate<CpuFeatureInfo>,
     pub(crate) dynamic: CpuComponentUpdate<CpuDynamicInfo>,
+    pub(crate) pdh_baseline_timestamp_ms: Option<u64>,
 }
 
-pub(crate) struct CpuDetailCollector {
-    com: Result<ComApartment, CpuDetailError>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CpuFirmwareSnapshot {
+    pub(crate) topology_key: CpuTopologyKey,
+    pub(crate) firmware: CpuComponentUpdate<Vec<CpuFirmwareProcessor>>,
+}
+
+pub(crate) struct CpuNativeCollector {
     topology_key: Option<CpuTopologyKey>,
     topology_done: bool,
     topology_failed: bool,
-    firmware_done: bool,
-    firmware_failed: bool,
     features_done: bool,
     pdh: Option<CpuPdhQuery>,
     pdh_failed: bool,
+    startup_started_ms: u64,
+    topology_timing_recorded: bool,
+    baseline_timing_recorded: bool,
+    first_dynamic_recorded: bool,
 }
 
-impl CpuDetailCollector {
+impl CpuNativeCollector {
     pub(crate) fn new() -> Self {
         Self {
-            com: ComApartment::initialize(),
             topology_key: None,
             topology_done: false,
             topology_failed: false,
-            firmware_done: false,
-            firmware_failed: false,
             features_done: false,
             pdh: None,
             pdh_failed: false,
+            startup_started_ms: unsafe { GetTickCount64() },
+            topology_timing_recorded: false,
+            baseline_timing_recorded: false,
+            first_dynamic_recorded: false,
         }
     }
 
-    pub(crate) fn collect(&mut self, request: CpuDetailRequest) -> CpuDetailSnapshot {
+    pub(crate) fn collect(&mut self, request: CpuDetailRequest) -> CpuNativeSnapshot {
         if self.topology_key.as_ref() != Some(&request.topology_key) {
             self.reset_for_topology(&request.topology_key);
         }
 
         let retry_failed = request.refresh == CpuDetailRefresh::User;
         let topology = if !self.topology_done || (retry_failed && self.topology_failed) {
-            match query_supplemental_topology(&request.topology_key) {
+            let started_ms = unsafe { GetTickCount64() };
+            let result = query_supplemental_topology(&request.topology_key);
+            if !self.topology_timing_recorded {
+                record_startup_timing(
+                    "CPU native topology",
+                    unsafe { GetTickCount64() }.wrapping_sub(started_ms),
+                );
+                self.topology_timing_recorded = true;
+            }
+            match result {
                 Ok(value) => {
                     self.topology_done = true;
                     self.topology_failed = false;
@@ -306,28 +326,6 @@ impl CpuDetailCollector {
             CpuComponentUpdate::Unchanged
         };
 
-        let firmware = if !self.firmware_done || (retry_failed && self.firmware_failed) {
-            let result = self
-                .com
-                .as_ref()
-                .map_err(Clone::clone)
-                .and_then(query_firmware_processors);
-            match result {
-                Ok(value) => {
-                    self.firmware_done = true;
-                    self.firmware_failed = false;
-                    CpuComponentUpdate::Success(value)
-                }
-                Err(error) => {
-                    self.firmware_done = true;
-                    self.firmware_failed = true;
-                    CpuComponentUpdate::Failed(error)
-                }
-            }
-        } else {
-            CpuComponentUpdate::Unchanged
-        };
-
         let features = if !self.features_done {
             self.features_done = true;
             CpuComponentUpdate::Success(query_cpu_features())
@@ -335,20 +333,20 @@ impl CpuDetailCollector {
             CpuComponentUpdate::Unchanged
         };
 
-        let dynamic = self.collect_dynamic(&request);
-        CpuDetailSnapshot {
+        let (dynamic, pdh_baseline_timestamp_ms) = self.collect_dynamic(&request);
+        CpuNativeSnapshot {
             topology_key: request.topology_key,
             topology,
-            firmware,
             features,
             dynamic,
+            pdh_baseline_timestamp_ms,
         }
     }
 
     fn collect_dynamic(
         &mut self,
         request: &CpuDetailRequest,
-    ) -> CpuComponentUpdate<CpuDynamicInfo> {
+    ) -> (CpuComponentUpdate<CpuDynamicInfo>, Option<u64>) {
         if request.refresh == CpuDetailRefresh::User && self.pdh_failed {
             self.pdh = None;
             self.pdh_failed = false;
@@ -358,23 +356,41 @@ impl CpuDetailCollector {
                 Ok(query) => self.pdh = Some(query),
                 Err(error) => {
                     self.pdh_failed = true;
-                    return CpuComponentUpdate::Failed(error);
+                    return (CpuComponentUpdate::Failed(error), None);
                 }
             }
         }
         let Some(pdh) = self.pdh.as_mut() else {
-            return CpuComponentUpdate::Unchanged;
+            return (CpuComponentUpdate::Unchanged, None);
         };
         if request.refresh == CpuDetailRefresh::Activation {
             pdh.reset_sample_baseline();
         }
         match pdh.collect() {
-            Ok(Some(value)) => CpuComponentUpdate::Success(value),
-            Ok(None) => CpuComponentUpdate::Unchanged,
+            Ok(CpuPdhCollectOutcome::Sample(value)) => {
+                if !self.first_dynamic_recorded {
+                    record_startup_timing(
+                        "CPU first dynamic sample",
+                        unsafe { GetTickCount64() }.wrapping_sub(self.startup_started_ms),
+                    );
+                    self.first_dynamic_recorded = true;
+                }
+                (CpuComponentUpdate::Success(value), None)
+            }
+            Ok(CpuPdhCollectOutcome::Primed(timestamp_ms)) => {
+                if !self.baseline_timing_recorded {
+                    record_startup_timing(
+                        "CPU PDH baseline",
+                        timestamp_ms.wrapping_sub(self.startup_started_ms),
+                    );
+                    self.baseline_timing_recorded = true;
+                }
+                (CpuComponentUpdate::Unchanged, Some(timestamp_ms))
+            }
             Err(error) => {
                 self.pdh = None;
                 self.pdh_failed = true;
-                CpuComponentUpdate::Failed(error)
+                (CpuComponentUpdate::Failed(error), None)
             }
         }
     }
@@ -383,11 +399,92 @@ impl CpuDetailCollector {
         self.topology_key = Some(key.clone());
         self.topology_done = false;
         self.topology_failed = false;
-        self.firmware_done = false;
-        self.firmware_failed = false;
         self.features_done = false;
         self.pdh = None;
         self.pdh_failed = false;
+        self.startup_started_ms = unsafe { GetTickCount64() };
+        self.topology_timing_recorded = false;
+        self.baseline_timing_recorded = false;
+        self.first_dynamic_recorded = false;
+    }
+}
+
+pub(crate) struct CpuFirmwareCollector {
+    provider: Result<CpuWmiProvider, CpuDetailError>,
+    topology_key: Option<CpuTopologyKey>,
+    firmware_done: bool,
+    firmware_failed: bool,
+    startup_started_ms: u64,
+    timing_recorded: bool,
+}
+
+impl CpuFirmwareCollector {
+    pub(crate) fn new() -> Self {
+        let startup_started_ms = unsafe { GetTickCount64() };
+        let provider = CpuWmiProvider::connect();
+        record_startup_timing(
+            "CPU WMI initialization",
+            unsafe { GetTickCount64() }.wrapping_sub(startup_started_ms),
+        );
+        Self {
+            provider,
+            topology_key: None,
+            firmware_done: false,
+            firmware_failed: false,
+            startup_started_ms,
+            timing_recorded: false,
+        }
+    }
+
+    pub(crate) fn collect(&mut self, request: CpuDetailRequest) -> CpuFirmwareSnapshot {
+        if self.topology_key.as_ref() != Some(&request.topology_key) {
+            self.topology_key = Some(request.topology_key.clone());
+            self.firmware_done = false;
+            self.firmware_failed = false;
+            self.timing_recorded = false;
+        }
+        let retry_failed = request.refresh == CpuDetailRefresh::User && self.firmware_failed;
+        if retry_failed {
+            self.provider = CpuWmiProvider::connect();
+            self.firmware_done = false;
+            self.firmware_failed = false;
+        }
+        let firmware = if !self.firmware_done {
+            let query_started_ms = unsafe { GetTickCount64() };
+            let result = self
+                .provider
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(CpuWmiProvider::query_processors);
+            if !self.timing_recorded {
+                record_startup_timing(
+                    "CPU WMI firmware query",
+                    unsafe { GetTickCount64() }.wrapping_sub(query_started_ms),
+                );
+                record_startup_timing(
+                    "CPU firmware completed",
+                    unsafe { GetTickCount64() }.wrapping_sub(self.startup_started_ms),
+                );
+                self.timing_recorded = true;
+            }
+            self.firmware_done = true;
+            match result {
+                Ok(value) => {
+                    self.firmware_failed = false;
+                    CpuComponentUpdate::Success(value)
+                }
+                Err(error) => {
+                    self.firmware_failed = true;
+                    CpuComponentUpdate::Failed(error)
+                }
+            }
+        } else {
+            CpuComponentUpdate::Unchanged
+        };
+        CpuFirmwareSnapshot {
+            topology_key: request.topology_key,
+            firmware,
+        }
     }
 }
 
@@ -868,8 +965,19 @@ struct CpuPdhQuery {
     context_switches: PDH_HCOUNTER,
     system_calls: PDH_HCOUNTER,
     processor_queue: PDH_HCOUNTER,
-    expected_processors: Vec<LogicalProcessorId>,
+    expected_processor_count: usize,
+    processor_indices: Option<HashMap<PdhProcessorInstance, usize>>,
+    nominal_values: Vec<i64>,
+    performance_values: Vec<f64>,
+    nominal_seen: Vec<u32>,
+    performance_seen: Vec<u32>,
+    sample_generation: u32,
     sample_baseline_ready: bool,
+}
+
+enum CpuPdhCollectOutcome {
+    Primed(u64),
+    Sample(CpuDynamicInfo),
 }
 
 impl CpuPdhQuery {
@@ -899,7 +1007,13 @@ impl CpuPdhQuery {
             context_switches: null_mut(),
             system_calls: null_mut(),
             processor_queue: null_mut(),
-            expected_processors,
+            expected_processor_count: expected_processors.len(),
+            processor_indices: None,
+            nominal_values: Vec::new(),
+            performance_values: Vec::new(),
+            nominal_seen: Vec::new(),
+            performance_seen: Vec::new(),
+            sample_generation: 0,
             sample_baseline_ready: false,
         };
         result.frequency = result.add_counter(FREQUENCY_COUNTER_PATH)?;
@@ -927,7 +1041,7 @@ impl CpuPdhQuery {
         self.sample_baseline_ready = false;
     }
 
-    fn collect(&mut self) -> Result<Option<CpuDynamicInfo>, CpuDetailError> {
+    fn collect(&mut self) -> Result<CpuPdhCollectOutcome, CpuDetailError> {
         let status = unsafe { PdhCollectQueryData(self.query) };
         if status != ERROR_SUCCESS {
             return Err(CpuDetailError::Pdh {
@@ -937,7 +1051,7 @@ impl CpuPdhQuery {
         }
         if !self.sample_baseline_ready {
             self.sample_baseline_ready = true;
-            return Ok(None);
+            return Ok(CpuPdhCollectOutcome::Primed(unsafe { GetTickCount64() }));
         }
         let frequencies = query_counter_array(self.frequency, PDH_FMT_LARGE, |value| unsafe {
             value.Anonymous.largeValue
@@ -946,11 +1060,11 @@ impl CpuPdhQuery {
             value.Anonymous.doubleValue
         })?;
         let (average_frequency_mhz, minimum_frequency_mhz, maximum_frequency_mhz) =
-            validate_frequencies(&frequencies, &performance, &self.expected_processors)?;
+            self.validate_frequencies(&frequencies, &performance)?;
         let processor_queue_length = query_single_counter(self.processor_queue)?;
         let context_switches_per_second = Some(query_single_counter(self.context_switches)?);
         let system_calls_per_second = Some(query_single_counter(self.system_calls)?);
-        Ok(Some(CpuDynamicInfo {
+        Ok(CpuPdhCollectOutcome::Sample(CpuDynamicInfo {
             average_frequency_mhz,
             minimum_frequency_mhz,
             maximum_frequency_mhz,
@@ -958,6 +1072,53 @@ impl CpuPdhQuery {
             context_switches_per_second,
             system_calls_per_second,
         }))
+    }
+
+    fn validate_frequencies(
+        &mut self,
+        nominal: &[PdhArrayValue<i64>],
+        performance: &[PdhArrayValue<f64>],
+    ) -> Result<(u64, u64, u64), CpuDetailError> {
+        if self.processor_indices.is_none() {
+            self.processor_indices = Some(build_processor_indices(
+                nominal,
+                self.expected_processor_count,
+            )?);
+            let count = self.expected_processor_count;
+            self.nominal_values.resize(count, 0);
+            self.performance_values.resize(count, 0.0);
+            self.nominal_seen.resize(count, 0);
+            self.performance_seen.resize(count, 0);
+        }
+        self.sample_generation = self.sample_generation.wrapping_add(1);
+        if self.sample_generation == 0 {
+            self.nominal_seen.fill(0);
+            self.performance_seen.fill(0);
+            self.sample_generation = 1;
+        }
+        let indices = self
+            .processor_indices
+            .as_ref()
+            .ok_or_else(|| invalid_error("CPU processor index state"))?;
+        fill_processor_values(
+            nominal,
+            indices,
+            &mut self.nominal_values,
+            &mut self.nominal_seen,
+            self.sample_generation,
+            |value| value > 0,
+            ProcessorValueErrors::NOMINAL,
+        )?;
+        fill_processor_values(
+            performance,
+            indices,
+            &mut self.performance_values,
+            &mut self.performance_seen,
+            self.sample_generation,
+            |value| value.is_finite() && value >= 0.0,
+            ProcessorValueErrors::PERFORMANCE,
+        )?;
+        summarize_frequencies(&self.nominal_values, &self.performance_values)
     }
 }
 
@@ -1071,6 +1232,7 @@ fn validate_pdh_status(status: u32) -> Result<(), CpuDetailError> {
     }
 }
 
+#[cfg(test)]
 fn validate_frequencies(
     nominal_values: &[PdhArrayValue<i64>],
     performance_values: &[PdhArrayValue<f64>],
@@ -1080,36 +1242,43 @@ fn validate_frequencies(
     if expected_count == 0 || expected_count != expected.len() {
         return invalid("CPU expected processor identities");
     }
-    let nominal = map_processor_values(
+    let indices = build_processor_indices(nominal_values, expected_count)?;
+    let mut nominal = vec![0i64; expected_count];
+    let mut performance = vec![0.0f64; expected_count];
+    let mut nominal_seen = vec![0u32; expected_count];
+    let mut performance_seen = vec![0u32; expected_count];
+    fill_processor_values(
         nominal_values,
-        expected_count,
+        &indices,
+        &mut nominal,
+        &mut nominal_seen,
+        1,
         |value| value > 0,
-        "CPU nominal frequency instance or value",
-        "CPU duplicate nominal frequency instance",
-        "CPU nominal frequency instance completeness",
+        ProcessorValueErrors::NOMINAL,
     )?;
-    let performance = map_processor_values(
+    fill_processor_values(
         performance_values,
-        expected_count,
+        &indices,
+        &mut performance,
+        &mut performance_seen,
+        1,
         |value| value.is_finite() && value >= 0.0,
-        "CPU performance instance or value",
-        "CPU duplicate performance instance",
-        "CPU performance instance completeness",
+        ProcessorValueErrors::PERFORMANCE,
     )?;
-    if nominal.keys().ne(performance.keys()) {
+    summarize_frequencies(&nominal, &performance)
+}
+
+fn summarize_frequencies(
+    nominal: &[i64],
+    performance: &[f64],
+) -> Result<(u64, u64, u64), CpuDetailError> {
+    if nominal.is_empty() || nominal.len() != performance.len() {
         return invalid("CPU frequency and performance instance mismatch");
     }
-
     let mut sum = 0u128;
     let mut minimum = u64::MAX;
     let mut maximum = 0u64;
-    for id in nominal.keys() {
-        let nominal_mhz = *nominal
-            .get(id)
-            .ok_or_else(|| invalid_error("CPU nominal frequency lookup"))?;
-        let performance_percent = *performance
-            .get(id)
-            .ok_or_else(|| invalid_error("CPU performance lookup"))?;
+    for (&nominal_mhz, &performance_percent) in nominal.iter().zip(performance) {
         // Windows reports nominal MHz separately from relative performance, which may exceed
         // 100 percent while the processor is boosting.
         let frequency = effective_frequency_mhz(nominal_mhz, performance_percent)?;
@@ -1119,7 +1288,7 @@ fn validate_frequencies(
         minimum = minimum.min(frequency);
         maximum = maximum.max(frequency);
     }
-    let count = expected_count as u128;
+    let count = nominal.len() as u128;
     let average = sum
         .checked_add(count / 2)
         .and_then(|value| value.checked_div(count))
@@ -1128,30 +1297,88 @@ fn validate_frequencies(
     Ok((average, minimum, maximum))
 }
 
-fn map_processor_values<T: Copy>(
-    values: &[PdhArrayValue<T>],
+fn build_processor_indices(
+    values: &[PdhArrayValue<i64>],
     expected_count: usize,
+) -> Result<HashMap<PdhProcessorInstance, usize>, CpuDetailError> {
+    if expected_count == 0 {
+        return invalid("CPU expected processor instance count");
+    }
+    let mut indices = HashMap::with_capacity(expected_count);
+    for item in values {
+        let Some(id) = parse_processor_instance(&item.instance)? else {
+            continue;
+        };
+        if item.value <= 0 {
+            return invalid("CPU nominal frequency instance or value");
+        }
+        let next_index = indices.len();
+        if indices.insert(id, next_index).is_some() {
+            return invalid("CPU duplicate nominal frequency instance");
+        }
+    }
+    if indices.len() != expected_count {
+        return invalid("CPU nominal frequency instance completeness");
+    }
+    Ok(indices)
+}
+
+#[derive(Clone, Copy)]
+struct ProcessorValueErrors {
+    invalid: &'static str,
+    duplicate: &'static str,
+    incomplete: &'static str,
+}
+
+impl ProcessorValueErrors {
+    const NOMINAL: Self = Self {
+        invalid: "CPU nominal frequency instance or value",
+        duplicate: "CPU duplicate nominal frequency instance",
+        incomplete: "CPU nominal frequency instance completeness",
+    };
+    const PERFORMANCE: Self = Self {
+        invalid: "CPU performance instance or value",
+        duplicate: "CPU duplicate performance instance",
+        incomplete: "CPU performance instance completeness",
+    };
+}
+
+fn fill_processor_values<T: Copy>(
+    values: &[PdhArrayValue<T>],
+    indices: &HashMap<PdhProcessorInstance, usize>,
+    output: &mut [T],
+    seen: &mut [u32],
+    generation: u32,
     is_valid: impl Fn(T) -> bool,
-    invalid_context: &'static str,
-    duplicate_context: &'static str,
-    incomplete_context: &'static str,
-) -> Result<BTreeMap<PdhProcessorInstance, T>, CpuDetailError> {
-    let mut mapped = BTreeMap::new();
+    errors: ProcessorValueErrors,
+) -> Result<(), CpuDetailError> {
+    if generation == 0 || output.len() != indices.len() || seen.len() != indices.len() {
+        return invalid("CPU processor value buffer shape");
+    }
+    let mut mapped_count = 0usize;
     for item in values {
         let Some(id) = parse_processor_instance(&item.instance)? else {
             continue;
         };
         if !is_valid(item.value) {
-            return invalid(invalid_context);
+            return invalid(errors.invalid);
         }
-        if mapped.insert(id, item.value).is_some() {
-            return invalid(duplicate_context);
+        let index = *indices
+            .get(&id)
+            .ok_or_else(|| invalid_error("CPU frequency and performance instance mismatch"))?;
+        if seen[index] == generation {
+            return invalid(errors.duplicate);
         }
+        seen[index] = generation;
+        output[index] = item.value;
+        mapped_count = mapped_count
+            .checked_add(1)
+            .ok_or_else(|| invalid_error("CPU processor value count overflow"))?;
     }
-    if mapped.len() != expected_count {
-        return invalid(incomplete_context);
+    if mapped_count != indices.len() {
+        return invalid(errors.incomplete);
     }
-    Ok(mapped)
+    Ok(())
 }
 
 fn effective_frequency_mhz(
@@ -1165,7 +1392,7 @@ fn effective_frequency_mhz(
     Ok(frequency.round() as u64)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 struct PdhProcessorInstance {
     // Processor Information instances are documented as NUMA node and node-local index.
     numa_node: u32,
@@ -1264,114 +1491,127 @@ impl Drop for ComApartment {
     }
 }
 
-fn query_firmware_processors(
-    _apartment: &ComApartment,
-) -> Result<Vec<CpuFirmwareProcessor>, CpuDetailError> {
-    let locator: IWbemLocator = unsafe {
-        CoCreateInstance(&WbemLocator, None, CLSCTX_INPROC_SERVER)
-    }
-    .map_err(|error| CpuDetailError::HResult {
-        context: "CoCreateInstance IWbemLocator",
-        code: error.code().0,
-    })?;
-    let empty = BSTR::new();
-    let services = unsafe {
-        locator.ConnectServer(
-            &BSTR::from("ROOT\\CIMV2"),
-            &empty,
-            &empty,
-            &empty,
-            0,
-            &empty,
-            None,
-        )
-    }
-    .map_err(|error| CpuDetailError::HResult {
-        context: "IWbemLocator::ConnectServer for CPU details",
-        code: error.code().0,
-    })?;
-    unsafe {
-        CoSetProxyBlanket(
-            &services,
-            RPC_C_AUTHN_WINNT,
-            RPC_C_AUTHZ_NONE,
-            PCWSTR::null(),
-            RPC_C_AUTHN_LEVEL_CALL,
-            RPC_C_IMP_LEVEL_IMPERSONATE,
-            None,
-            EOAC_NONE,
-        )
-    }
-    .map_err(|error| CpuDetailError::HResult {
-        context: "CoSetProxyBlanket for CPU WMI service",
-        code: error.code().0,
-    })?;
-    let query = BSTR::from(
-        "SELECT DeviceID, Name, Manufacturer, SocketDesignation, ProcessorId, Family, Level, \
-         Revision, Stepping, AddressWidth, DataWidth, MaxClockSpeed FROM Win32_Processor",
-    );
-    let enumerator = unsafe {
-        services.ExecQuery(
-            &BSTR::from("WQL"),
-            &query,
-            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
-            None,
-        )
-    }
-    .map_err(|error| CpuDetailError::HResult {
-        context: "IWbemServices::ExecQuery Win32_Processor",
-        code: error.code().0,
-    })?;
+struct CpuWmiProvider {
+    services: IWbemServices,
+    _apartment: ComApartment,
+}
 
-    let mut processors = Vec::new();
-    loop {
-        let mut objects: [Option<IWbemClassObject>; 1] = [None];
-        let mut returned = 0u32;
-        let result = unsafe { enumerator.Next(WBEM_INFINITE, &mut objects, &mut returned) };
-        if result.is_err() {
-            return Err(CpuDetailError::HResult {
-                context: "IEnumWbemClassObject::Next Win32_Processor",
-                code: result.0,
+impl CpuWmiProvider {
+    fn connect() -> Result<Self, CpuDetailError> {
+        let apartment = ComApartment::initialize()?;
+        let locator: IWbemLocator =
+            unsafe { CoCreateInstance(&WbemLocator, None, CLSCTX_INPROC_SERVER) }.map_err(
+                |error| CpuDetailError::HResult {
+                    context: "CoCreateInstance IWbemLocator",
+                    code: error.code().0,
+                },
+            )?;
+        let empty = BSTR::new();
+        let services = unsafe {
+            locator.ConnectServer(
+                &BSTR::from("ROOT\\CIMV2"),
+                &empty,
+                &empty,
+                &empty,
+                0,
+                &empty,
+                None,
+            )
+        }
+        .map_err(|error| CpuDetailError::HResult {
+            context: "IWbemLocator::ConnectServer for CPU details",
+            code: error.code().0,
+        })?;
+        unsafe {
+            CoSetProxyBlanket(
+                &services,
+                RPC_C_AUTHN_WINNT,
+                RPC_C_AUTHZ_NONE,
+                PCWSTR::null(),
+                RPC_C_AUTHN_LEVEL_CALL,
+                RPC_C_IMP_LEVEL_IMPERSONATE,
+                None,
+                EOAC_NONE,
+            )
+        }
+        .map_err(|error| CpuDetailError::HResult {
+            context: "CoSetProxyBlanket for CPU WMI service",
+            code: error.code().0,
+        })?;
+        Ok(Self {
+            services,
+            _apartment: apartment,
+        })
+    }
+
+    fn query_processors(&self) -> Result<Vec<CpuFirmwareProcessor>, CpuDetailError> {
+        let query = BSTR::from(
+            "SELECT DeviceID, Name, Manufacturer, SocketDesignation, ProcessorId, Family, Level, \
+         Revision, Stepping, AddressWidth, DataWidth, MaxClockSpeed FROM Win32_Processor",
+        );
+        let enumerator = unsafe {
+            self.services.ExecQuery(
+                &BSTR::from("WQL"),
+                &query,
+                WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+                None,
+            )
+        }
+        .map_err(|error| CpuDetailError::HResult {
+            context: "IWbemServices::ExecQuery Win32_Processor",
+            code: error.code().0,
+        })?;
+
+        let mut processors = Vec::new();
+        loop {
+            let mut objects: [Option<IWbemClassObject>; 1] = [None];
+            let mut returned = 0u32;
+            let result = unsafe { enumerator.Next(WBEM_INFINITE, &mut objects, &mut returned) };
+            if result.is_err() {
+                return Err(CpuDetailError::HResult {
+                    context: "IEnumWbemClassObject::Next Win32_Processor",
+                    code: result.0,
+                });
+            }
+            if returned == 0 {
+                break;
+            }
+            if returned != 1 {
+                return invalid("Win32_Processor enumerator returned count");
+            }
+            let object = objects[0]
+                .take()
+                .ok_or_else(|| invalid_error("Win32_Processor null object"))?;
+            let device_id = get_wmi_string(&object, "DeviceID")?
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| invalid_error("Win32_Processor DeviceID"))?;
+            processors.push(CpuFirmwareProcessor {
+                device_id,
+                name: get_wmi_string(&object, "Name")?,
+                manufacturer: get_wmi_string(&object, "Manufacturer")?,
+                socket: get_wmi_string(&object, "SocketDesignation")?,
+                processor_id: get_wmi_string(&object, "ProcessorId")?,
+                family: get_wmi_u16(&object, "Family")?,
+                level: get_wmi_u16(&object, "Level")?,
+                revision: get_wmi_u16(&object, "Revision")?,
+                stepping: get_wmi_string(&object, "Stepping")?,
+                address_width: get_wmi_u16(&object, "AddressWidth")?,
+                data_width: get_wmi_u16(&object, "DataWidth")?,
+                max_clock_mhz: get_wmi_u32(&object, "MaxClockSpeed")?,
             });
         }
-        if returned == 0 {
-            break;
+        if processors.is_empty() {
+            return invalid("Win32_Processor empty result");
         }
-        if returned != 1 {
-            return invalid("Win32_Processor enumerator returned count");
+        processors.sort_by(|left, right| left.device_id.cmp(&right.device_id));
+        if processors
+            .windows(2)
+            .any(|pair| pair[0].device_id == pair[1].device_id)
+        {
+            return invalid("Win32_Processor duplicate DeviceID");
         }
-        let object = objects[0]
-            .take()
-            .ok_or_else(|| invalid_error("Win32_Processor null object"))?;
-        let device_id = get_wmi_string(&object, "DeviceID")?
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| invalid_error("Win32_Processor DeviceID"))?;
-        processors.push(CpuFirmwareProcessor {
-            device_id,
-            name: get_wmi_string(&object, "Name")?,
-            manufacturer: get_wmi_string(&object, "Manufacturer")?,
-            socket: get_wmi_string(&object, "SocketDesignation")?,
-            processor_id: get_wmi_string(&object, "ProcessorId")?,
-            family: get_wmi_u16(&object, "Family")?,
-            level: get_wmi_u16(&object, "Level")?,
-            revision: get_wmi_u16(&object, "Revision")?,
-            stepping: get_wmi_string(&object, "Stepping")?,
-            address_width: get_wmi_u16(&object, "AddressWidth")?,
-            data_width: get_wmi_u16(&object, "DataWidth")?,
-            max_clock_mhz: get_wmi_u32(&object, "MaxClockSpeed")?,
-        });
+        Ok(processors)
     }
-    if processors.is_empty() {
-        return invalid("Win32_Processor empty result");
-    }
-    processors.sort_by(|left, right| left.device_id.cmp(&right.device_id));
-    if processors
-        .windows(2)
-        .any(|pair| pair[0].device_id == pair[1].device_id)
-    {
-        return invalid("Win32_Processor duplicate DeviceID");
-    }
-    Ok(processors)
 }
 
 struct OwnedVariant(VARIANT);
@@ -1778,42 +2018,50 @@ mod tests {
         let topology = crate::cpu_topology::query_processor_topology(processor_count as usize);
         let key = CpuTopologyKey::from_topology(&topology)
             .expect("live processor topology should be complete");
-        let mut collector = CpuDetailCollector::new();
-        let snapshot = collector.collect(CpuDetailRequest {
+        let mut native_collector = CpuNativeCollector::new();
+        let native = native_collector.collect(CpuDetailRequest {
             topology_key: key.clone(),
             refresh: CpuDetailRefresh::Prewarm,
         });
-        assert_eq!(snapshot.topology_key, key);
+        assert_eq!(native.topology_key, key);
         assert!(
-            matches!(&snapshot.topology, CpuComponentUpdate::Success(_)),
+            matches!(&native.topology, CpuComponentUpdate::Success(_)),
             "{:?}",
-            snapshot.topology
+            native.topology
         );
         assert!(
-            matches!(&snapshot.firmware, CpuComponentUpdate::Success(_)),
+            matches!(&native.features, CpuComponentUpdate::Success(_)),
             "{:?}",
-            snapshot.firmware
+            native.features
         );
         assert!(
-            matches!(&snapshot.features, CpuComponentUpdate::Success(_)),
+            matches!(&native.dynamic, CpuComponentUpdate::Unchanged),
             "{:?}",
-            snapshot.features
+            native.dynamic
         );
+        assert!(native.pdh_baseline_timestamp_ms.is_some());
+
+        let mut firmware_collector = CpuFirmwareCollector::new();
+        let firmware = firmware_collector.collect(CpuDetailRequest {
+            topology_key: key.clone(),
+            refresh: CpuDetailRefresh::Prewarm,
+        });
+        assert_eq!(firmware.topology_key, key);
         assert!(
-            matches!(&snapshot.dynamic, CpuComponentUpdate::Unchanged),
+            matches!(&firmware.firmware, CpuComponentUpdate::Success(_)),
             "{:?}",
-            snapshot.dynamic
+            firmware.firmware
         );
 
         std::thread::sleep(std::time::Duration::from_secs(1));
-        let snapshot = collector.collect(CpuDetailRequest {
+        let native = native_collector.collect(CpuDetailRequest {
             topology_key: key,
             refresh: CpuDetailRefresh::Periodic,
         });
         assert!(
-            matches!(&snapshot.dynamic, CpuComponentUpdate::Success(_)),
+            matches!(&native.dynamic, CpuComponentUpdate::Success(_)),
             "{:?}",
-            snapshot.dynamic
+            native.dynamic
         );
     }
 }

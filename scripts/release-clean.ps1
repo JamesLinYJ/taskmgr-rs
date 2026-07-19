@@ -1,5 +1,7 @@
 param(
-    [switch]$UseNightlyBuildStd
+    [switch]$UseNightlyBuildStd,
+    [ValidateSet("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc")]
+    [string]$Target = "x86_64-pc-windows-msvc"
 )
 
 $ErrorActionPreference = "Stop"
@@ -69,9 +71,10 @@ try {
 
         cargo +nightly build `
             -Z build-std=std,panic_abort `
+            --target $Target `
             --release
     } else {
-        cargo build --release
+        cargo build --target $Target --release
     }
 } finally {
     Pop-Location

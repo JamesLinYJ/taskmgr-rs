@@ -10,13 +10,12 @@
 
 //! Enumerates hardware display adapters with DXGI and samples their public PDH GPU counters.
 //!
-//! Adapter and engine identities always include the DXGI LUID. A sample is assembled completely
-//! on the worker thread and only then returned to the UI. Optional adapter metadata is kept
-//! separate from the required utilization snapshot so an unavailable sensor cannot invalidate
-//! otherwise trustworthy counters.
+//! Adapter and engine identities always include the DXGI LUID. The sampling worker submits a
+//! minimal DXGI inventory before PDH has produced its first rate sample; a separate metadata
+//! worker owns SetupAPI, D3D12, and KMT enrichment. Every source commits a complete generation-
+//! tagged snapshot, so an unavailable sensor cannot invalidate trustworthy inventory or counters.
 
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
@@ -59,17 +58,18 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Performance::{
-    PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_NO_COUNTER, PDH_CSTATUS_NO_OBJECT, PDH_CSTATUS_VALID_DATA,
-    PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY,
-    PDH_INVALID_PATH, PDH_MORE_DATA, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
-    PdhGetFormattedCounterArrayW, PdhOpenQueryW,
+    PDH_CSTATUS_INVALID_DATA, PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_NO_COUNTER, PDH_CSTATUS_NO_OBJECT,
+    PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_FMT_LARGE,
+    PDH_HCOUNTER, PDH_HQUERY, PDH_INVALID_PATH, PDH_MORE_DATA, PdhAddEnglishCounterW,
+    PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhOpenQueryW,
 };
 use windows_sys::Win32::System::Registry::REG_QWORD;
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::System::Time::FileTimeToSystemTime;
 
 use crate::winutil::{
-    record_hresult_error, record_ntstatus_error, record_pdh_error, record_win32_error, to_wide_null,
+    record_hresult_error, record_ntstatus_error, record_pdh_error, record_startup_timing,
+    record_win32_error, to_wide_null,
 };
 
 const ENGINE_COUNTER_PATH: &str = r"\GPU Engine(*)\Utilization Percentage";
@@ -174,6 +174,16 @@ impl GpuSampleError {
             }
         )
     }
+
+    fn is_baseline_pending(&self) -> bool {
+        matches!(
+            self,
+            Self::Pdh {
+                status: PDH_CSTATUS_INVALID_DATA,
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -195,6 +205,11 @@ pub(crate) struct GpuAdapterInfo {
     pub(crate) revision: u32,
     pub(crate) dedicated_limit_bytes: Option<u64>,
     pub(crate) shared_limit_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GpuAdapterMetadata {
+    pub(crate) id: GpuAdapterId,
     pub(crate) hardware_reserved_bytes: Option<u64>,
     pub(crate) driver: GpuDriverDetails,
     pub(crate) directx_feature_level: Option<String>,
@@ -220,16 +235,35 @@ pub(crate) struct GpuAdapterSample {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct GpuSnapshot {
+pub(crate) struct GpuInventorySnapshot {
+    pub(crate) generation: u64,
+    pub(crate) adapters: Vec<Arc<GpuAdapterInfo>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GpuDynamicSnapshot {
     pub(crate) generation: u64,
     pub(crate) timestamp_ms: u64,
     pub(crate) adapters: Vec<GpuAdapterSample>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GpuMetadataSnapshot {
+    pub(crate) generation: u64,
+    pub(crate) adapters: Vec<GpuAdapterMetadata>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GpuMetadataRequest {
+    pub(crate) generation: u64,
+    pub(crate) adapters: Vec<Arc<GpuAdapterInfo>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum GpuCollectOutcome {
-    Primed,
-    Snapshot(GpuSnapshot),
+    Inventory(GpuInventorySnapshot),
+    AwaitingBaseline { generation: u64 },
+    Dynamic(GpuDynamicSnapshot),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -254,8 +288,12 @@ struct ParsedEngineInstance {
 pub(crate) struct GpuCollector {
     topology: Option<GpuTopology>,
     pdh: Option<PdhQuery>,
+    pdh_error: Option<GpuSampleError>,
     engine_kinds: HashMap<GpuEngineId, GpuEngineKind>,
     generation: u64,
+    inventory_pending: bool,
+    dynamic_ready: bool,
+    startup_started_ms: u64,
 }
 
 impl GpuCollector {
@@ -263,8 +301,12 @@ impl GpuCollector {
         Self {
             topology: None,
             pdh: None,
+            pdh_error: None,
             engine_kinds: HashMap::new(),
             generation: 0,
+            inventory_pending: false,
+            dynamic_ready: false,
+            startup_started_ms: unsafe { GetTickCount64() },
         }
     }
 
@@ -280,24 +322,49 @@ impl GpuCollector {
         let topology = self.topology.as_ref().ok_or(GpuSampleError::InvalidData {
             context: "GPU topology commit",
         })?;
+        if self.inventory_pending {
+            self.inventory_pending = false;
+            record_startup_timing(
+                "GPU inventory ready",
+                unsafe { GetTickCount64() }.wrapping_sub(self.startup_started_ms),
+            );
+            return Ok(GpuCollectOutcome::Inventory(GpuInventorySnapshot {
+                generation: self.generation,
+                adapters: topology.infos.clone(),
+            }));
+        }
         if topology.infos.is_empty() {
-            return Ok(GpuCollectOutcome::Snapshot(GpuSnapshot {
+            return Ok(GpuCollectOutcome::Dynamic(GpuDynamicSnapshot {
                 generation: self.generation,
                 timestamp_ms: unsafe { GetTickCount64() },
                 adapters: Vec::new(),
             }));
         }
 
+        if let Some(error) = self.pdh_error.clone() {
+            return Err(error);
+        }
+
         let pdh = self.pdh.as_mut().ok_or(GpuSampleError::InvalidData {
             context: "GPU PDH query state",
         })?;
         if !pdh.collect()? {
-            return Ok(GpuCollectOutcome::Primed);
+            return Ok(GpuCollectOutcome::AwaitingBaseline {
+                generation: self.generation,
+            });
         }
 
-        let engine_readings = pdh.read_engine_values()?;
-        let dedicated_readings = pdh.read_memory_values(pdh.dedicated_counter)?;
-        let shared_readings = pdh.read_memory_values(pdh.shared_counter)?;
+        let engine_readings = match pdh.read_engine_values() {
+            Ok(values) => values,
+            Err(error) if !self.dynamic_ready && error.is_baseline_pending() => {
+                return Ok(GpuCollectOutcome::AwaitingBaseline {
+                    generation: self.generation,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let dedicated_readings = pdh.read_dedicated_memory_values()?;
+        let shared_readings = pdh.read_shared_memory_values()?;
         let temperatures = topology.query_temperatures();
         let adapters = assemble_samples(
             &topology.infos,
@@ -308,8 +375,15 @@ impl GpuCollector {
             temperatures,
         )?;
         self.engine_kinds = validated_engine_kinds(&self.engine_kinds, &adapters)?;
+        if !self.dynamic_ready {
+            record_startup_timing(
+                "GPU first dynamic sample",
+                unsafe { GetTickCount64() }.wrapping_sub(self.startup_started_ms),
+            );
+            self.dynamic_ready = true;
+        }
 
-        Ok(GpuCollectOutcome::Snapshot(GpuSnapshot {
+        Ok(GpuCollectOutcome::Dynamic(GpuDynamicSnapshot {
             generation: self.generation,
             timestamp_ms: unsafe { GetTickCount64() },
             adapters,
@@ -317,17 +391,34 @@ impl GpuCollector {
     }
 
     fn rebuild(&mut self) -> Result<(), GpuSampleError> {
+        self.startup_started_ms = unsafe { GetTickCount64() };
+        let topology_started_ms = self.startup_started_ms;
         let candidate_topology = GpuTopology::query()?;
-        let candidate_pdh = if candidate_topology.infos.is_empty() {
-            None
+        record_startup_timing(
+            "GPU DXGI inventory",
+            unsafe { GetTickCount64() }.wrapping_sub(topology_started_ms),
+        );
+        let baseline_started_ms = unsafe { GetTickCount64() };
+        let (candidate_pdh, pdh_error) = if candidate_topology.infos.is_empty() {
+            (None, None)
         } else {
-            Some(PdhQuery::new()?)
+            match PdhQuery::new().and_then(|mut query| query.collect().map(|_| query)) {
+                Ok(query) => (Some(query), None),
+                Err(error) => (None, Some(error)),
+            }
         };
+        record_startup_timing(
+            "GPU PDH baseline",
+            unsafe { GetTickCount64() }.wrapping_sub(baseline_started_ms),
+        );
 
         self.topology = Some(candidate_topology);
         self.pdh = candidate_pdh;
+        self.pdh_error = pdh_error;
         self.engine_kinds.clear();
         self.generation = self.generation.wrapping_add(1).max(1);
+        self.inventory_pending = true;
+        self.dynamic_ready = false;
         Ok(())
     }
 }
@@ -344,6 +435,9 @@ struct PdhQuery {
     dedicated_counter: PDH_HCOUNTER,
     shared_counter: PDH_HCOUNTER,
     primed: bool,
+    engine_storage: Vec<usize>,
+    dedicated_storage: Vec<usize>,
+    shared_storage: Vec<usize>,
 }
 
 impl PdhQuery {
@@ -364,6 +458,9 @@ impl PdhQuery {
                 dedicated_counter: null_mut(),
                 shared_counter: null_mut(),
                 primed: false,
+                engine_storage: Vec::new(),
+                dedicated_storage: Vec::new(),
+                shared_storage: Vec::new(),
             };
             candidate.engine_counter = candidate.add_counter(ENGINE_COUNTER_PATH)?;
             candidate.dedicated_counter = candidate.add_counter(DEDICATED_MEMORY_COUNTER_PATH)?;
@@ -402,8 +499,12 @@ impl PdhQuery {
         Ok(true)
     }
 
-    fn read_engine_values(&self) -> Result<Vec<EngineReading>, GpuSampleError> {
-        let items = query_counter_array(self.engine_counter, PDH_FMT_DOUBLE)?;
+    fn read_engine_values(&mut self) -> Result<Vec<EngineReading>, GpuSampleError> {
+        let items = query_counter_array(
+            self.engine_counter,
+            PDH_FMT_DOUBLE,
+            &mut self.engine_storage,
+        )?;
         items
             .into_iter()
             .map(|item| {
@@ -421,11 +522,19 @@ impl PdhQuery {
             .collect()
     }
 
+    fn read_dedicated_memory_values(&mut self) -> Result<Vec<MemoryReading>, GpuSampleError> {
+        Self::read_memory_values(self.dedicated_counter, &mut self.dedicated_storage)
+    }
+
+    fn read_shared_memory_values(&mut self) -> Result<Vec<MemoryReading>, GpuSampleError> {
+        Self::read_memory_values(self.shared_counter, &mut self.shared_storage)
+    }
+
     fn read_memory_values(
-        &self,
         counter: PDH_HCOUNTER,
+        storage: &mut Vec<usize>,
     ) -> Result<Vec<MemoryReading>, GpuSampleError> {
-        let items = query_counter_array(counter, PDH_FMT_LARGE)?;
+        let items = query_counter_array(counter, PDH_FMT_LARGE, storage)?;
         items
             .into_iter()
             .map(|item| {
@@ -464,6 +573,7 @@ struct CounterArrayItem {
 fn query_counter_array(
     counter: PDH_HCOUNTER,
     format: u32,
+    storage: &mut Vec<usize>,
 ) -> Result<Vec<CounterArrayItem>, GpuSampleError> {
     unsafe {
         let mut byte_count = 0u32;
@@ -492,7 +602,9 @@ fn query_counter_array(
 
         let word_size = size_of::<usize>();
         let words = (byte_count as usize).div_ceil(word_size);
-        let mut storage = vec![0usize; words];
+        if storage.len() < words {
+            storage.resize(words, 0);
+        }
         let status = PdhGetFormattedCounterArrayW(
             counter,
             format,
@@ -631,7 +743,6 @@ impl GpuTopology {
                     context: "duplicate DXGI adapter LUID",
                 });
             }
-
             if desc.Flags.0 & (DXGI_ADAPTER_FLAG3_SOFTWARE.0 | DXGI_ADAPTER_FLAG3_REMOTE.0) != 0 {
                 continue;
             }
@@ -640,45 +751,12 @@ impl GpuTopology {
             let kmt = OwnedKmtAdapter::open(luid)?;
             let physical_count = validated_physical_adapter_count(kmt.physical_count()?)?;
 
-            let mut adapter_errors = Vec::new();
-            let feature_level = match query_directx_feature_level(&adapter) {
-                Ok(value) => value,
-                Err(error) => {
-                    adapter_errors.push(error);
-                    None
-                }
-            };
-
             for physical_index in 0..physical_count {
-                let mut metadata_errors = adapter_errors.clone();
-                let driver = match query_driver_details(&kmt, physical_index) {
-                    Ok((details, errors)) => {
-                        metadata_errors.extend(errors);
-                        details
-                    }
-                    Err(error) => {
-                        metadata_errors.push(error);
-                        GpuDriverDetails::default()
-                    }
-                };
                 let single_physical_adapter = physical_count == 1;
                 let dedicated_limit_bytes =
                     single_physical_adapter.then_some(desc.DedicatedVideoMemory as u64);
                 let shared_limit_bytes =
                     single_physical_adapter.then_some(desc.SharedSystemMemory as u64);
-                // Preserve the driver-reported capacity exactly; rounding it to a marketed size
-                // would fabricate reserved bytes on adapters whose physical total is unavailable.
-                let hardware_reserved_bytes = match kmt
-                    .installed_adapter_memory(physical_index)
-                    .and_then(|installed_memory| {
-                        validated_hardware_reserved_memory(installed_memory, dedicated_limit_bytes)
-                    }) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        metadata_errors.push(error);
-                        None
-                    }
-                };
                 infos.push(Arc::new(GpuAdapterInfo {
                     id: GpuAdapterId {
                         luid,
@@ -692,17 +770,10 @@ impl GpuTopology {
                     revision: desc.Revision,
                     dedicated_limit_bytes,
                     shared_limit_bytes,
-                    hardware_reserved_bytes,
-                    driver,
-                    directx_feature_level: feature_level.clone(),
-                    metadata_errors,
                 }));
             }
-
             logical_adapters.push(LogicalAdapterRuntime { luid, kmt });
         }
-
-        infos.sort_by(|left, right| compare_adapter_info(left, right));
 
         Ok(Self {
             factory,
@@ -717,7 +788,7 @@ impl GpuTopology {
     }
 
     fn query_temperatures(&self) -> HashMap<GpuAdapterId, Result<Option<u32>, GpuSampleError>> {
-        let mut values = HashMap::new();
+        let mut values = HashMap::with_capacity(self.infos.len());
         for info in &self.infos {
             let result = self
                 .logical_adapters
@@ -735,6 +806,217 @@ impl GpuTopology {
         }
         values
     }
+}
+
+pub(crate) struct GpuMetadataCollector {
+    d3d12: Result<D3d12Runtime, GpuSampleError>,
+    generation: Option<u64>,
+    inventory: Vec<Arc<GpuAdapterInfo>>,
+    kmt_adapters: HashMap<AdapterLuid, OwnedKmtAdapter>,
+    snapshot: Option<GpuMetadataSnapshot>,
+}
+
+impl GpuMetadataCollector {
+    pub(crate) fn new() -> Self {
+        let started_ms = unsafe { GetTickCount64() };
+        let d3d12 = D3d12Runtime::load();
+        record_startup_timing(
+            "GPU metadata worker initialization",
+            unsafe { GetTickCount64() }.wrapping_sub(started_ms),
+        );
+        Self {
+            d3d12,
+            generation: None,
+            inventory: Vec::new(),
+            kmt_adapters: HashMap::new(),
+            snapshot: None,
+        }
+    }
+
+    pub(crate) fn collect(
+        &mut self,
+        request: GpuMetadataRequest,
+    ) -> Result<GpuMetadataSnapshot, GpuSampleError> {
+        let started_ms = unsafe { GetTickCount64() };
+        if request.generation == 0 {
+            return Err(GpuSampleError::InvalidData {
+                context: "GPU metadata generation",
+            });
+        }
+        let mut adapter_ids = HashSet::with_capacity(request.adapters.len());
+        if request
+            .adapters
+            .iter()
+            .any(|adapter| !adapter_ids.insert(adapter.id))
+        {
+            return Err(GpuSampleError::InvalidData {
+                context: "duplicate GPU metadata adapter identity",
+            });
+        }
+        if self.generation == Some(request.generation) && self.inventory == request.adapters {
+            return self.snapshot.clone().ok_or(GpuSampleError::InvalidData {
+                context: "GPU metadata cached snapshot",
+            });
+        }
+        if self.generation == Some(request.generation) {
+            return Err(GpuSampleError::InvalidData {
+                context: "GPU inventory changed without a new generation",
+            });
+        }
+
+        let requested_luids: HashSet<_> =
+            request.adapters.iter().map(|info| info.id.luid).collect();
+        let dxgi_adapters = query_dxgi_adapters(&requested_luids);
+        let info_set = OwnedDeviceInfoSet::display_devices();
+        let mut kmt_adapters = HashMap::with_capacity(requested_luids.len());
+        let mut kmt_errors = HashMap::new();
+        for luid in requested_luids.iter().copied() {
+            match OwnedKmtAdapter::open(luid) {
+                Ok(adapter) => {
+                    kmt_adapters.insert(luid, adapter);
+                }
+                Err(error) => {
+                    kmt_errors.insert(luid, error);
+                }
+            }
+        }
+
+        let mut directx_by_luid = HashMap::with_capacity(requested_luids.len());
+        for luid in requested_luids.iter().copied() {
+            let value = match (&self.d3d12, &dxgi_adapters) {
+                (Ok(runtime), Ok(adapters)) => adapters
+                    .get(&luid)
+                    .ok_or(GpuSampleError::InvalidData {
+                        context: "missing DXGI adapter for GPU metadata",
+                    })
+                    .and_then(|adapter| runtime.query_feature_level(adapter)),
+                (Err(error), _) | (_, Err(error)) => Err(error.clone()),
+            };
+            directx_by_luid.insert(luid, value);
+        }
+
+        let mut adapters = Vec::with_capacity(request.adapters.len());
+        for info in &request.adapters {
+            let mut metadata_errors = Vec::new();
+            let mut driver = GpuDriverDetails::default();
+            let mut hardware_reserved_bytes = None;
+
+            match kmt_adapters.get(&info.id.luid) {
+                Some(kmt) => {
+                    match kmt
+                        .installed_adapter_memory(info.id.physical_index)
+                        .and_then(|installed_memory| {
+                            validated_hardware_reserved_memory(
+                                installed_memory,
+                                info.dedicated_limit_bytes,
+                            )
+                        }) {
+                        Ok(value) => hardware_reserved_bytes = value,
+                        Err(error) => metadata_errors.push(error),
+                    }
+                    match &info_set {
+                        Ok(info_set) => {
+                            match query_driver_details(kmt, info.id.physical_index, info_set) {
+                                Ok((value, errors)) => {
+                                    driver = value;
+                                    metadata_errors.extend(errors);
+                                }
+                                Err(error) => metadata_errors.push(error),
+                            }
+                        }
+                        Err(error) => metadata_errors.push(error.clone()),
+                    }
+                }
+                None => metadata_errors.push(kmt_errors.get(&info.id.luid).cloned().unwrap_or(
+                    GpuSampleError::InvalidData {
+                        context: "missing KMT adapter for GPU metadata",
+                    },
+                )),
+            }
+
+            let directx_feature_level = match directx_by_luid.get(&info.id.luid) {
+                Some(Ok(value)) => value.clone(),
+                Some(Err(error)) => {
+                    metadata_errors.push(error.clone());
+                    None
+                }
+                None => {
+                    metadata_errors.push(GpuSampleError::InvalidData {
+                        context: "missing DirectX metadata result",
+                    });
+                    None
+                }
+            };
+            adapters.push(GpuAdapterMetadata {
+                id: info.id,
+                hardware_reserved_bytes,
+                driver,
+                directx_feature_level,
+                metadata_errors,
+            });
+        }
+
+        let snapshot = GpuMetadataSnapshot {
+            generation: request.generation,
+            adapters,
+        };
+        self.generation = Some(request.generation);
+        self.inventory = request.adapters;
+        self.kmt_adapters = kmt_adapters;
+        self.snapshot = Some(snapshot.clone());
+        record_startup_timing(
+            "GPU metadata ready",
+            unsafe { GetTickCount64() }.wrapping_sub(started_ms),
+        );
+        Ok(snapshot)
+    }
+}
+
+fn query_dxgi_adapters(
+    requested_luids: &HashSet<AdapterLuid>,
+) -> Result<HashMap<AdapterLuid, IDXGIAdapter1>, GpuSampleError> {
+    let factory: IDXGIFactory1 =
+        unsafe { CreateDXGIFactory1() }.map_err(|error| GpuSampleError::HResult {
+            context: "CreateDXGIFactory1 for GPU metadata",
+            code: error.code().0,
+        })?;
+    let mut adapters = HashMap::with_capacity(requested_luids.len());
+    let mut index = 0u32;
+    loop {
+        let adapter = match unsafe { factory.EnumAdapters1(index) } {
+            Ok(adapter) => adapter,
+            Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
+            Err(error) => {
+                return Err(GpuSampleError::HResult {
+                    context: "IDXGIFactory1::EnumAdapters1 for GPU metadata",
+                    code: error.code().0,
+                });
+            }
+        };
+        index = index.checked_add(1).ok_or(GpuSampleError::InvalidData {
+            context: "GPU metadata DXGI enumeration index",
+        })?;
+        let adapter4: IDXGIAdapter4 = adapter.cast().map_err(|error| GpuSampleError::HResult {
+            context: "IDXGIAdapter1 to IDXGIAdapter4 for GPU metadata",
+            code: error.code().0,
+        })?;
+        let desc = unsafe { adapter4.GetDesc3() }.map_err(|error| GpuSampleError::HResult {
+            context: "IDXGIAdapter4::GetDesc3 for GPU metadata",
+            code: error.code().0,
+        })?;
+        let luid = AdapterLuid::from_windows(desc.AdapterLuid);
+        if requested_luids.contains(&luid) && adapters.insert(luid, adapter).is_some() {
+            return Err(GpuSampleError::InvalidData {
+                context: "duplicate DXGI LUID for GPU metadata",
+            });
+        }
+    }
+    if adapters.len() != requested_luids.len() {
+        return Err(GpuSampleError::InvalidData {
+            context: "GPU metadata DXGI adapter completeness",
+        });
+    }
+    Ok(adapters)
 }
 
 fn validated_physical_adapter_count(count: u32) -> Result<u32, GpuSampleError> {
@@ -764,24 +1046,6 @@ fn validated_hardware_reserved_memory(
         .ok_or(GpuSampleError::InvalidData {
             context: "GPU installed memory is below the dedicated limit",
         })
-}
-
-fn compare_adapter_info(left: &GpuAdapterInfo, right: &GpuAdapterInfo) -> Ordering {
-    match (
-        left.driver.location_path.as_ref(),
-        right.driver.location_path.as_ref(),
-    ) {
-        (Some(left_path), Some(right_path)) => left_path
-            .cmp(right_path)
-            .then_with(|| left.enumeration_index.cmp(&right.enumeration_index))
-            .then_with(|| left.id.physical_index.cmp(&right.id.physical_index)),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => left
-            .enumeration_index
-            .cmp(&right.enumeration_index)
-            .then_with(|| left.id.physical_index.cmp(&right.id.physical_index)),
-    }
 }
 
 struct OwnedKmtAdapter {
@@ -1002,7 +1266,7 @@ fn assemble_samples(
 ) -> Result<Vec<GpuAdapterSample>, GpuSampleError> {
     let displayed_ids: HashSet<_> = infos.iter().map(|info| info.id).collect();
     let mut engine_instances = HashSet::new();
-    let mut engines: BTreeMap<GpuEngineId, (GpuEngineKind, f64)> = BTreeMap::new();
+    let mut engines: HashMap<GpuEngineId, (GpuEngineKind, f64)> = HashMap::new();
     for reading in engine_readings {
         let parsed = parse_engine_instance(&reading.instance_name)?;
         if !known_luids.contains(&parsed.id.adapter.luid) {
@@ -1047,17 +1311,24 @@ fn assemble_samples(
         "duplicate shared GPU memory instance",
     )?;
 
+    let mut engines_by_adapter: HashMap<GpuAdapterId, Vec<GpuEngineSample>> = HashMap::new();
+    for (id, (kind, value)) in engines {
+        engines_by_adapter
+            .entry(id.adapter)
+            .or_default()
+            .push(GpuEngineSample {
+                id,
+                kind,
+                utilization_percent: percentage_to_u8(value),
+            });
+    }
+    for adapter_engines in engines_by_adapter.values_mut() {
+        adapter_engines.sort_by_key(|engine| engine.id.ordinal);
+    }
+
     let mut samples = Vec::with_capacity(infos.len());
     for info in infos {
-        let adapter_engines: Vec<_> = engines
-            .iter()
-            .filter(|(id, _)| id.adapter == info.id)
-            .map(|(id, (kind, value))| GpuEngineSample {
-                id: *id,
-                kind: kind.clone(),
-                utilization_percent: percentage_to_u8(*value),
-            })
-            .collect();
+        let adapter_engines = engines_by_adapter.remove(&info.id).unwrap_or_default();
         let overall_utilization_percent = adapter_engines
             .iter()
             .map(|engine| engine.utilization_percent)
@@ -1251,12 +1522,13 @@ fn decode_fixed_wide(value: &[u16]) -> Result<String, GpuSampleError> {
 fn query_driver_details(
     adapter: &OwnedKmtAdapter,
     physical_index: u32,
+    info_set: &OwnedDeviceInfoSet,
 ) -> Result<(GpuDriverDetails, Vec<GpuSampleError>), GpuSampleError> {
     let key = adapter.pnp_hardware_key(physical_index)?;
     let instance_id = device_instance_id_from_pnp_key(&key).ok_or(GpuSampleError::InvalidData {
         context: "GPU PnP hardware key shape",
     })?;
-    query_setupapi_details(&instance_id)
+    query_setupapi_details(info_set, &instance_id)
 }
 
 fn device_instance_id_from_pnp_key(value: &str) -> Option<String> {
@@ -1273,6 +1545,19 @@ fn device_instance_id_from_pnp_key(value: &str) -> Option<String> {
 }
 
 struct OwnedDeviceInfoSet(HDEVINFO);
+
+impl OwnedDeviceInfoSet {
+    fn display_devices() -> Result<Self, GpuSampleError> {
+        let info_set = unsafe {
+            SetupDiGetClassDevsW(&GUID_DEVCLASS_DISPLAY, null(), null_mut(), DIGCF_PRESENT)
+        };
+        if info_set == INVALID_HANDLE_VALUE as isize {
+            Err(last_win32_error("SetupDiGetClassDevsW for GPU adapters"))
+        } else {
+            Ok(Self(info_set))
+        }
+    }
+}
 
 impl Drop for OwnedDeviceInfoSet {
     fn drop(&mut self) {
@@ -1294,15 +1579,10 @@ impl Drop for OwnedDeviceInfoSet {
 }
 
 fn query_setupapi_details(
+    info_set: &OwnedDeviceInfoSet,
     instance_id: &str,
 ) -> Result<(GpuDriverDetails, Vec<GpuSampleError>), GpuSampleError> {
     unsafe {
-        let info_set =
-            SetupDiGetClassDevsW(&GUID_DEVCLASS_DISPLAY, null(), null_mut(), DIGCF_PRESENT);
-        if info_set == INVALID_HANDLE_VALUE as isize {
-            return Err(last_win32_error("SetupDiGetClassDevsW for GPU adapter"));
-        }
-        let info_set = OwnedDeviceInfoSet(info_set);
         let mut device_info = SP_DEVINFO_DATA {
             cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
             ..zeroed()
@@ -1505,63 +1785,81 @@ unsafe fn query_device_property(
     Ok(Some((property_type, buffer)))
 }
 
-fn query_directx_feature_level(adapter: &IDXGIAdapter1) -> Result<Option<String>, GpuSampleError> {
-    let library = DynamicLibrary::load("d3d12.dll")?;
-    let procedure = unsafe { GetProcAddress(library.0, c"D3D12CreateDevice".as_ptr().cast()) };
-    let Some(procedure) = procedure else {
-        return Err(last_win32_error("GetProcAddress for D3D12CreateDevice"));
-    };
-    type CreateDevice = unsafe extern "system" fn(
-        *mut c_void,
-        D3D_FEATURE_LEVEL,
-        *const windows::core::GUID,
-        *mut *mut c_void,
-    ) -> i32;
-    // Safety: `procedure` comes from d3d12.dll under the documented D3D12CreateDevice export,
-    // and `library` remains alive for every call through the typed function pointer.
-    let create_device: CreateDevice = unsafe { std::mem::transmute(procedure) };
-    let mut raw_device = null_mut();
-    let result = unsafe {
-        create_device(
-            adapter.as_raw(),
+type D3d12CreateDevice = unsafe extern "system" fn(
+    *mut c_void,
+    D3D_FEATURE_LEVEL,
+    *const windows::core::GUID,
+    *mut *mut c_void,
+) -> i32;
+
+struct D3d12Runtime {
+    _library: DynamicLibrary,
+    create_device: D3d12CreateDevice,
+}
+
+impl D3d12Runtime {
+    fn load() -> Result<Self, GpuSampleError> {
+        let library = DynamicLibrary::load("d3d12.dll")?;
+        let procedure = unsafe { GetProcAddress(library.0, c"D3D12CreateDevice".as_ptr().cast()) };
+        let Some(procedure) = procedure else {
+            return Err(last_win32_error("GetProcAddress for D3D12CreateDevice"));
+        };
+        // Safety: the symbol is obtained from the loaded system d3d12.dll under its documented
+        // export name, and `_library` keeps the code address alive for the runtime's lifetime.
+        let create_device: D3d12CreateDevice = unsafe { std::mem::transmute(procedure) };
+        Ok(Self {
+            _library: library,
+            create_device,
+        })
+    }
+
+    fn query_feature_level(
+        &self,
+        adapter: &IDXGIAdapter1,
+    ) -> Result<Option<String>, GpuSampleError> {
+        let mut raw_device = null_mut();
+        let result = unsafe {
+            (self.create_device)(
+                adapter.as_raw(),
+                D3D_FEATURE_LEVEL_11_0,
+                &ID3D12Device::IID,
+                &mut raw_device,
+            )
+        };
+        if result < 0 {
+            return Ok(None);
+        }
+        if raw_device.is_null() {
+            return Err(GpuSampleError::InvalidData {
+                context: "D3D12CreateDevice output",
+            });
+        }
+        let device = unsafe { ID3D12Device::from_raw(raw_device) };
+        let requested = [
+            D3D_FEATURE_LEVEL_12_2,
+            D3D_FEATURE_LEVEL_12_1,
+            D3D_FEATURE_LEVEL_12_0,
+            D3D_FEATURE_LEVEL_11_1,
             D3D_FEATURE_LEVEL_11_0,
-            &ID3D12Device::IID,
-            &mut raw_device,
-        )
-    };
-    if result < 0 {
-        return Ok(None);
+        ];
+        let mut levels = D3D12_FEATURE_DATA_FEATURE_LEVELS {
+            NumFeatureLevels: requested.len() as u32,
+            pFeatureLevelsRequested: requested.as_ptr(),
+            MaxSupportedFeatureLevel: D3D_FEATURE_LEVEL_11_0,
+        };
+        unsafe {
+            device.CheckFeatureSupport(
+                D3D12_FEATURE_FEATURE_LEVELS,
+                (&mut levels as *mut D3D12_FEATURE_DATA_FEATURE_LEVELS).cast(),
+                size_of::<D3D12_FEATURE_DATA_FEATURE_LEVELS>() as u32,
+            )
+        }
+        .map_err(|error| GpuSampleError::HResult {
+            context: "ID3D12Device::CheckFeatureSupport",
+            code: error.code().0,
+        })?;
+        Ok(feature_level_name(levels.MaxSupportedFeatureLevel).map(str::to_string))
     }
-    if raw_device.is_null() {
-        return Err(GpuSampleError::InvalidData {
-            context: "D3D12CreateDevice output",
-        });
-    }
-    let device = unsafe { ID3D12Device::from_raw(raw_device) };
-    let requested = [
-        D3D_FEATURE_LEVEL_12_2,
-        D3D_FEATURE_LEVEL_12_1,
-        D3D_FEATURE_LEVEL_12_0,
-        D3D_FEATURE_LEVEL_11_1,
-        D3D_FEATURE_LEVEL_11_0,
-    ];
-    let mut levels = D3D12_FEATURE_DATA_FEATURE_LEVELS {
-        NumFeatureLevels: requested.len() as u32,
-        pFeatureLevelsRequested: requested.as_ptr(),
-        MaxSupportedFeatureLevel: D3D_FEATURE_LEVEL_11_0,
-    };
-    unsafe {
-        device.CheckFeatureSupport(
-            D3D12_FEATURE_FEATURE_LEVELS,
-            (&mut levels as *mut D3D12_FEATURE_DATA_FEATURE_LEVELS).cast(),
-            size_of::<D3D12_FEATURE_DATA_FEATURE_LEVELS>() as u32,
-        )
-    }
-    .map_err(|error| GpuSampleError::HResult {
-        context: "ID3D12Device::CheckFeatureSupport",
-        code: error.code().0,
-    })?;
-    Ok(feature_level_name(levels.MaxSupportedFeatureLevel).map(str::to_string))
 }
 
 fn feature_level_name(level: D3D_FEATURE_LEVEL) -> Option<&'static str> {
@@ -1635,10 +1933,6 @@ mod tests {
             revision: 4,
             dedicated_limit_bytes: Some(8 * 1024 * 1024 * 1024),
             shared_limit_bytes: Some(4 * 1024 * 1024 * 1024),
-            hardware_reserved_bytes: Some(256 * 1024 * 1024),
-            driver: GpuDriverDetails::default(),
-            directx_feature_level: None,
-            metadata_errors: Vec::new(),
         })
     }
 
@@ -1677,30 +1971,24 @@ mod tests {
     }
 
     #[test]
-    fn adapter_order_uses_verified_location_then_dxgi_enumeration_order() {
-        let make_info = |low_part: u32, enumeration_index: u32, location: Option<&str>| {
+    fn inventory_order_can_preserve_dxgi_enumeration_order() {
+        let make_info = |low_part: u32, enumeration_index: u32| {
             let id = GpuAdapterId {
                 luid: AdapterLuid::from_parts(0, low_part),
                 physical_index: 0,
             };
             let mut info = (*adapter_info(id)).clone();
             info.enumeration_index = enumeration_index;
-            info.driver.location_path = location.map(str::to_string);
             Arc::new(info)
         };
-        let mut infos = [
-            make_info(1, 1, None),
-            make_info(2, 2, Some("PCIROOT(0)#PCI(0200)")),
-            make_info(3, 0, None),
-            make_info(4, 3, Some("PCIROOT(0)#PCI(0100)")),
-        ];
-        infos.sort_by(|left, right| compare_adapter_info(left, right));
+        let mut infos = [make_info(1, 2), make_info(2, 0), make_info(3, 1)];
+        infos.sort_by_key(|info| (info.enumeration_index, info.id.physical_index));
         assert_eq!(
             infos
                 .iter()
                 .map(|info| info.id.luid.low_part)
                 .collect::<Vec<_>>(),
-            vec![4, 2, 3, 1]
+            vec![2, 3, 1]
         );
     }
 
@@ -1892,6 +2180,50 @@ mod tests {
     }
 
     #[test]
+    fn known_non_displayed_adapter_instances_are_ignored_without_weakening_identity_checks() {
+        let displayed = GpuAdapterId {
+            luid: AdapterLuid::from_parts(0, 0x10),
+            physical_index: 0,
+        };
+        let non_displayed_luid = AdapterLuid::from_parts(0, 0x20);
+        let samples = assemble_samples(
+            &[adapter_info(displayed)],
+            &HashSet::from([displayed.luid, non_displayed_luid]),
+            vec![EngineReading {
+                instance_name: "pid_1_luid_0x0_0x20_phys_0_eng_0_engtype_3d".to_string(),
+                utilization: 50.0,
+            }],
+            vec![MemoryReading {
+                instance_name: "luid_0x0_0x10_phys_0".to_string(),
+                bytes: 100,
+            }],
+            vec![MemoryReading {
+                instance_name: "luid_0x0_0x10_phys_0".to_string(),
+                bytes: 200,
+            }],
+            HashMap::from([(displayed, Ok(None))]),
+        )
+        .unwrap();
+        assert!(samples[0].engines.is_empty());
+
+        let unknown = EngineReading {
+            instance_name: "pid_1_luid_0x0_0x30_phys_0_eng_0_engtype_3d".to_string(),
+            utilization: 1.0,
+        };
+        assert!(
+            assemble_samples(
+                &[adapter_info(displayed)],
+                &HashSet::from([displayed.luid, non_displayed_luid]),
+                vec![unknown],
+                Vec::new(),
+                Vec::new(),
+                HashMap::from([(displayed, Ok(None))]),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn clamps_only_the_final_engine_display_value() {
         assert_eq!(percentage_to_u8(101.7), 100);
         assert_eq!(percentage_to_u8(49.5), 50);
@@ -1930,5 +2262,37 @@ mod tests {
             .as_deref(),
             Some(r"PCI\VEN_1234&DEV_5678\ABC")
         );
+    }
+
+    #[test]
+    #[ignore = "requires live Windows DXGI, KMT, SetupAPI, D3D12, and PDH services"]
+    fn live_gpu_sources_submit_inventory_before_optional_details() {
+        let mut collector = GpuCollector::new();
+        let inventory = match collector.collect().expect("GPU inventory query") {
+            GpuCollectOutcome::Inventory(inventory) => inventory,
+            other => panic!("first GPU completion was not inventory: {other:?}"),
+        };
+        assert_ne!(inventory.generation, 0);
+
+        let mut metadata_collector = GpuMetadataCollector::new();
+        let metadata = metadata_collector
+            .collect(GpuMetadataRequest {
+                generation: inventory.generation,
+                adapters: inventory.adapters.clone(),
+            })
+            .expect("GPU metadata query");
+        assert_eq!(metadata.generation, inventory.generation);
+        assert_eq!(metadata.adapters.len(), inventory.adapters.len());
+
+        match collector.collect().expect("second GPU sample") {
+            GpuCollectOutcome::AwaitingBaseline { generation } => {
+                assert_eq!(generation, inventory.generation);
+            }
+            GpuCollectOutcome::Dynamic(snapshot) => {
+                assert_eq!(snapshot.generation, inventory.generation);
+                assert_eq!(snapshot.adapters.len(), inventory.adapters.len());
+            }
+            GpuCollectOutcome::Inventory(_) => panic!("inventory was submitted twice"),
+        }
     }
 }

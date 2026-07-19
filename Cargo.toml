@@ -2,7 +2,7 @@
 # 这里定义包名、版本、发布构建策略，以及 Win32 API 绑定所需的功能开关。
 [package]
 name = "taskmgr-rs"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["taskmgr-rs contributors"]
 description = "A classic Windows Task Manager built in Rust with native Win32 APIs."
 license = "MIT"

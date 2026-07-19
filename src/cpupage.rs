@@ -8,7 +8,7 @@
 //   作者:       OpenAI Codex
 // --------------------------------------------------------------------------
 
-//! Owns the classic CPU diagnostics page, its histories, worker, and responsive layout.
+//! Owns the classic CPU diagnostics page, its histories, workers, and responsive layout.
 //!
 //! System samples and slower diagnostic sources are committed independently. Every worker
 //! completion carries a group-aware topology key; data for a previous topology is discarded
@@ -44,9 +44,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::background_worker::BackgroundWorker;
 use crate::chart_renderer::{ChartColor, ChartRenderer};
 use crate::cpu_details::{
-    CpuArchitecture, CpuCacheInfo, CpuCacheKind, CpuComponentUpdate, CpuDetailCollector,
-    CpuDetailError, CpuDetailRefresh, CpuDetailRequest, CpuDetailSnapshot, CpuDynamicInfo,
-    CpuFeatureInfo, CpuFirmwareProcessor, CpuSupplementalTopology, CpuTopologyKey,
+    CpuArchitecture, CpuCacheInfo, CpuCacheKind, CpuComponentUpdate, CpuDetailError,
+    CpuDetailRefresh, CpuDetailRequest, CpuDynamicInfo, CpuFeatureInfo, CpuFirmwareCollector,
+    CpuFirmwareProcessor, CpuFirmwareSnapshot, CpuNativeCollector, CpuNativeSnapshot,
+    CpuSupplementalTopology, CpuTopologyKey,
 };
 use crate::cpu_layout::{CpuLayoutMetrics, CpuLayoutPlan, compute_cpu_layout};
 use crate::cpu_topology::{CoreClass, ProcessorTopologySummary};
@@ -61,7 +62,7 @@ use crate::resource::{
     CPU_DETAIL_GROUP_COUNT, CPU_DETAIL_METRIC_COUNTS, IDC_CPU_DETAIL_GRAPH,
     IDC_CPU_DETAIL_GROUP_FIRST, IDC_CPU_DETAIL_LABEL_BASES, IDC_CPU_DETAIL_MODEL,
     IDC_CPU_DETAIL_STATUS, IDC_CPU_DETAIL_TITLE, IDC_CPU_DETAIL_VALUE_BASES,
-    PWM_CPU_WORKER_COMPLETE,
+    PWM_CPU_FIRMWARE_WORKER_COMPLETE, PWM_CPU_WORKER_COMPLETE,
 };
 use crate::system_sampler::{CpuDiagnosticError, CpuDiagnosticSample, SystemSample};
 use crate::winutil::{
@@ -129,7 +130,9 @@ pub(crate) const CPU_DETAIL_METRIC_KEYS: [&[TextKey]; CPU_DETAIL_GROUP_COUNT] = 
 enum CpuPageStatus {
     #[default]
     Loading,
+    LoadingDetails,
     Ready,
+    Partial,
     Unavailable,
     Failed,
     Stale,
@@ -184,16 +187,22 @@ pub(crate) struct CpuPageState {
     show_kernel_times: bool,
     layout_metrics: Option<CpuLayoutMetrics>,
     chart_renderer: ChartRenderer,
-    worker: Option<BackgroundWorker<CpuDetailRequest, CpuDetailSnapshot>>,
-    collection_in_flight: bool,
-    queued_refresh: Option<CpuDetailRefresh>,
+    native_worker: Option<BackgroundWorker<CpuDetailRequest, CpuNativeSnapshot>>,
+    firmware_worker: Option<BackgroundWorker<CpuDetailRequest, CpuFirmwareSnapshot>>,
+    native_collection_in_flight: bool,
+    firmware_collection_in_flight: bool,
+    queued_native_refresh: Option<CpuDetailRefresh>,
+    queued_firmware_refresh: Option<CpuDetailRefresh>,
     topology_key: Option<CpuTopologyKey>,
     topology_summary: Option<ProcessorTopologySummary>,
     topology: ComponentState<CpuSupplementalTopology>,
     firmware: ComponentState<Vec<CpuFirmwareProcessor>>,
     features: ComponentState<CpuFeatureInfo>,
     dynamic: ComponentState<CpuDynamicInfo>,
-    worker_error: Option<CpuDetailError>,
+    native_worker_error: Option<CpuDetailError>,
+    firmware_worker_error: Option<CpuDetailError>,
+    pdh_baseline_timestamp_ms: Option<u64>,
+    last_system_sample_timestamp_ms: Option<u64>,
     system_sample_seen: bool,
     system_sample_stale: bool,
     diagnostic_stale: bool,
@@ -224,16 +233,22 @@ impl CpuPageState {
             show_kernel_times: false,
             layout_metrics: None,
             chart_renderer: ChartRenderer::new(),
-            worker: None,
-            collection_in_flight: false,
-            queued_refresh: None,
+            native_worker: None,
+            firmware_worker: None,
+            native_collection_in_flight: false,
+            firmware_collection_in_flight: false,
+            queued_native_refresh: None,
+            queued_firmware_refresh: None,
             topology_key: None,
             topology_summary: None,
             topology: ComponentState::new(),
             firmware: ComponentState::new(),
             features: ComponentState::new(),
             dynamic: ComponentState::new(),
-            worker_error: None,
+            native_worker_error: None,
+            firmware_worker_error: None,
+            pdh_baseline_timestamp_ms: None,
+            last_system_sample_timestamp_ms: None,
             system_sample_seen: false,
             system_sample_stale: false,
             diagnostic_stale: false,
@@ -262,7 +277,7 @@ impl CpuPageState {
         self.layout_metrics = Some(self.capture_layout_metrics()?);
         self.sync_graph_font()?;
         self.initialize_tooltips()?;
-        self.start_worker()?;
+        self.start_workers()?;
         self.update_visible_texts();
         if !self.size_page() {
             return Err(ERROR_GEN_FAILURE);
@@ -270,18 +285,28 @@ impl CpuPageState {
         Ok(())
     }
 
-    fn start_worker(&mut self) -> Result<(), u32> {
-        if self.worker.is_some() {
+    fn start_workers(&mut self) -> Result<(), u32> {
+        if self.native_worker.is_some() && self.firmware_worker.is_some() {
             return Ok(());
         }
-        self.worker = Some(BackgroundWorker::spawn_initialized(
-            "taskmgr-rs-cpu-details-worker",
+        let native_worker = BackgroundWorker::spawn_initialized(
+            "taskmgr-rs-cpu-native-worker",
             PWM_CPU_WORKER_COMPLETE,
             || {
-                let mut collector = CpuDetailCollector::new();
+                let mut collector = CpuNativeCollector::new();
                 move |request| collector.collect(request)
             },
-        )?);
+        )?;
+        let firmware_worker = BackgroundWorker::spawn_initialized(
+            "taskmgr-rs-cpu-firmware-worker",
+            PWM_CPU_FIRMWARE_WORKER_COMPLETE,
+            || {
+                let mut collector = CpuFirmwareCollector::new();
+                move |request| collector.collect(request)
+            },
+        )?;
+        self.native_worker = Some(native_worker);
+        self.firmware_worker = Some(firmware_worker);
         Ok(())
     }
 
@@ -297,22 +322,27 @@ impl CpuPageState {
     }
 
     pub(crate) fn timer_event(&mut self, refresh: CpuDetailRefresh) {
-        self.request_refresh(refresh);
+        self.request_native_refresh(refresh);
+        if refresh == CpuDetailRefresh::User
+            || self.firmware.value.is_none() && self.firmware.error.is_none()
+        {
+            self.request_firmware_refresh(refresh);
+        }
     }
 
-    fn request_refresh(&mut self, refresh: CpuDetailRefresh) {
+    fn request_native_refresh(&mut self, refresh: CpuDetailRefresh) {
         let Some(topology_key) = self.topology_key.clone() else {
-            self.queue_refresh(refresh);
+            queue_refresh(&mut self.queued_native_refresh, refresh);
             self.update_status_text();
             return;
         };
-        if self.collection_in_flight {
-            self.queue_refresh(refresh);
+        if self.native_collection_in_flight {
+            queue_refresh(&mut self.queued_native_refresh, refresh);
             return;
         }
-        let Some(worker) = self.worker.as_ref() else {
-            self.handle_worker_error(CpuDetailError::Win32 {
-                context: "CPU details worker state",
+        let Some(worker) = self.native_worker.as_ref() else {
+            self.handle_native_worker_error(CpuDetailError::Win32 {
+                context: "CPU native worker state",
                 code: ERROR_BROKEN_PIPE,
             });
             return;
@@ -323,27 +353,53 @@ impl CpuPageState {
         };
         match worker.submit(request, self.hwnd) {
             Ok(()) => {
-                self.collection_in_flight = true;
+                self.native_collection_in_flight = true;
                 self.update_status_text();
             }
-            Err(code) => self.handle_worker_error(CpuDetailError::Win32 {
-                context: "CPU details worker request",
+            Err(code) => self.handle_native_worker_error(CpuDetailError::Win32 {
+                context: "CPU native worker request",
                 code,
             }),
         }
     }
 
-    fn queue_refresh(&mut self, refresh: CpuDetailRefresh) {
-        self.queued_refresh = Some(match self.queued_refresh {
-            Some(current) if refresh_priority(current) >= refresh_priority(refresh) => current,
-            _ => refresh,
-        });
+    fn request_firmware_refresh(&mut self, refresh: CpuDetailRefresh) {
+        let Some(topology_key) = self.topology_key.clone() else {
+            queue_refresh(&mut self.queued_firmware_refresh, refresh);
+            self.update_status_text();
+            return;
+        };
+        if self.firmware_collection_in_flight {
+            queue_refresh(&mut self.queued_firmware_refresh, refresh);
+            return;
+        }
+        let Some(worker) = self.firmware_worker.as_ref() else {
+            self.handle_firmware_worker_error(CpuDetailError::Win32 {
+                context: "CPU firmware worker state",
+                code: ERROR_BROKEN_PIPE,
+            });
+            return;
+        };
+        let request = CpuDetailRequest {
+            topology_key,
+            refresh,
+        };
+        match worker.submit(request, self.hwnd) {
+            Ok(()) => {
+                self.firmware_collection_in_flight = true;
+                self.update_status_text();
+            }
+            Err(code) => self.handle_firmware_worker_error(CpuDetailError::Win32 {
+                context: "CPU firmware worker request",
+                code,
+            }),
+        }
     }
 
-    pub(crate) fn handle_worker_completion(&mut self) {
+    pub(crate) fn handle_native_worker_completion(&mut self) {
         let mut completions = Vec::new();
         let mut disconnected = false;
-        if let Some(worker) = self.worker.as_ref() {
+        if let Some(worker) = self.native_worker.as_ref() {
             loop {
                 match worker.try_recv() {
                     Ok(completion) => completions.push(completion),
@@ -355,44 +411,113 @@ impl CpuPageState {
                 }
             }
         }
-        self.collection_in_flight = false;
+        self.native_collection_in_flight = false;
         if disconnected {
-            self.worker = None;
-            self.handle_worker_error(CpuDetailError::Win32 {
-                context: "CPU details worker completion channel",
+            self.native_worker = None;
+            self.handle_native_worker_error(CpuDetailError::Win32 {
+                context: "CPU native worker completion channel",
                 code: ERROR_BROKEN_PIPE,
             });
         }
 
         for completion in completions {
-            self.commit_snapshot(completion);
+            self.commit_native_snapshot(completion);
         }
 
-        if let Some(refresh) = self.queued_refresh.take() {
-            self.request_refresh(refresh);
+        if let Some(refresh) = self.queued_native_refresh.take() {
+            self.request_native_refresh(refresh);
+        } else {
+            self.request_initial_dynamic_if_ready();
+            self.update_status_text();
+        }
+    }
+
+    pub(crate) fn handle_firmware_worker_completion(&mut self) {
+        let mut completions = Vec::new();
+        let mut disconnected = false;
+        if let Some(worker) = self.firmware_worker.as_ref() {
+            loop {
+                match worker.try_recv() {
+                    Ok(completion) => completions.push(completion),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        self.firmware_collection_in_flight = false;
+        if disconnected {
+            self.firmware_worker = None;
+            self.handle_firmware_worker_error(CpuDetailError::Win32 {
+                context: "CPU firmware worker completion channel",
+                code: ERROR_BROKEN_PIPE,
+            });
+        }
+        for completion in completions {
+            self.commit_firmware_snapshot(completion);
+        }
+        if let Some(refresh) = self.queued_firmware_refresh.take() {
+            self.request_firmware_refresh(refresh);
         } else {
             self.update_status_text();
         }
     }
 
-    fn commit_snapshot(&mut self, snapshot: CpuDetailSnapshot) {
+    fn commit_native_snapshot(&mut self, snapshot: CpuNativeSnapshot) {
         if self.topology_key.as_ref() != Some(&snapshot.topology_key) {
             return;
         }
-        self.worker_error = None;
+        self.native_worker_error = None;
+        if matches!(
+            &snapshot.dynamic,
+            CpuComponentUpdate::Success(_) | CpuComponentUpdate::Failed(_)
+        ) {
+            self.pdh_baseline_timestamp_ms = None;
+        }
+        if let Some(timestamp_ms) = snapshot.pdh_baseline_timestamp_ms {
+            self.pdh_baseline_timestamp_ms = Some(timestamp_ms);
+        }
         self.topology.apply(snapshot.topology);
-        self.firmware.apply(snapshot.firmware);
         self.features.apply(snapshot.features);
         self.dynamic.apply(snapshot.dynamic);
         self.update_visible_texts();
     }
 
-    fn handle_worker_error(&mut self, error: CpuDetailError) {
-        if self.worker_error.as_ref() != Some(&error) {
+    fn commit_firmware_snapshot(&mut self, snapshot: CpuFirmwareSnapshot) {
+        if self.topology_key.as_ref() != Some(&snapshot.topology_key) {
+            return;
+        }
+        self.firmware_worker_error = None;
+        self.firmware.apply(snapshot.firmware);
+        self.update_visible_texts();
+    }
+
+    fn handle_native_worker_error(&mut self, error: CpuDetailError) {
+        if self.native_worker_error.as_ref() != Some(&error) {
             error.record();
         }
-        self.worker_error = Some(error);
+        self.native_worker_error = Some(error);
         self.update_visible_texts();
+    }
+
+    fn handle_firmware_worker_error(&mut self, error: CpuDetailError) {
+        if self.firmware_worker_error.as_ref() != Some(&error) {
+            error.record();
+        }
+        self.firmware_worker_error = Some(error);
+        self.update_visible_texts();
+    }
+
+    fn request_initial_dynamic_if_ready(&mut self) {
+        let ready = self
+            .pdh_baseline_timestamp_ms
+            .zip(self.last_system_sample_timestamp_ms)
+            .is_some_and(|(baseline, sample)| sample > baseline);
+        if ready && !self.native_collection_in_flight {
+            self.request_native_refresh(CpuDetailRefresh::Periodic);
+        }
     }
 
     pub(crate) fn apply_system_sample(
@@ -418,7 +543,8 @@ impl CpuPageState {
             self.diagnostics = None;
             self.diagnostic_stale = false;
             if next_key.is_some() {
-                self.queue_refresh(CpuDetailRefresh::Prewarm);
+                queue_refresh(&mut self.queued_native_refresh, CpuDetailRefresh::Prewarm);
+                queue_refresh(&mut self.queued_firmware_refresh, CpuDetailRefresh::Prewarm);
             }
         } else {
             self.topology_summary = sample.processor_topology.summary();
@@ -426,6 +552,7 @@ impl CpuPageState {
 
         self.system_sample_seen = true;
         self.system_sample_stale = false;
+        self.last_system_sample_timestamp_ms = Some(sample.uptime_ms);
         self.uptime_ms = Some(sample.uptime_ms);
         self.handle_count = Some(sample.handle_count);
         self.thread_count = Some(sample.thread_count);
@@ -447,11 +574,18 @@ impl CpuPageState {
             Err(_) => self.diagnostic_stale = self.diagnostics.is_some(),
         }
 
-        if self.topology_key.is_some()
-            && !self.collection_in_flight
-            && let Some(refresh) = self.queued_refresh.take()
-        {
-            self.request_refresh(refresh);
+        if self.topology_key.is_some() {
+            if !self.native_collection_in_flight
+                && let Some(refresh) = self.queued_native_refresh.take()
+            {
+                self.request_native_refresh(refresh);
+            }
+            if !self.firmware_collection_in_flight
+                && let Some(refresh) = self.queued_firmware_refresh.take()
+            {
+                self.request_firmware_refresh(refresh);
+            }
+            self.request_initial_dynamic_if_ready();
         }
         self.update_visible_texts();
         if redraw {
@@ -470,7 +604,9 @@ impl CpuPageState {
         self.firmware.clear();
         self.features.clear();
         self.dynamic.clear();
-        self.worker_error = None;
+        self.native_worker_error = None;
+        self.firmware_worker_error = None;
+        self.pdh_baseline_timestamp_ms = None;
     }
 
     fn update_visible_texts(&mut self) {
@@ -644,9 +780,11 @@ impl CpuPageState {
         self.status = self.derive_status();
         let status_text = match self.status {
             CpuPageStatus::Loading => text(TextKey::CpuLoading).to_string(),
+            CpuPageStatus::LoadingDetails => text(TextKey::CpuLoadingDetails).to_string(),
             CpuPageStatus::Ready => {
                 format_header_summary(self.topology_summary.as_ref(), self.dynamic.value.as_ref())
             }
+            CpuPageStatus::Partial => text(TextKey::CpuPartialDetails).to_string(),
             CpuPageStatus::Unavailable => text(TextKey::CpuUnavailable).to_string(),
             CpuPageStatus::Failed => text(TextKey::CpuRefreshFailed).to_string(),
             CpuPageStatus::Stale => text(TextKey::CpuRefreshFailedStale).to_string(),
@@ -665,14 +803,20 @@ impl CpuPageState {
         if self.topology_key.is_none() {
             return CpuPageStatus::Unavailable;
         }
-        let source_failed = self.worker_error.is_some()
+        let worker_failed =
+            self.native_worker_error.is_some() || self.firmware_worker_error.is_some();
+        let source_failed = worker_failed
             || self.topology.has_error()
             || self.firmware.has_error()
             || self.features.has_error()
             || self.dynamic.has_error();
         let retained_stale_value = self.system_sample_stale
             || self.diagnostic_stale
-            || self.worker_error.is_some() && self.has_detail_values()
+            || self.native_worker_error.is_some()
+                && (self.topology.value.is_some()
+                    || self.features.value.is_some()
+                    || self.dynamic.value.is_some())
+            || self.firmware_worker_error.is_some() && self.firmware.value.is_some()
             || self.topology.is_stale()
             || self.firmware.is_stale()
             || self.features.is_stale()
@@ -681,10 +825,20 @@ impl CpuPageState {
             return CpuPageStatus::Stale;
         }
         if source_failed {
-            return CpuPageStatus::Failed;
+            return if self.has_detail_values() {
+                CpuPageStatus::Partial
+            } else {
+                CpuPageStatus::Failed
+            };
         }
-        if !self.has_detail_values() || self.collection_in_flight && self.firmware.value.is_none() {
+        if !self.has_detail_values() {
             CpuPageStatus::Loading
+        } else if self.topology.value.is_none() && !self.topology.has_error()
+            || self.features.value.is_none() && !self.features.has_error()
+            || self.dynamic.value.is_none() && !self.dynamic.has_error()
+            || self.firmware.value.is_none() && !self.firmware.has_error()
+        {
+            CpuPageStatus::LoadingDetails
         } else {
             CpuPageStatus::Ready
         }
@@ -1136,9 +1290,13 @@ impl CpuPageState {
     }
 
     pub(crate) fn destroy(&mut self) {
-        self.worker = None;
-        self.collection_in_flight = false;
-        self.queued_refresh = None;
+        self.native_worker = None;
+        self.firmware_worker = None;
+        self.native_collection_in_flight = false;
+        self.firmware_collection_in_flight = false;
+        self.queued_native_refresh = None;
+        self.queued_firmware_refresh = None;
+        self.last_system_sample_timestamp_ms = None;
         self.layout_metrics = None;
         self.topology_key = None;
         self.clear_detail_components();
@@ -1165,6 +1323,12 @@ fn refresh_priority(refresh: CpuDetailRefresh) -> u8 {
         CpuDetailRefresh::Prewarm => 1,
         CpuDetailRefresh::Activation => 2,
         CpuDetailRefresh::User => 3,
+    }
+}
+
+fn queue_refresh(slot: &mut Option<CpuDetailRefresh>, refresh: CpuDetailRefresh) {
+    if slot.is_none_or(|current| refresh_priority(refresh) > refresh_priority(current)) {
+        *slot = Some(refresh);
     }
 }
 

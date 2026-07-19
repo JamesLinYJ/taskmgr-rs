@@ -105,6 +105,14 @@ pub fn record_ntstatus_error(component: &str, status: i32) {
     unsafe { OutputDebugStringW(message.as_ptr()) };
 }
 
+pub fn record_startup_timing(stage: &str, elapsed_ms: u64) {
+    let message = to_wide_null(&format!(
+        "taskmgr-rs startup: {stage} completed in {elapsed_ms} ms\r\n"
+    ));
+    // Safety: `message` is null-terminated and remains alive for the synchronous call.
+    unsafe { OutputDebugStringW(message.as_ptr()) };
+}
+
 pub fn enable_debug_privilege() -> Result<(), u32> {
     // Task Manager needs SeDebugPrivilege to query process tokens owned by services and SYSTEM.
     // AdjustTokenPrivileges may return success while reporting ERROR_NOT_ALL_ASSIGNED, so both

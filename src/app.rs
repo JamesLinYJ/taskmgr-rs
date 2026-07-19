@@ -26,6 +26,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
 };
+use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::System::Threading::{
     ALL_PROCESSOR_GROUPS, CreateMutexW, GetActiveProcessorCount, ReleaseMutex,
     SetProcessShutdownParameters, WaitForSingleObject,
@@ -80,8 +81,8 @@ use crate::system_sampler::{SystemSample, SystemSampleError, SystemSampler};
 use crate::winutil::{
     call_window_proc, destroy_icon_handle, enable_debug_privilege, format_resource_string, height,
     hiword, loword, process_is_elevated, record_hresult_error, record_ntstatus_error,
-    record_win32_error, sanitize_task_manager_menu, set_dialog_msg_result, set_style,
-    set_window_userdata_ptr, to_wide_null, width, window_userdata_non_null,
+    record_startup_timing, record_win32_error, sanitize_task_manager_menu, set_dialog_msg_result,
+    set_style, set_window_userdata_ptr, to_wide_null, width, window_userdata_non_null,
 };
 
 const STARTUP_MUTEX_NAME: &str = "NTShell Taskman Startup Mutex";
@@ -319,6 +320,7 @@ impl App {
     }
 
     fn run_main(&mut self) -> i32 {
+        let startup_started_ms = unsafe { GetTickCount64() };
         // 启动链路按“单实例检查 -> 环境初始化 -> 创建主对话框 -> 进入消息循环”展开。
         // 这样既能兼容经典 Task Manager 的行为，也便于在失败点提前退出。
         if !self.acquire_startup_mutex() {
@@ -407,6 +409,10 @@ impl App {
 
         // 安全性: the main HWND is live after successful dialog creation.
         unsafe { ShowWindow(self.main_hwnd, SW_SHOW) };
+        record_startup_timing(
+            "main window visible",
+            unsafe { GetTickCount64() }.wrapping_sub(startup_started_ms),
+        );
         self.release_startup_mutex();
         // Queue every hidden page independently so their first layout/sample can overlap. The
         // tray/icon work stays deferred until after those lightweight warm-up requests.
