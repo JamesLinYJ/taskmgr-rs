@@ -207,7 +207,39 @@ fn build_perf_main_menu() -> MenuResult<MenuBar> {
     Ok(bar)
 }
 
+fn build_cpu_main_menu() -> MenuResult<MenuBar> {
+    let mut bar = MenuBar::new()?;
+    let mut view = PopupMenu::new()?;
+    append_item(&mut view, IDM_REFRESH, TextKey::RefreshNow)?;
+    view.append_submenu(text(TextKey::UpdateSpeed), build_update_speed_menu()?)?;
+    append_separator(&mut view)?;
+    append_item(&mut view, IDM_KERNELTIMES, TextKey::ShowKernelTimes)?;
+    append_common_main_menus(
+        &mut bar,
+        build_file_menu()?,
+        build_common_options_menu(false)?,
+        view,
+    )?;
+    bar.append_submenu(text(TextKey::Help), build_common_help_menu()?)?;
+    Ok(bar)
+}
+
 fn build_network_main_menu() -> MenuResult<MenuBar> {
+    let mut bar = MenuBar::new()?;
+    let mut view = PopupMenu::new()?;
+    append_item(&mut view, IDM_REFRESH, TextKey::RefreshNow)?;
+    view.append_submenu(text(TextKey::UpdateSpeed), build_update_speed_menu()?)?;
+    append_common_main_menus(
+        &mut bar,
+        build_file_menu()?,
+        build_common_options_menu(false)?,
+        view,
+    )?;
+    bar.append_submenu(text(TextKey::Help), build_common_help_menu()?)?;
+    Ok(bar)
+}
+
+fn build_gpu_main_menu() -> MenuResult<MenuBar> {
     let mut bar = MenuBar::new()?;
     let mut view = PopupMenu::new()?;
     append_item(&mut view, IDM_REFRESH, TextKey::RefreshNow)?;
@@ -261,6 +293,8 @@ pub fn build_main_menu(resource_id: u16, processor_count: usize) -> MenuResult<M
         IDR_MAINMENU_TASK => build_task_main_menu()?,
         IDR_MAINMENU_PROC => build_process_main_menu()?,
         IDR_MAINMENU_PERF => build_perf_main_menu()?,
+        IDR_MAINMENU_CPU => build_cpu_main_menu()?,
+        IDR_MAINMENU_GPU => build_gpu_main_menu()?,
         IDR_MAINMENU_NET => build_network_main_menu()?,
         IDR_MAINMENU_USER => build_users_main_menu()?,
         _ => return Err(ERROR_RESOURCE_DATA_NOT_FOUND),

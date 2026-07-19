@@ -55,13 +55,34 @@
     <None Include="src\chart_renderer.rs">
       <Filter>Source Files</Filter>
     </None>
+    <None Include="src\cpu_details.rs">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="src\cpu_layout.rs">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="src\cpupage.rs">
+      <Filter>Source Files</Filter>
+    </None>
     <None Include="src\cpu_sampler.rs">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="src\cpu_topology.rs">
       <Filter>Source Files</Filter>
     </None>
     <None Include="src\dialog_templates.rs">
       <Filter>Source Files</Filter>
     </None>
     <None Include="src\drawing.rs">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="src\gpu_sampler.rs">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="src\gpu_layout.rs">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="src\gpupage.rs">
       <Filter>Source Files</Filter>
     </None>
     <None Include="src\language.rs">

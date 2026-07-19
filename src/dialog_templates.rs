@@ -7,9 +7,10 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::UI::Controls::{LVS_OWNERDATA, LVS_REPORT, LVS_SINGLESEL};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_GROUPBOX, BS_OWNERDRAW, CreateDialogIndirectParamW,
-    DialogBoxIndirectParamW, ES_AUTOVSCROLL, ES_MULTILINE, SBS_VERT, WS_BORDER, WS_CAPTION,
-    WS_CHILD, WS_DISABLED, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_THICKFRAME, WS_VISIBLE,
+    BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_GROUPBOX, BS_OWNERDRAW, CBS_DROPDOWNLIST,
+    CreateDialogIndirectParamW, DialogBoxIndirectParamW, ES_AUTOVSCROLL, ES_MULTILINE, SBS_VERT,
+    WS_BORDER, WS_CAPTION, WS_CHILD, WS_DISABLED, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_THICKFRAME,
+    WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::resource::*;
@@ -29,6 +30,9 @@ const BS_DEFPUSHBUTTON_STYLE: u32 = BS_DEFPUSHBUTTON as u32;
 const ES_MULTILINE_STYLE: u32 = ES_MULTILINE as u32;
 const ES_AUTOVSCROLL_STYLE: u32 = ES_AUTOVSCROLL as u32;
 const SBS_VERT_STYLE: u32 = SBS_VERT as u32;
+const CBS_DROPDOWNLIST_STYLE: u32 = CBS_DROPDOWNLIST as u32;
+const SS_RIGHT_STYLE: u32 = 0x0000_0002;
+const SS_ENDELLIPSIS_STYLE: u32 = 0x0000_4000;
 const DIALOG_FONT_NAME: &str = "MS Shell Dlg";
 const DIALOG_FONT_SIZE: u16 = 8;
 const CPU_LABELS: [&str; 64] = [
@@ -252,6 +256,20 @@ fn frame_control(
     }
 }
 
+fn combo_box(id: i32, x: i16, y: i16, cx: i16, cy: i16) -> ControlSpec<'static> {
+    ControlSpec {
+        class_name: "ComboBox",
+        text: "",
+        id: id as u16,
+        style: WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST_STYLE,
+        ex_style: 0,
+        x,
+        y,
+        cx,
+        cy,
+    }
+}
+
 fn build_main_dialog() -> DialogSpec<'static> {
     // 主窗口目前只承载标签页控件，其余页面由子对话框填充。
     DialogSpec {
@@ -387,6 +405,259 @@ fn build_network_dialog() -> DialogSpec<'static> {
                 cy: 131,
             },
         ],
+    }
+}
+
+fn build_gpu_dialog() -> DialogSpec<'static> {
+    let mut controls = vec![
+        combo_box(IDC_GPU_SELECTOR, 8, 8, 150, 96),
+        static_text("", IDC_GPU_MODEL, 0, 164, 11, 260, 10),
+        static_text("Loading GPU data...", IDC_GPU_STATUS, 0, 8, 29, 416, 10),
+    ];
+
+    for slot in 0..4 {
+        controls.push(combo_box(
+            IDC_GPU_ENGINE_SELECTOR_FIRST + slot,
+            8 + (slot % 2) as i16 * 210,
+            44 + (slot / 2) as i16 * 66,
+            150,
+            96,
+        ));
+        controls.push(static_text(
+            "0%",
+            IDC_GPU_ENGINE_PERCENT_FIRST + slot,
+            SS_RIGHT_STYLE,
+            164 + (slot % 2) as i16 * 210,
+            47 + (slot / 2) as i16 * 66,
+            50,
+            9,
+        ));
+        controls.push(ownerdraw_button(
+            IDC_GPU_ENGINE_GRAPH_FIRST + slot,
+            true,
+            8 + (slot % 2) as i16 * 210,
+            58 + (slot / 2) as i16 * 66,
+            206,
+            48,
+        ));
+    }
+
+    controls.extend([
+        static_text(
+            "Dedicated GPU memory",
+            IDC_GPU_DEDICATED_CAPTION,
+            0,
+            8,
+            178,
+            416,
+            9,
+        ),
+        ownerdraw_button(IDC_GPU_DEDICATED_GRAPH, true, 8, 188, 416, 42),
+        static_text(
+            "Shared GPU memory",
+            IDC_GPU_SHARED_CAPTION,
+            0,
+            8,
+            234,
+            416,
+            9,
+        ),
+        ownerdraw_button(IDC_GPU_SHARED_GRAPH, true, 8, 244, 416, 42),
+        frame_control("Current", IDC_GPU_METRICS_GROUP, 8, 290, 204, 69),
+        frame_control("Adapter details", IDC_GPU_DETAILS_GROUP, 220, 290, 204, 69),
+    ]);
+
+    let left_labels = [
+        (
+            "Utilization",
+            IDC_GPU_UTILIZATION_LABEL,
+            IDC_GPU_UTILIZATION_VALUE,
+        ),
+        (
+            "GPU memory",
+            IDC_GPU_TOTAL_MEMORY_LABEL,
+            IDC_GPU_TOTAL_MEMORY_VALUE,
+        ),
+        (
+            "Dedicated GPU memory",
+            IDC_GPU_DEDICATED_MEMORY_LABEL,
+            IDC_GPU_DEDICATED_MEMORY_VALUE,
+        ),
+        (
+            "Shared GPU memory",
+            IDC_GPU_SHARED_MEMORY_LABEL,
+            IDC_GPU_SHARED_MEMORY_VALUE,
+        ),
+        (
+            "Temperature",
+            IDC_GPU_TEMPERATURE_LABEL,
+            IDC_GPU_TEMPERATURE_VALUE,
+        ),
+    ];
+    let right_labels = [
+        (
+            "Driver version",
+            IDC_GPU_DRIVER_VERSION_LABEL,
+            IDC_GPU_DRIVER_VERSION_VALUE,
+        ),
+        (
+            "Driver date",
+            IDC_GPU_DRIVER_DATE_LABEL,
+            IDC_GPU_DRIVER_DATE_VALUE,
+        ),
+        (
+            "DirectX version",
+            IDC_GPU_DIRECTX_LABEL,
+            IDC_GPU_DIRECTX_VALUE,
+        ),
+        (
+            "Physical location",
+            IDC_GPU_LOCATION_LABEL,
+            IDC_GPU_LOCATION_VALUE,
+        ),
+        (
+            "Hardware reserved memory",
+            IDC_GPU_RESERVED_MEMORY_LABEL,
+            IDC_GPU_RESERVED_MEMORY_VALUE,
+        ),
+    ];
+    for (index, (text, label_id, value_id)) in left_labels.into_iter().enumerate() {
+        controls.push(static_text(
+            text,
+            label_id,
+            0,
+            16,
+            303 + index as i16 * 10,
+            86,
+            9,
+        ));
+        controls.push(static_text(
+            "-",
+            value_id,
+            SS_RIGHT_STYLE,
+            104,
+            303 + index as i16 * 10,
+            98,
+            9,
+        ));
+    }
+    for (index, (text, label_id, value_id)) in right_labels.into_iter().enumerate() {
+        controls.push(static_text(
+            text,
+            label_id,
+            0,
+            228,
+            303 + index as i16 * 10,
+            86,
+            9,
+        ));
+        controls.push(static_text(
+            "-",
+            value_id,
+            SS_RIGHT_STYLE,
+            316,
+            303 + index as i16 * 10,
+            98,
+            9,
+        ));
+    }
+
+    DialogSpec {
+        style: DS_CONTROL | WS_CHILD | WS_VSCROLL,
+        ex_style: 0,
+        x: 0,
+        y: 0,
+        cx: 438,
+        cy: 369,
+        title: "",
+        font_name: DIALOG_FONT_NAME,
+        font_size: DIALOG_FONT_SIZE,
+        controls,
+    }
+}
+
+fn build_cpu_details_dialog() -> DialogSpec<'static> {
+    let mut controls = vec![
+        static_text(
+            "CPU",
+            IDC_CPU_DETAIL_TITLE,
+            SS_ENDELLIPSIS_STYLE,
+            8,
+            8,
+            32,
+            12,
+        ),
+        static_text(
+            "",
+            IDC_CPU_DETAIL_MODEL,
+            SS_ENDELLIPSIS_STYLE,
+            46,
+            8,
+            378,
+            12,
+        ),
+        static_text(
+            "Loading CPU diagnostics...",
+            IDC_CPU_DETAIL_STATUS,
+            SS_ENDELLIPSIS_STYLE,
+            8,
+            23,
+            416,
+            10,
+        ),
+        ownerdraw_button(IDC_CPU_DETAIL_GRAPH, true, 8, 36, 416, 126),
+    ];
+
+    for group in 0..CPU_DETAIL_GROUP_COUNT {
+        let column = (group % 2) as i16;
+        let row = (group / 2) as i16;
+        let group_x = 8 + column * 210;
+        let group_y = 168 + row * 94;
+        controls.push(frame_control(
+            "",
+            IDC_CPU_DETAIL_GROUP_FIRST + group as i32,
+            group_x,
+            group_y,
+            206,
+            88,
+        ));
+        for index in 0..CPU_DETAIL_METRIC_COUNTS[group] {
+            let pair = (index % 2) as i16;
+            let metric_row = (index / 2) as i16;
+            let pair_x = group_x + 6 + pair * 98;
+            let y = group_y + 13 + metric_row * 11;
+            controls.push(static_text(
+                "",
+                IDC_CPU_DETAIL_LABEL_BASES[group] + index as i32,
+                SS_ENDELLIPSIS_STYLE,
+                pair_x,
+                y,
+                45,
+                9,
+            ));
+            controls.push(static_text(
+                "-",
+                IDC_CPU_DETAIL_VALUE_BASES[group] + index as i32,
+                SS_RIGHT_STYLE | SS_ENDELLIPSIS_STYLE,
+                pair_x + 46,
+                y,
+                46,
+                9,
+            ));
+        }
+    }
+
+    DialogSpec {
+        style: DS_CONTROL | WS_CHILD,
+        ex_style: 0,
+        x: 0,
+        y: 0,
+        cx: 438,
+        cy: 369,
+        title: "",
+        font_name: DIALOG_FONT_NAME,
+        font_size: DIALOG_FONT_SIZE,
+        controls,
     }
 }
 
@@ -812,6 +1083,8 @@ fn dialog_spec(dialog_id: u16) -> Option<DialogSpec<'static>> {
         IDD_MAINWND => build_main_dialog(),
         IDD_PERFPAGE => build_perf_dialog(),
         IDD_NETPAGE => build_network_dialog(),
+        IDD_CPUPAGE => build_cpu_details_dialog(),
+        IDD_GPUPAGE => build_gpu_dialog(),
         IDD_PROCPAGE => build_process_dialog(),
         IDD_TASKPAGE => build_task_dialog(),
         IDD_SELECTPROCCOLS => build_select_columns_dialog(),
@@ -888,8 +1161,9 @@ pub fn dialog_box(
 mod tests {
     use super::{DialogTemplateBuilder, dialog_spec};
     use crate::resource::{
-        IDC_NICTOTALS, IDC_PROCLIST, IDC_TASKLIST, IDD_AFFINITY, IDD_MAINWND, IDD_MESSAGE,
-        IDD_NETPAGE, IDD_PERFPAGE, IDD_PROCPAGE, IDD_SELECTPROCCOLS, IDD_TASKPAGE, IDD_USERSPAGE,
+        IDC_NICTOTALS, IDC_PROCLIST, IDC_TASKLIST, IDD_AFFINITY, IDD_CPUPAGE, IDD_GPUPAGE,
+        IDD_MAINWND, IDD_MESSAGE, IDD_NETPAGE, IDD_PERFPAGE, IDD_PROCPAGE, IDD_SELECTPROCCOLS,
+        IDD_TASKPAGE, IDD_USERSPAGE,
     };
     use windows_sys::Win32::UI::Controls::LVS_OWNERDATA;
 
@@ -899,6 +1173,8 @@ mod tests {
             IDD_MAINWND,
             IDD_PERFPAGE,
             IDD_NETPAGE,
+            IDD_CPUPAGE,
+            IDD_GPUPAGE,
             IDD_PROCPAGE,
             IDD_TASKPAGE,
             IDD_SELECTPROCCOLS,

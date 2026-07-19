@@ -25,26 +25,30 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_SIZE, WM_VSCROLL, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
 };
 
+use crate::cpu_details::CpuDetailRefresh;
+use crate::cpupage::CpuPageState;
 use crate::dialog_templates::create_dialog;
+use crate::gpupage::GpuPageState;
 use crate::language::{TextKey, localize_dialog, text};
 use crate::menus::build_main_menu;
 use crate::netpage::NetworkPageState;
 use crate::options::Options;
-use crate::perfpage::{PerformancePageState, redraw_performance_page};
+use crate::perfpage::PerformancePageState;
 use crate::process_identity::ProcIdentity;
 use crate::procpage::ProcessPageState;
 use crate::resource::{
-    IDC_CPUMETER, IDC_MEMGRAPH, IDC_MEMMETER, IDC_NICTOTALS, IDC_PROCLIST, IDC_TASKLIST,
-    IDC_USERLIST, IDD_NETPAGE, IDD_PERFPAGE, IDD_PROCPAGE, IDD_TASKPAGE, IDD_USERSPAGE,
+    IDC_CPU_DETAIL_GRAPH, IDC_CPUMETER, IDC_GPU_SELECTOR, IDC_MEMGRAPH, IDC_MEMMETER,
+    IDC_NICTOTALS, IDC_PROCLIST, IDC_TASKLIST, IDC_USERLIST, IDD_CPUPAGE, IDD_GPUPAGE, IDD_NETPAGE,
+    IDD_PERFPAGE, IDD_PROCPAGE, IDD_TASKPAGE, IDD_USERSPAGE, IDR_MAINMENU_CPU, IDR_MAINMENU_GPU,
     IDR_MAINMENU_NET, IDR_MAINMENU_PERF, IDR_MAINMENU_PROC, IDR_MAINMENU_TASK, IDR_MAINMENU_USER,
-    PWM_NET_WORKER_COMPLETE, PWM_PROC_WORKER_COMPLETE, PWM_TASK_WORKER_COMPLETE,
-    PWM_USER_WORKER_COMPLETE,
+    PWM_CPU_WORKER_COMPLETE, PWM_GPU_WORKER_COMPLETE, PWM_NET_WORKER_COMPLETE,
+    PWM_PROC_WORKER_COMPLETE, PWM_TASK_WORKER_COMPLETE, PWM_USER_WORKER_COMPLETE,
 };
 use crate::runtime_menu::MenuBar;
 use crate::system_sampler::SystemSample;
 use crate::taskpage::TaskPageState;
 use crate::userpage::UserPageState;
-use crate::winutil::{get_window_userdata, set_window_userdata};
+use crate::winutil::{get_window_userdata, redraw_window_tree, set_window_userdata};
 
 enum PageFocusTarget {
     // 每个页面激活后都有一个更自然的初始焦点目标。
@@ -53,10 +57,35 @@ enum PageFocusTarget {
     Control(i32),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefreshReason {
+    Prewarm,
+    Activation,
+    Periodic,
+    User,
+}
+
+impl RefreshReason {
+    fn forces_list_refresh(self) -> bool {
+        self != Self::Periodic
+    }
+
+    fn cpu_detail_refresh(self) -> CpuDetailRefresh {
+        match self {
+            Self::Prewarm => CpuDetailRefresh::Prewarm,
+            Self::Activation => CpuDetailRefresh::Activation,
+            Self::Periodic => CpuDetailRefresh::Periodic,
+            Self::User => CpuDetailRefresh::User,
+        }
+    }
+}
+
 enum PageState {
     Task(Box<TaskPageState>),
     Process(Box<ProcessPageState>),
     Performance(Box<PerformancePageState>),
+    Cpu(Box<CpuPageState>),
+    Gpu(Box<GpuPageState>),
     Network(Box<NetworkPageState>),
     Users(Box<UserPageState>),
 }
@@ -86,6 +115,8 @@ impl PageState {
             Self::Task(_) => IDC_TASKLIST,
             Self::Process(_) => IDC_PROCLIST,
             Self::Performance(_) => IDC_CPUMETER,
+            Self::Cpu(_) => IDC_CPU_DETAIL_GRAPH,
+            Self::Gpu(_) => IDC_GPU_SELECTOR,
             Self::Network(_) => IDC_NICTOTALS,
             Self::Users(_) => IDC_USERLIST,
         };
@@ -99,6 +130,8 @@ impl PageState {
                 state.initialize(hinstance, hwnd, main_hwnd)?;
             },
             Self::Performance(state) => state.complete_initialize(hwnd)?,
+            Self::Cpu(state) => state.initialize(hwnd)?,
+            Self::Gpu(state) => state.initialize(hwnd, main_hwnd, hwnd_tabs)?,
             Self::Network(state) => unsafe {
                 state.initialize(hwnd, main_hwnd, hwnd_tabs)?;
             },
@@ -114,7 +147,7 @@ impl PageState {
         options: &Options,
         processor_count: usize,
     ) {
-        let redraw_performance = match self {
+        let redraw_owner_draw_page = match self {
             Self::Task(state) => {
                 state.apply_options(options);
                 false
@@ -131,6 +164,20 @@ impl PageState {
                     false
                 }
             }
+            Self::Cpu(state) => {
+                if state.apply_options(options) {
+                    state.size_page()
+                } else {
+                    false
+                }
+            }
+            Self::Gpu(state) => {
+                if state.apply_options(options) {
+                    state.size_page()
+                } else {
+                    false
+                }
+            }
             Self::Network(state) => unsafe {
                 state.apply_options(options);
                 false
@@ -140,12 +187,13 @@ impl PageState {
                 false
             }
         };
-        if redraw_performance {
-            redraw_performance_page(hwnd);
+        if redraw_owner_draw_page {
+            redraw_window_tree(hwnd);
         }
     }
 
-    fn timer_event(&mut self, options: &Options, processor_count: usize, force: bool) {
+    fn timer_event(&mut self, options: &Options, processor_count: usize, reason: RefreshReason) {
+        let force = reason.forces_list_refresh();
         match self {
             Self::Task(state) => state.timer_event(options, force),
             Self::Process(state) => unsafe {
@@ -153,6 +201,11 @@ impl PageState {
                 state.timer_event(options, force);
             },
             Self::Performance(_) => {}
+            Self::Cpu(state) => state.timer_event(reason.cpu_detail_refresh()),
+            Self::Gpu(state) => {
+                let _ = state.apply_options(options);
+                state.timer_event();
+            }
             Self::Network(state) => unsafe {
                 state.apply_options(options);
                 state.timer_event();
@@ -177,6 +230,8 @@ impl PageState {
             Self::Task(state) => state.destroy(),
             Self::Process(state) => unsafe { state.destroy() },
             Self::Performance(state) => state.destroy(),
+            Self::Cpu(state) => state.destroy(),
+            Self::Gpu(state) => state.destroy(),
             Self::Network(state) => unsafe { state.destroy() },
             Self::Users(state) => state.destroy(),
         }
@@ -190,7 +245,14 @@ impl PageState {
     ) -> Result<(), u32> {
         match self {
             Self::Performance(state) => state.apply_system_sample(hwnd, sample, redraw),
+            Self::Cpu(state) => state.apply_system_sample(sample, redraw),
             _ => Ok(()),
+        }
+    }
+
+    fn mark_system_sample_error(&mut self) {
+        if let Self::Cpu(state) = self {
+            state.mark_system_sample_error();
         }
     }
 
@@ -230,6 +292,8 @@ impl PageState {
             Self::Task(state) => state.no_title(),
             Self::Process(state) => unsafe { state.no_title() },
             Self::Performance(state) => state.no_title(),
+            Self::Cpu(state) => state.no_title(),
+            Self::Gpu(state) => state.no_title(),
             Self::Network(state) => unsafe { state.no_title() },
             Self::Users(state) => state.no_title(),
         }
@@ -248,6 +312,8 @@ impl PageState {
             Self::Network(_) => 1,
             Self::Users(_) => 1,
             Self::Performance(_) => 1,
+            Self::Cpu(_) => 1,
+            Self::Gpu(_) => 1,
         }
     }
 
@@ -270,6 +336,7 @@ impl PageState {
         match self {
             Self::Task(state) => state.handle_notify(lparam),
             Self::Process(state) => unsafe { state.handle_notify(lparam) },
+            Self::Cpu(state) => state.handle_notify(lparam),
             Self::Users(state) => state.handle_notify(lparam),
             _ => 0,
         }
@@ -305,7 +372,7 @@ impl PageState {
     }
 
     fn handle_size_or_show(&mut self, hwnd: HWND, main_hwnd: HWND) -> isize {
-        let redraw_performance = match self {
+        let redraw_owner_draw_page = match self {
             Self::Task(state) => {
                 state.size_page();
                 false
@@ -318,6 +385,8 @@ impl PageState {
                 state.size_page(hwnd, main_hwnd);
                 true
             }
+            Self::Cpu(state) => state.size_page(),
+            Self::Gpu(state) => state.size_page(),
             Self::Network(state) => unsafe {
                 state.size_page();
                 false
@@ -327,15 +396,15 @@ impl PageState {
                 false
             }
         };
-        if redraw_performance {
-            redraw_performance_page(hwnd);
+        if redraw_owner_draw_page {
+            redraw_window_tree(hwnd);
         }
         1
     }
 
     fn redraw_after_layout(&self, hwnd: HWND) {
         match self {
-            Self::Performance(_) => redraw_performance_page(hwnd),
+            Self::Performance(_) | Self::Cpu(_) | Self::Gpu(_) => redraw_window_tree(hwnd),
             _ => redraw_plain_page(hwnd),
         }
     }
@@ -403,6 +472,36 @@ impl DialogPage {
         }
     }
 
+    pub fn cpu_page() -> Self {
+        Self {
+            hinstance: null_mut(),
+            hwnd: null_mut(),
+            hwnd_tabs: null_mut(),
+            main_hwnd: null_mut(),
+            dialog_id: IDD_CPUPAGE,
+            menu_id: IDR_MAINMENU_CPU,
+            menu: None,
+            title_key: TextKey::CpuPageTitle,
+            initial_focus: PageFocusTarget::None,
+            state: PageState::Cpu(Box::default()),
+        }
+    }
+
+    pub fn gpu_page() -> Self {
+        Self {
+            hinstance: null_mut(),
+            hwnd: null_mut(),
+            hwnd_tabs: null_mut(),
+            main_hwnd: null_mut(),
+            dialog_id: IDD_GPUPAGE,
+            menu_id: IDR_MAINMENU_GPU,
+            menu: None,
+            title_key: TextKey::GpuPageTitle,
+            initial_focus: PageFocusTarget::Control(IDC_GPU_SELECTOR),
+            state: PageState::Gpu(Box::default()),
+        }
+    }
+
     pub fn network_page() -> Self {
         Self {
             hinstance: null_mut(),
@@ -460,6 +559,10 @@ impl DialogPage {
         let proc: Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> isize> =
             if self.dialog_id == IDD_PERFPAGE {
                 Some(performance_page_proc)
+            } else if self.dialog_id == IDD_CPUPAGE {
+                Some(cpu_page_proc)
+            } else if self.dialog_id == IDD_GPUPAGE {
+                Some(gpu_page_proc)
             } else if self.dialog_id == IDD_TASKPAGE {
                 Some(task_page_proc)
             } else if self.dialog_id == IDD_PROCPAGE {
@@ -560,10 +663,13 @@ impl DialogPage {
             ShowWindow(self.hwnd, SW_SHOW);
             SetWindowPos(self.hwnd, null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         }
-        if matches!(&self.state, PageState::Performance(_)) {
-            // Hidden-page prewarming cannot paint child windows. Commit the complete performance
-            // surface synchronously after it becomes visible so no template-layout frame escapes.
-            redraw_performance_page(self.hwnd);
+        if matches!(
+            &self.state,
+            PageState::Performance(_) | PageState::Cpu(_) | PageState::Gpu(_)
+        ) {
+            // Hidden-page prewarming cannot paint owner-draw children. Commit the complete chart
+            // tree synchronously after it becomes visible so no template-layout frame escapes.
+            redraw_window_tree(self.hwnd);
         }
 
         match self.initial_focus {
@@ -589,13 +695,22 @@ impl DialogPage {
             .apply_options(self.hwnd, self.main_hwnd, options, processor_count);
     }
 
-    pub fn timer_event(&mut self, options: &Options, processor_count: usize, force: bool) {
+    pub fn timer_event(
+        &mut self,
+        options: &Options,
+        processor_count: usize,
+        reason: RefreshReason,
+    ) {
         // 定时刷新同样走统一入口，避免主框架需要知道每个页面各自的刷新细节。
-        self.state.timer_event(options, processor_count, force);
+        self.state.timer_event(options, processor_count, reason);
     }
 
     pub fn apply_system_sample(&mut self, sample: &SystemSample, redraw: bool) -> Result<(), u32> {
         self.state.apply_system_sample(self.hwnd, sample, redraw)
+    }
+
+    pub fn mark_system_sample_error(&mut self) {
+        self.state.mark_system_sample_error();
     }
 
     pub fn redraw_after_layout(&self) {
@@ -649,11 +764,13 @@ impl DialogPage {
     }
 }
 
-pub fn default_pages() -> [DialogPage; 5] {
+pub fn default_pages() -> [DialogPage; crate::resource::NUM_PAGES] {
     [
         DialogPage::task_page(),
         DialogPage::process_page(),
         DialogPage::performance_page(),
+        DialogPage::cpu_page(),
+        DialogPage::gpu_page(),
         DialogPage::network_page(),
         DialogPage::users_page(),
     ]
@@ -1007,6 +1124,197 @@ unsafe fn erase_performance_page_background(hwnd: HWND, wparam: WPARAM) -> isize
         GetClientRect(hwnd, &mut rect);
         FillRect(hdc, &rect, GetSysColorBrush(COLOR_3DFACE));
         1
+    }
+}
+
+unsafe extern "system" fn cpu_page_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> isize {
+    let page = page_from_hwnd(hwnd, lparam);
+
+    // Safety: messages are dispatched on the owning UI thread. Win32-provided pointers are only
+    // borrowed for the synchronous callback, and the stored DialogPage pointer is null-checked.
+    unsafe {
+        match msg {
+            WM_INITDIALOG => {
+                if !page.is_null() {
+                    bind_page(hwnd, lparam, page);
+                    let current_style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+                    SetWindowLongW(
+                        hwnd,
+                        GWL_STYLE,
+                        (current_style | WS_CLIPCHILDREN | WS_CLIPSIBLINGS) as i32,
+                    );
+                }
+                1
+            }
+            WM_ERASEBKGND => erase_performance_page_background(hwnd, wparam),
+            WM_LBUTTONUP | WM_LBUTTONDOWN => {
+                forward_no_title_drag(page, msg, lparam);
+                0
+            }
+            WM_NCLBUTTONDBLCLK | WM_LBUTTONDBLCLK => {
+                forward_main_double_click(page, msg, wparam, lparam);
+                0
+            }
+            WM_CTLCOLORBTN => {
+                let control_id = GetDlgCtrlID(lparam as HWND);
+                if !page.is_null()
+                    && let PageState::Cpu(cpu_state) = &(*page).state
+                    && cpu_state.is_graph_control(control_id)
+                {
+                    return GetStockObject(BLACK_BRUSH) as isize;
+                }
+                0
+            }
+            WM_DRAWITEM => {
+                if page.is_null() {
+                    return 0;
+                }
+                let draw_item = &*(lparam as *const DRAWITEMSTRUCT);
+                let PageState::Cpu(cpu_state) = &mut (*page).state else {
+                    return 0;
+                };
+                let control_id = draw_item.CtlID as i32;
+                if cpu_state.is_graph_control(control_id) {
+                    cpu_state.draw_graph(draw_item.hDC, draw_item.rcItem);
+                    1
+                } else {
+                    0
+                }
+            }
+            WM_NOTIFY => {
+                if page.is_null() {
+                    0
+                } else {
+                    (*page).state.handle_notify(lparam)
+                }
+            }
+            PWM_CPU_WORKER_COMPLETE => {
+                if !page.is_null()
+                    && let PageState::Cpu(cpu_state) = &mut (*page).state
+                {
+                    cpu_state.handle_worker_completion();
+                }
+                1
+            }
+            WM_SHOWWINDOW => 1,
+            WM_SIZE => {
+                if page.is_null() {
+                    1
+                } else {
+                    (*page).state.handle_size_or_show(hwnd, (*page).main_hwnd)
+                }
+            }
+            _ => 0,
+        }
+    }
+}
+
+unsafe extern "system" fn gpu_page_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> isize {
+    let page = page_from_hwnd(hwnd, lparam);
+
+    // 安全性: dialog messages are dispatched on the UI thread. Win32-owned message pointers are
+    // only borrowed for the synchronous callback, and every stored page pointer is null-checked.
+    unsafe {
+        match msg {
+            WM_INITDIALOG => {
+                if !page.is_null() {
+                    bind_page(hwnd, lparam, page);
+                    let current_style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+                    SetWindowLongW(
+                        hwnd,
+                        GWL_STYLE,
+                        (current_style | WS_CLIPCHILDREN | WS_CLIPSIBLINGS) as i32,
+                    );
+                }
+                1
+            }
+            WM_ERASEBKGND => erase_performance_page_background(hwnd, wparam),
+            WM_LBUTTONUP | WM_LBUTTONDOWN => {
+                forward_no_title_drag(page, msg, lparam);
+                0
+            }
+            WM_NCLBUTTONDBLCLK | WM_LBUTTONDBLCLK => {
+                forward_main_double_click(page, msg, wparam, lparam);
+                0
+            }
+            WM_CTLCOLORBTN => {
+                let control_id = GetDlgCtrlID(lparam as HWND);
+                if !page.is_null()
+                    && let PageState::Gpu(gpu_state) = &(*page).state
+                    && gpu_state.is_graph_control(control_id)
+                {
+                    return GetStockObject(BLACK_BRUSH) as isize;
+                }
+                0
+            }
+            WM_DRAWITEM => {
+                if page.is_null() {
+                    return 0;
+                }
+                let draw_item = &*(lparam as *const DRAWITEMSTRUCT);
+                let PageState::Gpu(gpu_state) = &mut (*page).state else {
+                    return 0;
+                };
+                let control_id = draw_item.CtlID as i32;
+                if gpu_state.is_graph_control(control_id) {
+                    gpu_state.draw_graph(draw_item.hDC, draw_item.rcItem, control_id);
+                    1
+                } else {
+                    0
+                }
+            }
+            WM_COMMAND => {
+                if !page.is_null()
+                    && let PageState::Gpu(gpu_state) = &mut (*page).state
+                {
+                    return gpu_state.handle_command(wparam);
+                }
+                0
+            }
+            WM_VSCROLL => {
+                if !page.is_null()
+                    && let PageState::Gpu(gpu_state) = &mut (*page).state
+                {
+                    return gpu_state.handle_vscroll(wparam);
+                }
+                0
+            }
+            WM_MOUSEWHEEL => {
+                if !page.is_null()
+                    && let PageState::Gpu(gpu_state) = &mut (*page).state
+                {
+                    return gpu_state.handle_mouse_wheel(wparam);
+                }
+                0
+            }
+            PWM_GPU_WORKER_COMPLETE => {
+                if !page.is_null()
+                    && let PageState::Gpu(gpu_state) = &mut (*page).state
+                {
+                    gpu_state.handle_worker_completion();
+                }
+                1
+            }
+            WM_SHOWWINDOW => 1,
+            WM_SIZE => {
+                if page.is_null() {
+                    1
+                } else {
+                    (*page).state.handle_size_or_show(hwnd, (*page).main_hwnd)
+                }
+            }
+            _ => 0,
+        }
     }
 }
 

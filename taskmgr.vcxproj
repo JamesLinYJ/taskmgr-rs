@@ -89,9 +89,16 @@
     <None Include="src\assets.rs" />
     <None Include="src\background_worker.rs" />
     <None Include="src\chart_renderer.rs" />
+    <None Include="src\cpu_details.rs" />
+    <None Include="src\cpu_layout.rs" />
+    <None Include="src\cpupage.rs" />
     <None Include="src\cpu_sampler.rs" />
+    <None Include="src\cpu_topology.rs" />
     <None Include="src\dialog_templates.rs" />
     <None Include="src\drawing.rs" />
+    <None Include="src\gpu_sampler.rs" />
+    <None Include="src\gpu_layout.rs" />
+    <None Include="src\gpupage.rs" />
     <None Include="src\language.rs" />
     <None Include="src\localization_terms.rs" />
     <None Include="src\localization_ui.rs" />

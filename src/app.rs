@@ -67,11 +67,12 @@ use crate::app_controllers::{
     MenuController, RuntimeStatsController, TrayController, WindowModeController,
 };
 use crate::assets::{MAIN_ICON_RESOURCE, create_accelerator_table, load_icon_resource};
+use crate::cpu_topology::CpuTopologyError;
 use crate::dialog_templates::create_dialog;
 use crate::language::{TextKey, localize_dialog, menu_status_help, text};
 use crate::menus::build_popup_menu;
 use crate::options::{Options, update_speed_timer_interval};
-use crate::pages::{DialogPage, default_pages};
+use crate::pages::{DialogPage, RefreshReason, default_pages};
 use crate::process_identity::ProcIdentity;
 use crate::resource::*;
 use crate::runtime_menu::PopupMenu;
@@ -150,6 +151,7 @@ pub struct App {
     stats: RuntimeStatsController,
     system_sampler: SystemSampler,
     last_system_sample_error: Option<SystemSampleError>,
+    last_cpu_topology_error: Option<CpuTopologyError>,
     last_system_worker_error: Option<u32>,
     window_mode: WindowModeController,
     min_width: i32,
@@ -306,6 +308,7 @@ impl App {
             stats: RuntimeStatsController::default(),
             system_sampler: SystemSampler::new(),
             last_system_sample_error: None,
+            last_cpu_topology_error: None,
             last_system_worker_error: None,
             window_mode: WindowModeController::default(),
             min_width: 0,
@@ -936,6 +939,10 @@ impl App {
             return Err(ERROR_INVALID_PARAMETER);
         }
 
+        if page_uses_normal_minimum(self.options.no_title(), index) {
+            self.ensure_window_minimum_size()?;
+        }
+
         let previous_page = self.options.current_page;
         let switching_pages = previous_page >= 0 && previous_page as usize != index;
 
@@ -953,7 +960,7 @@ impl App {
                 self.options.current_page = index as i32;
                 self.update_menu_states();
                 self.size_active_page();
-                self.refresh_active_page(true);
+                self.refresh_active_page(RefreshReason::Activation);
                 self.request_system_sample();
                 self.refresh_tray_icon();
                 self.refresh_status_bar();
@@ -1065,20 +1072,28 @@ impl App {
 
     fn refresh_task_page(&mut self) {
         self.pages[TASK_PAGE].apply_options(&self.options, self.stats.processor_count);
-        self.pages[TASK_PAGE].timer_event(&self.options, self.stats.processor_count, true);
+        self.pages[TASK_PAGE].timer_event(
+            &self.options,
+            self.stats.processor_count,
+            RefreshReason::User,
+        );
     }
 
     fn refresh_performance_page(&mut self) {
         self.pages[PERF_PAGE].apply_options(&self.options, self.stats.processor_count);
-        self.pages[PERF_PAGE].timer_event(&self.options, self.stats.processor_count, true);
+        self.pages[PERF_PAGE].timer_event(
+            &self.options,
+            self.stats.processor_count,
+            RefreshReason::User,
+        );
     }
 
-    fn refresh_active_page(&mut self, force: bool) {
+    fn refresh_active_page(&mut self, reason: RefreshReason) {
         // 定时器只推动当前可见页，隐藏页在切换到前台时再立即刷新。
         let Some(index) = active_page_index(self.options.current_page, self.pages.len()) else {
             return;
         };
-        self.pages[index].timer_event(&self.options, self.stats.processor_count, force);
+        self.pages[index].timer_event(&self.options, self.stats.processor_count, reason);
     }
 
     fn size_active_page(&mut self) {
@@ -1171,6 +1186,46 @@ impl App {
         }
     }
 
+    fn ensure_window_minimum_size(&mut self) -> Result<(), u32> {
+        // 页面策略要求正常最小尺寸时，先把主窗口提升到模板定义的最小外框尺寸。
+        // 该操作发生在目标页提交前，因此失败不会留下已经切换了一半的页面状态。
+        unsafe {
+            let mut window_rect = zeroed::<RECT>();
+            if GetWindowRect(self.main_hwnd, &mut window_rect) == 0 {
+                let error = windows_sys::Win32::Foundation::GetLastError();
+                return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+            }
+
+            let current_width = width(&window_rect);
+            let current_height = height(&window_rect);
+            let (window_width, window_height) = clamped_window_size(
+                current_width,
+                current_height,
+                self.min_width,
+                self.min_height,
+            );
+            if window_width == current_width && window_height == current_height {
+                return Ok(());
+            }
+
+            if SetWindowPos(
+                self.main_hwnd,
+                null_mut(),
+                0,
+                0,
+                window_width,
+                window_height,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            ) == 0
+            {
+                let error = windows_sys::Win32::Foundation::GetLastError();
+                return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+            }
+        }
+
+        Ok(())
+    }
+
     fn prewarm_page(&mut self, index: usize) {
         if index >= self.pages.len()
             || Some(index) == active_page_index(self.options.current_page, self.pages.len())
@@ -1209,7 +1264,11 @@ impl App {
             );
         }
         self.pages[index].apply_options(&self.options, self.stats.processor_count);
-        self.pages[index].timer_event(&self.options, self.stats.processor_count, true);
+        self.pages[index].timer_event(
+            &self.options,
+            self.stats.processor_count,
+            RefreshReason::Prewarm,
+        );
     }
 
     fn toggle_no_title_mode(&mut self) {
@@ -1301,7 +1360,11 @@ impl App {
             return;
         }
 
-        self.refresh_active_page(force);
+        self.refresh_active_page(if force {
+            RefreshReason::User
+        } else {
+            RefreshReason::Periodic
+        });
         self.request_system_sample();
     }
 
@@ -1333,12 +1396,20 @@ impl App {
     }
 
     fn apply_system_sample(&mut self, sample: &SystemSample) {
+        self.record_cpu_topology_error(sample.processor_topology.error());
+        let window_is_visible = unsafe { IsIconic(self.main_hwnd) == 0 };
         let redraw_performance_page =
             is_active_page(self.options.current_page, self.pages.len(), PERF_PAGE)
-                && unsafe { IsIconic(self.main_hwnd) == 0 };
+                && window_is_visible;
         if let Err(error) =
             self.pages[PERF_PAGE].apply_system_sample(sample, redraw_performance_page)
         {
+            self.record_system_sample_error(SystemSampleError::Win32(error));
+            return;
+        }
+        let redraw_cpu_page = is_active_page(self.options.current_page, self.pages.len(), CPU_PAGE)
+            && window_is_visible;
+        if let Err(error) = self.pages[CPU_PAGE].apply_system_sample(sample, redraw_cpu_page) {
             self.record_system_sample_error(SystemSampleError::Win32(error));
             return;
         }
@@ -1350,6 +1421,7 @@ impl App {
     }
 
     fn record_system_sample_error(&mut self, error: SystemSampleError) {
+        self.pages[CPU_PAGE].mark_system_sample_error();
         if self.last_system_sample_error == Some(error) {
             return;
         }
@@ -1360,7 +1432,18 @@ impl App {
         self.last_system_sample_error = Some(error);
     }
 
+    fn record_cpu_topology_error(&mut self, error: Option<CpuTopologyError>) {
+        if self.last_cpu_topology_error == error {
+            return;
+        }
+        if let Some(error) = error {
+            record_win32_error(error.context(), error.win32_code());
+        }
+        self.last_cpu_topology_error = error;
+    }
+
     fn record_system_worker_error(&mut self, component: &str, error: u32) {
+        self.pages[CPU_PAGE].mark_system_sample_error();
         if self.last_system_worker_error != Some(error) {
             record_win32_error(component, error);
         }
@@ -1685,6 +1768,7 @@ impl App {
                 IDM_KERNELTIMES => {
                     self.options.set_kernel_times(!self.options.kernel_times());
                     self.refresh_performance_page();
+                    self.pages[CPU_PAGE].apply_options(&self.options, self.stats.processor_count);
                     self.update_menu_states();
                 }
                 IDM_LARGEICONS | IDM_SMALLICONS | IDM_DETAILS => {
@@ -1817,7 +1901,11 @@ impl App {
             };
             if GetWindowPlacement(hwnd, &mut placement) != 0 {
                 let mut rect = placement.rcNormalPosition;
-                if !self.options.no_title() {
+                if active_page_uses_normal_minimum(
+                    self.options.no_title(),
+                    self.options.current_page,
+                    self.pages.len(),
+                ) {
                     let (rect_width, rect_height) = clamped_window_size(
                         width(&rect),
                         height(&rect),
@@ -1928,6 +2016,16 @@ fn active_page_index(current_page: i32, page_count: usize) -> Option<usize> {
 
 fn is_active_page(current_page: i32, page_count: usize, page_index: usize) -> bool {
     active_page_index(current_page, page_count) == Some(page_index)
+}
+
+fn page_uses_normal_minimum(no_title: bool, page_index: usize) -> bool {
+    !no_title || matches!(page_index, CPU_PAGE | GPU_PAGE)
+}
+
+fn active_page_uses_normal_minimum(no_title: bool, current_page: i32, page_count: usize) -> bool {
+    active_page_index(current_page, page_count)
+        .map(|page_index| page_uses_normal_minimum(no_title, page_index))
+        .unwrap_or(true)
 }
 
 fn adjusted_tab_page_rect(tabs_hwnd: HWND, owner_hwnd: HWND) -> RECT {
@@ -2060,7 +2158,11 @@ unsafe extern "system" fn main_window_proc(
                 0
             }
             WM_GETMINMAXINFO => {
-                if !application.options.no_title() {
+                if active_page_uses_normal_minimum(
+                    application.options.no_title(),
+                    application.options.current_page,
+                    application.pages.len(),
+                ) {
                     let info = &mut *(lparam as *mut MINMAXINFO);
                     info.ptMinTrackSize.x = application.min_width;
                     info.ptMinTrackSize.y = application.min_height;
@@ -2122,8 +2224,11 @@ unsafe extern "system" fn main_window_proc(
 
 #[cfg(test)]
 mod tests {
-    use super::{active_page_index, clamped_window_size, is_active_page};
-    use crate::resource::PERF_PAGE;
+    use super::{
+        active_page_index, active_page_uses_normal_minimum, clamped_window_size, is_active_page,
+        page_uses_normal_minimum,
+    };
+    use crate::resource::{CPU_PAGE, GPU_PAGE, NUM_PAGES, PERF_PAGE};
 
     #[test]
     fn active_page_index_rejects_invalid_values() {
@@ -2135,8 +2240,8 @@ mod tests {
     #[test]
     fn active_page_index_accepts_current_visible_page() {
         assert_eq!(active_page_index(2, 5), Some(2));
-        assert!(is_active_page(2, 5, PERF_PAGE));
-        assert!(!is_active_page(1, 5, PERF_PAGE));
+        assert!(is_active_page(2, NUM_PAGES, PERF_PAGE));
+        assert!(!is_active_page(1, NUM_PAGES, PERF_PAGE));
     }
 
     #[test]
@@ -2153,5 +2258,51 @@ mod tests {
     #[test]
     fn clamped_window_size_preserves_valid_dimensions() {
         assert_eq!(clamped_window_size(500, 400, 320, 240), (500, 400));
+    }
+
+    #[test]
+    fn framed_pages_always_use_the_normal_minimum() {
+        assert!(page_uses_normal_minimum(false, PERF_PAGE));
+        assert!(page_uses_normal_minimum(false, GPU_PAGE));
+    }
+
+    #[test]
+    fn borderless_gpu_keeps_the_normal_minimum() {
+        assert!(page_uses_normal_minimum(true, GPU_PAGE));
+        assert!(active_page_uses_normal_minimum(
+            true,
+            GPU_PAGE as i32,
+            NUM_PAGES
+        ));
+    }
+
+    #[test]
+    fn borderless_cpu_diagnostics_keeps_the_normal_minimum() {
+        assert!(page_uses_normal_minimum(true, CPU_PAGE));
+        assert!(active_page_uses_normal_minimum(
+            true,
+            CPU_PAGE as i32,
+            NUM_PAGES
+        ));
+    }
+
+    #[test]
+    fn borderless_performance_page_can_still_use_compact_sizes() {
+        assert!(!page_uses_normal_minimum(true, PERF_PAGE));
+        assert!(!active_page_uses_normal_minimum(
+            true,
+            PERF_PAGE as i32,
+            NUM_PAGES
+        ));
+    }
+
+    #[test]
+    fn invalid_active_page_keeps_the_safe_normal_minimum() {
+        assert!(active_page_uses_normal_minimum(true, -1, NUM_PAGES));
+        assert!(active_page_uses_normal_minimum(
+            true,
+            NUM_PAGES as i32,
+            NUM_PAGES
+        ));
     }
 }

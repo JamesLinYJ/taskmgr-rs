@@ -36,16 +36,33 @@ where
     pub(crate) fn spawn<Collect>(
         thread_name: &str,
         completion_message: u32,
-        mut collect: Collect,
+        collect: Collect,
     ) -> Result<Self, u32>
     where
         Collect: FnMut(Request) -> Completion + Send + 'static,
+    {
+        Self::spawn_initialized(thread_name, completion_message, move || collect)
+    }
+
+    /// Starts a worker whose collector state is constructed on the worker thread.
+    ///
+    /// This is required for native resources that are safe to own and use on one thread but must
+    /// not be constructed on the UI thread and transferred afterward.
+    pub(crate) fn spawn_initialized<Initialize, Collect>(
+        thread_name: &str,
+        completion_message: u32,
+        initialize: Initialize,
+    ) -> Result<Self, u32>
+    where
+        Initialize: FnOnce() -> Collect + Send + 'static,
+        Collect: FnMut(Request) -> Completion + 'static,
     {
         let (command_sender, command_receiver) = channel::<WorkerCommand<Request>>();
         let (completion_sender, completion_receiver) = channel::<Completion>();
         let thread = thread::Builder::new()
             .name(thread_name.to_string())
             .spawn(move || {
+                let mut collect = initialize();
                 loop {
                     let command = match command_receiver.recv() {
                         Ok(command) => command,

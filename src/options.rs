@@ -5,7 +5,7 @@ use std::mem::{size_of, zeroed};
 // 数据合法性校验以及注册表的读写边界。
 use std::ptr::null_mut;
 
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, RECT};
+use windows_sys::Win32::Foundation::{ERROR_REVISION_MISMATCH, ERROR_SUCCESS, RECT};
 use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromRect};
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_BINARY, REG_OPTION_NON_VOLATILE, RegCloseKey,
@@ -22,6 +22,12 @@ use crate::winutil::{record_win32_error, to_wide_null};
 
 const TASKMAN_KEY: &str = "Software\\Microsoft\\Windows NT\\CurrentVersion\\TaskManager";
 const OPTIONS_KEY: &str = "Preferences";
+const OPTIONS_SCHEMA_VERSION: i32 = 2;
+const SCHEMA_0_NETWORK_PAGE: i32 = 3;
+const SCHEMA_0_USERS_PAGE: i32 = 4;
+const SCHEMA_1_GPU_PAGE: i32 = 3;
+const SCHEMA_1_NETWORK_PAGE: i32 = 4;
+const SCHEMA_1_USERS_PAGE: i32 = 5;
 
 // 这些 flag 会按历史二进制格式打包到 `Options.flags`。
 const FLAG_MINIMIZE_ON_USE: u32 = 1 << 0;
@@ -146,7 +152,7 @@ impl Default for Options {
             active_process_columns: [-1; NUM_COLUMN + 1],
             column_widths: [-1; NUM_COLUMN + 1],
             flags: 0,
-            unused: 0,
+            unused: OPTIONS_SCHEMA_VERSION,
             unused2: 0,
         };
 
@@ -223,12 +229,22 @@ impl Options {
                 return false;
             }
 
+            let migrated = match loaded.migrate_schema() {
+                Ok(migrated) => migrated,
+                Err(()) => {
+                    record_win32_error("unsupported options schema", ERROR_REVISION_MISMATCH);
+                    self.set_default_values(min_width, min_height);
+                    return false;
+                }
+            };
             let loaded_was_valid = loaded.is_valid(min_width, min_height);
             if !loaded_was_valid {
                 loaded.normalize(min_width, min_height);
             }
             *self = loaded;
-            if !loaded_was_valid && let Err(error) = self.save() {
+            if (migrated || !loaded_was_valid)
+                && let Err(error) = self.save()
+            {
                 record_win32_error("normalized options persistence", error);
             }
             loaded_was_valid
@@ -349,7 +365,37 @@ impl Options {
             && is_valid_update_speed(self.update_speed)
             && timer_interval_is_valid(self.update_speed, self.timer_interval)
             && self.flags & !ALL_VALID_FLAGS == 0
+            && self.unused == OPTIONS_SCHEMA_VERSION
+            && self.unused2 == 0
             && process_columns_are_valid(&self.active_process_columns, &self.column_widths)
+    }
+
+    fn migrate_schema(&mut self) -> Result<bool, ()> {
+        match self.unused {
+            0 => {
+                self.current_page = match self.current_page {
+                    SCHEMA_0_NETWORK_PAGE => 5,
+                    SCHEMA_0_USERS_PAGE => 6,
+                    page => page,
+                };
+                self.unused = OPTIONS_SCHEMA_VERSION;
+                self.unused2 = 0;
+                Ok(true)
+            }
+            1 => {
+                if matches!(
+                    self.current_page,
+                    SCHEMA_1_GPU_PAGE | SCHEMA_1_NETWORK_PAGE | SCHEMA_1_USERS_PAGE
+                ) {
+                    self.current_page += 1;
+                }
+                self.unused = OPTIONS_SCHEMA_VERSION;
+                self.unused2 = 0;
+                Ok(true)
+            }
+            OPTIONS_SCHEMA_VERSION => Ok(false),
+            _ => Err(()),
+        }
     }
 
     fn normalize(&mut self, min_width: i32, min_height: i32) {
@@ -357,6 +403,8 @@ impl Options {
         defaults.set_default_values(min_width, min_height);
 
         self.cb_size = size_of::<Self>() as u32;
+        self.unused = OPTIONS_SCHEMA_VERSION;
+        self.unused2 = 0;
         if !is_valid_view_mode(self.view_mode) {
             self.view_mode = defaults.view_mode;
         }
@@ -569,9 +617,10 @@ fn screen_reader_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ColumnId, NUM_COLUMN, Options, UpdateSpeed, normalize_process_columns,
-        process_columns_are_valid, update_speed_timer_interval, window_rect_dimensions_are_valid,
-        window_rect_is_valid,
+        ColumnId, NUM_COLUMN, OPTIONS_SCHEMA_VERSION, Options, SCHEMA_0_NETWORK_PAGE,
+        SCHEMA_0_USERS_PAGE, SCHEMA_1_GPU_PAGE, SCHEMA_1_NETWORK_PAGE, SCHEMA_1_USERS_PAGE,
+        UpdateSpeed, normalize_process_columns, process_columns_are_valid,
+        update_speed_timer_interval, window_rect_dimensions_are_valid, window_rect_is_valid,
     };
     use windows_sys::Win32::Foundation::RECT;
 
@@ -616,6 +665,7 @@ mod tests {
     #[test]
     fn default_options_have_valid_process_columns() {
         let options = Options::default();
+        assert_eq!(options.unused, OPTIONS_SCHEMA_VERSION);
         assert_eq!(
             options.timer_interval,
             update_speed_timer_interval(UpdateSpeed::Normal as i32).unwrap()
@@ -624,6 +674,64 @@ mod tests {
             &options.active_process_columns,
             &options.column_widths
         ));
+    }
+
+    #[test]
+    fn schema_zero_page_indices_migrate_across_gpu_and_cpu_insertions() {
+        let mut network = Options {
+            unused: 0,
+            current_page: SCHEMA_0_NETWORK_PAGE,
+            ..Options::default()
+        };
+        assert_eq!(network.migrate_schema(), Ok(true));
+        assert_eq!(network.current_page, 5);
+
+        let mut users = Options {
+            unused: 0,
+            current_page: SCHEMA_0_USERS_PAGE,
+            ..Options::default()
+        };
+        assert_eq!(users.migrate_schema(), Ok(true));
+        assert_eq!(users.current_page, 6);
+
+        let mut performance = Options {
+            unused: 0,
+            current_page: 2,
+            ..Options::default()
+        };
+        assert_eq!(performance.migrate_schema(), Ok(true));
+        assert_eq!(performance.current_page, 2);
+    }
+
+    #[test]
+    fn schema_one_page_indices_migrate_around_the_inserted_cpu_page() {
+        for (old_page, expected_page) in [
+            (SCHEMA_1_GPU_PAGE, 4),
+            (SCHEMA_1_NETWORK_PAGE, 5),
+            (SCHEMA_1_USERS_PAGE, 6),
+        ] {
+            let mut options = Options {
+                unused: 1,
+                current_page: old_page,
+                ..Options::default()
+            };
+            assert_eq!(options.migrate_schema(), Ok(true));
+            assert_eq!(options.current_page, expected_page);
+            assert_eq!(options.unused, OPTIONS_SCHEMA_VERSION);
+        }
+    }
+
+    #[test]
+    fn current_and_unknown_options_schemas_are_not_guessed() {
+        let mut current = Options::default();
+        assert_eq!(current.migrate_schema(), Ok(false));
+
+        let mut unknown = Options {
+            unused: OPTIONS_SCHEMA_VERSION + 1,
+            ..Options::default()
+        };
+        assert_eq!(unknown.migrate_schema(), Err(()));
+        assert_eq!(unknown.unused, OPTIONS_SCHEMA_VERSION + 1);
     }
 
     #[test]

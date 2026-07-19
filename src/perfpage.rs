@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::mem::zeroed;
 use std::ptr::{null, null_mut};
+use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::{
     ERROR_ARITHMETIC_OVERFLOW, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_INVALID_WINDOW_HANDLE,
@@ -11,14 +12,14 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Graphics::Gdi::{
     BLACK_BRUSH, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DT_BOTTOM, DT_CENTER,
     DT_SINGLELINE, DeleteDC, DeleteObject, DrawTextW, GetDC, GetStockObject, HBITMAP, HBRUSH, HDC,
-    HGDIOBJ, InvalidateRect, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW, Rectangle,
-    RedrawWindow, ReleaseDC, SRCCOPY, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    HGDIOBJ, InvalidateRect, Rectangle, ReleaseDC, SRCCOPY, SelectObject, SetBkMode, SetTextColor,
+    TRANSPARENT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_OWNERDRAW, BeginDeferWindowPos, CreateWindowExW, DeferWindowPos, EndDeferWindowPos,
-    GetClientRect, GetDialogBaseUnits, GetDlgItem, HDWP, HMENU, IsWindowVisible, SW_HIDE, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, ShowWindow, WM_SETREDRAW,
-    WS_CHILD, WS_DISABLED,
+    GetClientRect, GetDialogBaseUnits, GetDlgItem, HDWP, HMENU, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
+    SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetWindowTextW, ShowWindow, WM_GETFONT,
+    WM_SETFONT, WS_CHILD, WS_DISABLED,
 };
 
 use crate::assets::{
@@ -26,12 +27,16 @@ use crate::assets::{
     load_bitmap_resource,
 };
 use crate::chart_renderer::{ChartColor, ChartRenderer};
+use crate::cpu_topology::{
+    ProcessorTopology, format_compact_cpu_graph_label, format_cpu_graph_label,
+};
 use crate::drawing::{HistoryBuffer, fill_black, rgb};
+use crate::language::{TextKey, text};
 use crate::options::{CpuHistoryMode, Options};
 use crate::perf_drawing::{
     GRAPH_GRID, HIST_SIZE, HistoryPlotLayout, HistorySeries, current_font_height, defer_resize,
-    draw_grid_width, draw_grid_width_gpu, draw_history_series, draw_history_series_gpu, draw_meter,
-    format_mem_meter_text, set_numeric_text,
+    draw_graph_label, draw_grid_width, draw_grid_width_gpu, draw_history_series,
+    draw_history_series_gpu, draw_meter, format_mem_meter_text, set_numeric_text,
 };
 use crate::perf_layout::{
     PerfDialogSpacing, PerfLayoutAnchors, compute_perf_layout, next_graph_surface_extent,
@@ -47,7 +52,8 @@ use crate::resource::{
 };
 use crate::system_sampler::SystemSample;
 use crate::winutil::{
-    hiword, loword, record_win32_error, to_wide_null, window_rect_relative_to_page,
+    hiword, loword, pause_redraw_for_visible_windows, record_win32_error,
+    resume_redraw_for_windows, to_wide_null, window_rect_relative_to_page,
 };
 
 const STRIP_HEIGHT: i32 = 75;
@@ -123,6 +129,10 @@ pub struct PerformancePageState {
     scroll_offset: i32,
     cpu_history: Vec<HistoryBuffer>,
     kernel_history: Vec<HistoryBuffer>,
+    processor_topology: Option<Arc<ProcessorTopology>>,
+    cpu_graph_labels: Vec<Vec<u16>>,
+    cpu_graph_compact_labels: Vec<Vec<u16>>,
+    total_cpu_label: Vec<u16>,
     mem_history: HistoryBuffer,
     averaged_cpu_history: HistoryBuffer,
     averaged_kernel_history: HistoryBuffer,
@@ -148,6 +158,7 @@ impl PerformancePageState {
         // 性能页启动时先准备采样缓冲和仪表位图；
         // 真正依赖窗口尺寸的离屏表面会在布局完成后再创建。
         self.hinstance = hinstance;
+        self.total_cpu_label = to_wide_null(text(TextKey::TotalCpu));
         self.ensure_history_capacity(processor_count.max(1));
         if let Err(error) = self.load_meter_bitmaps() {
             // The vector meter is a complete renderer, not a partial bitmap approximation.
@@ -208,7 +219,20 @@ impl PerformancePageState {
             }
         }
 
+        let font_source = unsafe { GetDlgItem(hwnd_page, IDC_TOTAL_HANDLES) };
+        if font_source.is_null() {
+            return Err(ERROR_INVALID_WINDOW_HANDLE);
+        }
+        let numeric_font = unsafe { SendMessageW(font_source, WM_GETFONT, 0, 0) };
+        if numeric_font == 0 {
+            return Err(ERROR_INVALID_DATA);
+        }
+        for control in &controls {
+            unsafe { SendMessageW(*control, WM_SETFONT, numeric_font as usize, 0) };
+        }
+
         self.cpu_graph_hwnds = controls;
+        self.sync_cpu_graph_accessible_text(hwnd_page);
         Ok(())
     }
 
@@ -222,8 +246,10 @@ impl PerformancePageState {
         unsafe {
             // 配置变化会同时影响图表数量、是否叠加内核时间，以及文字区是否折叠。
             let processor_count = processor_count.max(1);
-            let layout_changed = self.processor_count != processor_count
-                || self.cpu_history_mode != options.cpu_history_mode
+            let processor_count_changed = self.processor_count != processor_count;
+            let history_mode_changed = self.cpu_history_mode != options.cpu_history_mode;
+            let layout_changed = processor_count_changed
+                || history_mode_changed
                 || self.no_title != options.no_title();
             let graph_style_changed = self.show_kernel_times != options.kernel_times();
 
@@ -231,6 +257,10 @@ impl PerformancePageState {
             self.cpu_history_mode = options.cpu_history_mode;
             self.show_kernel_times = options.kernel_times();
             self.no_title = options.no_title();
+
+            if processor_count_changed || history_mode_changed {
+                self.sync_cpu_graph_accessible_text(hwnd_page);
+            }
 
             if !layout_changed && !graph_style_changed {
                 return false;
@@ -254,10 +284,18 @@ impl PerformancePageState {
         if sample.processor_count == 0
             || sample.processor_cpu_usage.len() != sample.processor_count
             || sample.processor_kernel_usage.len() != sample.processor_count
+            || !sample
+                .processor_topology
+                .matches_sample_len(sample.processor_count)
         {
             return Err(ERROR_INVALID_DATA);
         }
         self.ensure_history_capacity(sample.processor_count);
+        if self.processor_topology.as_deref() != Some(sample.processor_topology.as_ref()) {
+            self.processor_topology = Some(Arc::clone(&sample.processor_topology));
+            self.rebuild_cpu_graph_labels();
+            self.sync_cpu_graph_accessible_text(hwnd_page);
+        }
         self.cpu_usage = sample.cpu_usage;
         self.kernel_usage = sample.kernel_usage;
         self.physical_mem_usage_kb = sample.physical_mem_usage_kb;
@@ -366,6 +404,17 @@ impl PerformancePageState {
                 return;
             }
             if self.draw_cpu_graph_gpu(hdc, rect, pane_index) {
+                let (full_label, compact_label) = self.cpu_graph_labels(pane_index);
+                draw_graph_label(
+                    self.cpu_graph_hwnds
+                        .get(pane_index)
+                        .copied()
+                        .unwrap_or(null_mut()),
+                    hdc,
+                    &rect,
+                    full_label,
+                    compact_label,
+                );
                 return;
             }
 
@@ -385,7 +434,6 @@ impl PerformancePageState {
             } else {
                 rect
             };
-
             fill_black(target_hdc, &target_rect);
             draw_grid_width(target_hdc, &target_rect, width, self.scroll_offset);
 
@@ -452,6 +500,28 @@ impl PerformancePageState {
                     &mut self.gdi_history_points,
                 );
             }
+
+            let label_rect = if use_backbuffer {
+                RECT {
+                    left: (self.graph_bitmap_width - width).max(0),
+                    top: 0,
+                    right: self.graph_bitmap_width,
+                    bottom: height,
+                }
+            } else {
+                rect
+            };
+            let (full_label, compact_label) = self.cpu_graph_labels(pane_index);
+            draw_graph_label(
+                self.cpu_graph_hwnds
+                    .get(pane_index)
+                    .copied()
+                    .unwrap_or(null_mut()),
+                target_hdc,
+                &label_rect,
+                full_label,
+                compact_label,
+            );
 
             if use_backbuffer {
                 let x_diff = (self.graph_bitmap_width - width).max(0);
@@ -904,6 +974,7 @@ impl PerformancePageState {
         }
 
         self.processor_count = processor_count;
+        self.processor_topology = None;
         self.cpu_history = (0..processor_count)
             .map(|_| HistoryBuffer::zeroed(HIST_SIZE))
             .collect();
@@ -913,6 +984,79 @@ impl PerformancePageState {
         self.averaged_cpu_history = HistoryBuffer::zeroed(HIST_SIZE);
         self.averaged_kernel_history = HistoryBuffer::zeroed(HIST_SIZE);
         self.mem_history = HistoryBuffer::zeroed(HIST_SIZE);
+        self.rebuild_cpu_graph_labels();
+    }
+
+    fn rebuild_cpu_graph_labels(&mut self) {
+        self.cpu_graph_labels.clear();
+        self.cpu_graph_compact_labels.clear();
+        self.cpu_graph_labels.reserve(self.processor_count);
+        self.cpu_graph_compact_labels.reserve(self.processor_count);
+        let topology = self
+            .processor_topology
+            .as_deref()
+            .filter(|topology| topology.matches_sample_len(self.processor_count));
+        for index in 0..self.processor_count {
+            let processor = topology
+                .and_then(|topology| topology.processors().get(index))
+                .and_then(Option::as_ref);
+            let label = processor
+                .map(|processor| {
+                    format_cpu_graph_label(
+                        processor,
+                        topology.map_or(0, ProcessorTopology::group_count),
+                    )
+                })
+                .unwrap_or_else(|| format!("CPU {index} · ?"));
+            let compact_label = processor
+                .map(|processor| {
+                    format_compact_cpu_graph_label(
+                        processor,
+                        topology.map_or(0, ProcessorTopology::group_count),
+                    )
+                })
+                .unwrap_or_else(|| format!("{index} ?"));
+            self.cpu_graph_labels.push(to_wide_null(&label));
+            self.cpu_graph_compact_labels
+                .push(to_wide_null(&compact_label));
+        }
+    }
+
+    fn cpu_graph_labels(&self, pane_index: usize) -> (&[u16], &[u16]) {
+        if self.cpu_history_mode == CpuHistoryMode::Panes as i32 {
+            let full = self
+                .cpu_graph_labels
+                .get(pane_index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let compact = self
+                .cpu_graph_compact_labels
+                .get(pane_index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            (full, compact)
+        } else {
+            (&self.total_cpu_label, &self.total_cpu_label)
+        }
+    }
+
+    fn sync_cpu_graph_accessible_text(&self, hwnd_page: HWND) {
+        const EMPTY_TEXT: [u16; 1] = [0];
+        unsafe {
+            for index in 0..self.cpu_graph_slot_count() {
+                let control = self.cpu_graph_hwnd(hwnd_page, index);
+                if control.is_null() {
+                    continue;
+                }
+                let (label, _) = self.cpu_graph_labels(index);
+                let text = if label.is_empty() {
+                    EMPTY_TEXT.as_ptr()
+                } else {
+                    label.as_ptr()
+                };
+                SetWindowTextW(control, text);
+            }
+        }
     }
 
     fn update_detail_texts(&self, hwnd_page: HWND) {
@@ -1343,46 +1487,4 @@ fn push_unique_window(windows: &mut Vec<HWND>, hwnd: HWND) {
         return;
     }
     windows.push(hwnd);
-}
-
-fn pause_redraw_for_visible_windows(windows: &[HWND]) -> Vec<HWND> {
-    let mut paused = Vec::with_capacity(windows.len());
-    // Only visible windows may be paused. DefWindowProc can remove/add WS_VISIBLE while handling
-    // WM_SETREDRAW, so sending the enable message to an originally hidden pane would show it.
-    unsafe {
-        for &hwnd in windows {
-            if IsWindowVisible(hwnd) != 0 {
-                SendMessageW(hwnd, WM_SETREDRAW, 0, 0);
-                paused.push(hwnd);
-            }
-        }
-    }
-    paused
-}
-
-fn resume_redraw_for_windows(windows: &[HWND]) {
-    // 安全性: this list contains exactly the live page windows paused by the matching helper.
-    unsafe {
-        for &hwnd in windows {
-            SendMessageW(hwnd, WM_SETREDRAW, 1, 0);
-        }
-    }
-}
-
-pub fn redraw_performance_page(hwnd_page: HWND) {
-    if hwnd_page.is_null() {
-        return;
-    }
-
-    // Redraw the committed child tree as one operation. Owner-draw buttons that become visible
-    // while their parent is hidden do not reliably receive a first paint from child-level
-    // UpdateWindow calls; RDW_ALLCHILDREN makes that first frame part of the page redraw.
-    unsafe {
-        RedrawWindow(
-            hwnd_page,
-            null(),
-            null_mut(),
-            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
-        );
-    }
 }

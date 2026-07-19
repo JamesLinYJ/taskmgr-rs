@@ -2,20 +2,24 @@
 # 这里定义包名、版本、发布构建策略，以及 Win32 API 绑定所需的功能开关。
 [package]
 name = "taskmgr-rs"
-version = "0.1.2"
-license = "GPL-2.0-only"
+version = "0.2.0"
+authors = ["taskmgr-rs contributors"]
+description = "A classic Windows Task Manager built in Rust with native Win32 APIs."
+license = "MIT"
+repository = "https://github.com/JamesLinYJ/taskmgr-rs"
 edition = "2024"
 rust-version = "1.97"
 build = "build.rs"
 exclude = [".claude/**", ".tmp-pip/**", ".tmp-tests/**", ".vs/**"]
 
 [package.metadata.winres]
-FileDescription = "Windows NT Task Manager"
-ProductName = "Windows NT Task Manager"
+FileDescription = "taskmgr-rs - Classic Windows Task Manager"
+ProductName = "taskmgr-rs"
 InternalName = "taskmgr"
 OriginalFilename = "taskmgr.exe"
-CompanyName = "JamesLinYJ"
-LegalCopyright = "GNU General Public License v2.0"
+CompanyName = "taskmgr-rs contributors"
+LegalCopyright = "Copyright (c) 2026 taskmgr-rs contributors"
+Comments = "A classic Windows Task Manager built in Rust with native Win32 APIs."
 
 [[bin]]
 name = "taskmgr"
@@ -36,6 +40,9 @@ overflow-checks = false
 # 仅启用当前项目实际使用到的 Win32 模块，避免无关绑定进入最终产物。
 [dependencies]
 windows-sys = { version = "0.61.2", features = [
+    "Wdk_Graphics_Direct3D",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
     "Win32_Globalization",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -48,11 +55,14 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Environment",
     "Win32_System_LibraryLoader",
     "Win32_System_ProcessStatus",
+    "Win32_System_Performance",
     "Win32_System_Registry",
     "Win32_System_RemoteDesktop",
     "Win32_System_Shutdown",
     "Win32_System_StationsAndDesktops",
     "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Time",
     "Win32_System_Threading",
     "Win32_System_VirtualDosMachines",
     "Win32_UI_Controls",
@@ -62,11 +72,19 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Rpc",
+    "Win32_System_Variant",
+    "Win32_System_Wmi",
+    "Win32_Security",
     "Win32_UI_Shell",
 ] }
 windows-numerics = "0.3.1"

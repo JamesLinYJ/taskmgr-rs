@@ -17,7 +17,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     COLOR_WINDOW, CombineRgn, CreateRectRgn, CreateSolidBrush, DeleteObject, FillRgn, GetSysColor,
-    HBRUSH, HDC, HRGN, InvalidateRect, MapWindowPoints, RGN_DIFF, RGN_OR, SetRectRgn,
+    HBRUSH, HDC, HRGN, InvalidateRect, MapWindowPoints, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
+    RDW_UPDATENOW, RGN_DIFF, RGN_OR, RedrawWindow, SetRectRgn,
 };
 use windows_sys::Win32::Security::{
     AdjustTokenPrivileges, GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
@@ -42,8 +43,9 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, DWLP_MSGRESULT, DeleteMenu, DestroyIcon, EnableMenuItem, GWL_STYLE,
     GWLP_USERDATA, GetClientRect, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HICON, HMENU,
-    MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, SM_CXEDGE, SendMessageW, SetWindowLongPtrW, WM_ERASEBKGND,
-    WM_NCDESTROY, WM_NOTIFY, WM_SETREDRAW, WM_SYSCOLORCHANGE, WNDPROC,
+    IsWindowVisible, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, SM_CXEDGE, SendMessageW,
+    SetWindowLongPtrW, WM_ERASEBKGND, WM_NCDESTROY, WM_NOTIFY, WM_SETREDRAW, WM_SYSCOLORCHANGE,
+    WNDPROC,
 };
 
 use crate::language::{TextKey, text};
@@ -81,6 +83,14 @@ pub fn record_hresult_error(component: &str, error: i32) {
     let message = to_wide_null(&format!(
         "taskmgr-rs: {component} failed with HRESULT 0x{:08X}\r\n",
         error as u32
+    ));
+    // 安全性: `message` is null-terminated and remains alive for the synchronous call.
+    unsafe { OutputDebugStringW(message.as_ptr()) };
+}
+
+pub fn record_pdh_error(component: &str, status: u32) {
+    let message = to_wide_null(&format!(
+        "taskmgr-rs: {component} failed with PDH status 0x{status:08X}\r\n"
     ));
     // 安全性: `message` is null-terminated and remains alive for the synchronous call.
     unsafe { OutputDebugStringW(message.as_ptr()) };
@@ -464,6 +474,47 @@ fn finish_list_view_update_internal(hwnd: HWND, invalidate: bool) {
 pub fn finish_list_view_update(hwnd: HWND) {
     // 恢复重绘并安排一次异步刷新，避免采样/提交消息被同步 GDI 绘制阻塞。
     finish_list_view_update_internal(hwnd, true);
+}
+
+pub fn pause_redraw_for_visible_windows(windows: &[HWND]) -> Vec<HWND> {
+    let mut paused = Vec::with_capacity(windows.len());
+    // WM_SETREDRAW changes WS_VISIBLE state in DefWindowProc, so hidden controls must stay out of
+    // the pause set or they can become visible when redraw resumes.
+    unsafe {
+        for &hwnd in windows {
+            if !hwnd.is_null() && IsWindowVisible(hwnd) != 0 {
+                SendMessageW(hwnd, WM_SETREDRAW, 0, 0);
+                paused.push(hwnd);
+            }
+        }
+    }
+    paused
+}
+
+pub fn resume_redraw_for_windows(windows: &[HWND]) {
+    // Safety: callers pass the same live HWND set returned by the matching pause helper.
+    unsafe {
+        for &hwnd in windows {
+            SendMessageW(hwnd, WM_SETREDRAW, 1, 0);
+        }
+    }
+}
+
+pub fn redraw_window_tree(hwnd: HWND) {
+    if hwnd.is_null() {
+        return;
+    }
+
+    // Owner-draw children need to join the same synchronous repaint as their parent after a
+    // deferred layout commit; ordinary parent invalidation does not guarantee that first frame.
+    unsafe {
+        RedrawWindow(
+            hwnd,
+            null(),
+            null_mut(),
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+        );
+    }
 }
 
 pub fn is_32_bit_process_handle(handle: HANDLE) -> Result<bool, u32> {

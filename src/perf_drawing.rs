@@ -6,15 +6,17 @@ use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    DC_PEN, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW, GetCurrentObject,
-    GetObjectW, GetStockObject, HDC, LOGFONTW, LineTo, MoveToEx, OBJ_FONT, Polyline, SelectObject,
-    SetBkMode, SetDCPenColor, SetTextColor, TRANSPARENT,
+    DC_PEN, DT_CALCRECT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_TOP, DT_VCENTER,
+    DrawTextW, GetCurrentObject, GetObjectW, GetStockObject, HDC, HFONT, LOGFONTW, LineTo,
+    MoveToEx, OBJ_FONT, Polyline, SelectObject, SetBkMode, SetDCPenColor, SetTextColor,
+    TRANSPARENT,
 };
 use windows_sys::Win32::UI::Shell::{
     SFBS_FLAGS_ROUND_TO_NEAREST_DISPLAYED_DIGIT, StrFormatByteSizeEx,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DeferWindowPos, HDWP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREDRAW, SWP_NOZORDER, SetDlgItemTextW,
+    DeferWindowPos, HDWP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREDRAW, SWP_NOZORDER, SendMessageW,
+    SetDlgItemTextW, WM_GETFONT,
 };
 
 use crate::chart_renderer::{ChartColor, ChartFrame};
@@ -50,6 +52,85 @@ pub fn set_numeric_text(hwnd_page: HWND, control_id: i32, value: u64) {
         let mut buf = [0u16; 24];
         write_u64_utf16(value, &mut buf);
         SetDlgItemTextW(hwnd_page, control_id, buf.as_ptr());
+    }
+}
+
+pub fn draw_graph_label(
+    graph_hwnd: HWND,
+    hdc: HDC,
+    rect: &RECT,
+    full_label: &[u16],
+    compact_label: &[u16],
+) {
+    if rect.right - rect.left < 8 || rect.bottom - rect.top < 8 {
+        return;
+    }
+
+    // Labels are transparent overlays on the graph. Both forms are cached by the page, so paint
+    // only measures and selects between the full and compact representations.
+    unsafe {
+        if graph_hwnd.is_null() {
+            return;
+        }
+        let font = SendMessageW(graph_hwnd, WM_GETFONT, 0, 0) as HFONT;
+        if font.is_null() {
+            return;
+        }
+        let old_font = SelectObject(hdc, font);
+        if old_font.is_null() || old_font as isize == -1 {
+            return;
+        }
+
+        let available_width = (rect.right - rect.left - 4).max(0);
+        let available_height = (rect.bottom - rect.top - 4).max(0);
+        let mut selected_label = None;
+        for label in [full_label, compact_label] {
+            if label.first().copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            let mut measured = RECT {
+                left: 0,
+                top: 0,
+                right: available_width,
+                bottom: available_height,
+            };
+            let measured_height = DrawTextW(
+                hdc,
+                label.as_ptr() as *mut u16,
+                -1,
+                &mut measured,
+                DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            if measured_height > 0
+                && measured_height <= available_height
+                && measured.right - measured.left <= available_width
+            {
+                selected_label = Some(label);
+                break;
+            }
+        }
+
+        let old_bk_mode = SetBkMode(hdc, TRANSPARENT as i32);
+        let old_text_color = SetTextColor(hdc, rgb(255, 255, 255));
+        if let Some(label) = selected_label {
+            let mut text_rect = RECT {
+                left: rect.left + 2,
+                top: rect.top + 2,
+                right: rect.right - 2,
+                bottom: rect.bottom - 2,
+            };
+            DrawTextW(
+                hdc,
+                label.as_ptr() as *mut u16,
+                -1,
+                &mut text_rect,
+                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
+            );
+        }
+
+        SetTextColor(hdc, old_text_color);
+        SetBkMode(hdc, old_bk_mode);
+        SelectObject(hdc, old_font);
     }
 }
 

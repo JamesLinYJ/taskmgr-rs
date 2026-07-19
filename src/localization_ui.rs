@@ -6,6 +6,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetDlgItem, IDCANCEL, IDOK, SetDlgItemTextW, SetWindowTextW,
 };
 
+use crate::cpupage::{CPU_DETAIL_GROUP_TITLE_KEYS, CPU_DETAIL_METRIC_KEYS};
 use crate::language::{TextKey, text};
 use crate::resource::*;
 use crate::winutil::to_wide_null;
@@ -27,6 +28,54 @@ pub fn localize_dialog(hwnd: HWND, dialog_id: u16) {
         }
         IDD_NETPAGE => {
             set_dialog_item_text(hwnd, IDC_NOADAPTERS, TextKey::NoActiveNetworkAdaptersFound);
+        }
+        IDD_CPUPAGE => {
+            set_dialog_item_text(hwnd, IDC_CPU_DETAIL_TITLE, TextKey::CpuPageTitle);
+            for group in 0..CPU_DETAIL_GROUP_COUNT {
+                set_control_text(
+                    dlg_item(hwnd, IDC_CPU_DETAIL_GROUP_FIRST + group as i32),
+                    CPU_DETAIL_GROUP_TITLE_KEYS[group],
+                );
+                for (index, key) in CPU_DETAIL_METRIC_KEYS[group].iter().copied().enumerate() {
+                    set_dialog_item_text(
+                        hwnd,
+                        IDC_CPU_DETAIL_LABEL_BASES[group] + index as i32,
+                        key,
+                    );
+                }
+            }
+        }
+        IDD_GPUPAGE => {
+            set_control_text(
+                dlg_item(hwnd, IDC_GPU_METRICS_GROUP),
+                TextKey::GpuCurrentMetrics,
+            );
+            set_control_text(
+                dlg_item(hwnd, IDC_GPU_DETAILS_GROUP),
+                TextKey::GpuAdapterDetails,
+            );
+            set_dialog_item_text(hwnd, IDC_GPU_UTILIZATION_LABEL, TextKey::GpuUtilization);
+            set_dialog_item_text(hwnd, IDC_GPU_TOTAL_MEMORY_LABEL, TextKey::GpuMemory);
+            set_dialog_item_text(
+                hwnd,
+                IDC_GPU_DEDICATED_MEMORY_LABEL,
+                TextKey::GpuDedicatedMemory,
+            );
+            set_dialog_item_text(hwnd, IDC_GPU_SHARED_MEMORY_LABEL, TextKey::GpuSharedMemory);
+            set_dialog_item_text(hwnd, IDC_GPU_TEMPERATURE_LABEL, TextKey::GpuTemperature);
+            set_dialog_item_text(
+                hwnd,
+                IDC_GPU_DRIVER_VERSION_LABEL,
+                TextKey::GpuDriverVersion,
+            );
+            set_dialog_item_text(hwnd, IDC_GPU_DRIVER_DATE_LABEL, TextKey::GpuDriverDate);
+            set_dialog_item_text(hwnd, IDC_GPU_DIRECTX_LABEL, TextKey::GpuDirectXVersion);
+            set_dialog_item_text(hwnd, IDC_GPU_LOCATION_LABEL, TextKey::GpuPhysicalLocation);
+            set_dialog_item_text(
+                hwnd,
+                IDC_GPU_RESERVED_MEMORY_LABEL,
+                TextKey::GpuHardwareReservedMemory,
+            );
         }
         IDD_USERSPAGE => {
             set_dialog_item_text(hwnd, i32::from(IDM_DISCONNECT), TextKey::Disconnect);
