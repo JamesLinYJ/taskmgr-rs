@@ -1,40 +1,24 @@
+// +-------------------------------------------------------------------------
+//
+//   taskmgr-rs - 程序入口
+//
+//   文件:       src/main.rs
+//
+//   日期:       2026年07月19日
+//   作者:       OpenAI Codex
+// --------------------------------------------------------------------------
+
 //! 程序入口文件。
 //! 这里本身不承载业务逻辑，只负责组织模块并把启动流程委托给 `app::run`。
 
 #![windows_subsystem = "windows"]
 
 mod app;
-mod app_controllers;
-mod assets;
-mod background_worker;
-mod chart_renderer;
-mod cpu_details;
-mod cpu_layout;
-mod cpu_sampler;
-mod cpu_topology;
-mod cpupage;
-mod dialog_templates;
-mod drawing;
-mod gpu_layout;
-mod gpu_sampler;
-mod gpupage;
-mod language;
-mod menus;
-mod netpage;
-mod options;
+mod config;
+mod infrastructure;
 mod pages;
-mod perf_drawing;
-mod perf_layout;
-mod perfpage;
-mod process_identity;
-mod procpage;
-#[allow(dead_code)]
-mod resource;
-mod runtime_menu;
-mod system_sampler;
-mod taskpage;
-mod userpage;
-mod winutil;
+mod system;
+mod ui;
 
 fn main() {
     // `app::run` 内部负责 Win32 初始化，并返回最终的进程退出码。

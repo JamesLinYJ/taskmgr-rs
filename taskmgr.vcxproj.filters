@@ -4,152 +4,34 @@
     <Filter Include="Project Files">
       <UniqueIdentifier>{1D462085-3C40-43DF-8874-5EC1B7AD34A9}</UniqueIdentifier>
     </Filter>
-    <Filter Include="Scripts">
-      <UniqueIdentifier>{3596E3C8-B478-411E-A67D-2E984ADCC4A1}</UniqueIdentifier>
-    </Filter>
     <Filter Include="Source Files">
       <UniqueIdentifier>{05EEAC89-38DE-45CF-8411-6242A0343259}</UniqueIdentifier>
     </Filter>
-    <Filter Include="Source Files\Localization">
+    <Filter Include="Build Support">
       <UniqueIdentifier>{707160F1-0C16-4F90-8523-51029399FDCC}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Assets">
+      <UniqueIdentifier>{3596E3C8-B478-411E-A67D-2E984ADCC4A1}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Tests">
+      <UniqueIdentifier>{DA68F78A-87A6-430C-BB4E-4DBEA9C54813}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
-
   <ItemGroup>
-    <None Include=".cargo\config.toml">
+    <None Include=".cargo\config.toml;AGENTS.md;Cargo.toml;Cargo.lock;LICENSE;README.md;README.zh-CN.md;build.rs;rust-toolchain.toml">
       <Filter>Project Files</Filter>
     </None>
-    <None Include="AGENTS.md">
-      <Filter>Project Files</Filter>
-    </None>
-    <None Include="Cargo.toml">
-      <Filter>Project Files</Filter>
-    </None>
-    <None Include="Cargo.lock">
-      <Filter>Project Files</Filter>
-    </None>
-    <None Include="build.rs">
-      <Filter>Project Files</Filter>
-    </None>
-    <None Include="rust-toolchain.toml">
-      <Filter>Project Files</Filter>
-    </None>
-    <None Include="sysmon.manifest">
-      <Filter>Project Files</Filter>
-    </None>
-    <None Include="scripts\release-clean.ps1">
-      <Filter>Scripts</Filter>
-    </None>
-    <None Include="src\app.rs">
+    <None Include="src\**\*.rs">
       <Filter>Source Files</Filter>
     </None>
-    <None Include="src\app_controllers.rs">
-      <Filter>Source Files</Filter>
+    <None Include="build_support\**\*.rs;localization\**\*.toml;scripts\**\*.ps1">
+      <Filter>Build Support</Filter>
     </None>
-    <None Include="src\assets.rs">
-      <Filter>Source Files</Filter>
+    <None Include="assets\**\*">
+      <Filter>Assets</Filter>
     </None>
-    <None Include="src\background_worker.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\chart_renderer.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\cpu_details.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\cpu_layout.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\cpupage.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\cpu_sampler.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\cpu_topology.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\dialog_templates.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\drawing.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\gpu_sampler.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\gpu_layout.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\gpupage.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\language.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\localization_terms.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\localization_ui.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\main.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\menus.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\netpage.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\options.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\pages.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\perf_drawing.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\perf_layout.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\perfpage.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\process_identity.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\procpage.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\resource.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\runtime_menu.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\system_sampler.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\taskpage.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\text_key_parser.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\userpage.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\winutil.rs">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\localization\text_key.rs">
-      <Filter>Source Files\Localization</Filter>
-    </None>
-    <None Include="tests\text_key_parse.rs">
-      <Filter>Source Files</Filter>
+    <None Include="tests\**\*.rs">
+      <Filter>Tests</Filter>
     </None>
   </ItemGroup>
 </Project>

@@ -1,4 +1,4 @@
-#[path = "../src/text_key_parser.rs"]
+#[path = "../build_support/text_key_parser.rs"]
 mod text_key_parser;
 
 use std::path::Path;
