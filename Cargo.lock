@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "taskmgr-rs"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "crossbeam-channel",
  "ico",

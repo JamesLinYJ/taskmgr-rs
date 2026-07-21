@@ -22,9 +22,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{
-    GetLengthSid, GetTokenInformation, IsValidSid, IsWellKnownSid, LookupAccountSidW, SID_NAME_USE,
-    TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalServiceSid, WinLocalSystemSid,
-    WinNetworkServiceSid,
+    GetLengthSid, GetTokenInformation, IsValidSid, LookupAccountSidW, SID_NAME_USE, TOKEN_QUERY,
+    TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -96,6 +95,7 @@ impl AccountNameCache {
     }
 
     fn insert(&mut self, sid: Vec<u8>, name: String) {
+        debug_assert!(!name.is_empty());
         if !self.entries.contains_key(sid.as_slice())
             && self.entries.len() >= Self::MAX_ENTRIES
             && let Some(oldest) = self
@@ -169,28 +169,11 @@ impl ProcWorkerState {
     }
 }
 
-fn well_known_service_name(sid: *mut core::ffi::c_void) -> Option<String> {
-    unsafe {
-        if IsWellKnownSid(sid, WinLocalSystemSid) != 0 {
-            Some("SYSTEM".to_string())
-        } else if IsWellKnownSid(sid, WinLocalServiceSid) != 0 {
-            Some("LOCAL SERVICE".to_string())
-        } else if IsWellKnownSid(sid, WinNetworkServiceSid) != 0 {
-            Some("NETWORK SERVICE".to_string())
-        } else {
-            None
-        }
-    }
-}
-
 // 通过 LookupAccountSidW 将 SID 解析为经典 Task Manager 风格的账户名。
-unsafe fn lookup_account_name_from_sid(sid: *mut core::ffi::c_void) -> Result<Option<String>, u32> {
+unsafe fn lookup_account_name_from_sid(sid: *mut core::ffi::c_void) -> Result<String, u32> {
     unsafe {
         if sid.is_null() || IsValidSid(sid) == 0 {
-            return Ok(None);
-        }
-        if let Some(name) = well_known_service_name(sid) {
-            return Ok(Some(name));
+            return Err(ERROR_INVALID_DATA);
         }
 
         let mut name_len = 0u32;
@@ -208,7 +191,7 @@ unsafe fn lookup_account_name_from_sid(sid: *mut core::ffi::c_void) -> Result<Op
         {
             let error = GetLastError();
             if error == ERROR_NONE_MAPPED {
-                return sid_string(sid).map(Some);
+                return sid_string(sid);
             }
             if error != ERROR_INSUFFICIENT_BUFFER {
                 return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
@@ -238,7 +221,7 @@ unsafe fn lookup_account_name_from_sid(sid: *mut core::ffi::c_void) -> Result<Op
         {
             let error = GetLastError();
             if error == ERROR_NONE_MAPPED {
-                return sid_string(sid).map(Some);
+                return sid_string(sid);
             }
             return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
         }
@@ -248,14 +231,19 @@ unsafe fn lookup_account_name_from_sid(sid: *mut core::ffi::c_void) -> Result<Op
             .iter()
             .position(|value| *value == 0)
             .unwrap_or(available);
-        Ok(Some(String::from_utf16_lossy(&name[..length])))
+        let name = String::from_utf16_lossy(&name[..length]);
+        if name.is_empty() {
+            Err(ERROR_INVALID_DATA)
+        } else {
+            Ok(name)
+        }
     }
 }
 
 unsafe fn lookup_account_name_from_sid_cached(
     sid: *mut core::ffi::c_void,
     account_cache: &mut AccountNameCache,
-) -> Result<Option<String>, u32> {
+) -> Result<String, u32> {
     unsafe {
         if sid.is_null() || IsValidSid(sid) == 0 {
             return lookup_account_name_from_sid(sid);
@@ -266,13 +254,11 @@ unsafe fn lookup_account_name_from_sid_cached(
         }
         let cache_key = slice::from_raw_parts(sid as *const u8, length);
         if let Some(name) = account_cache.get(cache_key) {
-            return Ok(Some(name));
+            return Ok(name);
         }
 
         let name = lookup_account_name_from_sid(sid)?;
-        if let Some(name) = name.as_ref() {
-            account_cache.insert(cache_key.to_vec(), name.clone());
-        }
+        account_cache.insert(cache_key.to_vec(), name.clone());
         Ok(name)
     }
 }
@@ -280,7 +266,7 @@ unsafe fn lookup_account_name_from_sid_cached(
 unsafe fn query_process_account_name(
     process_handle: HANDLE,
     account_cache: &mut AccountNameCache,
-) -> Result<Option<String>, u32> {
+) -> Result<String, u32> {
     unsafe {
         let mut raw_token = null_mut();
         if OpenProcessToken(process_handle, TOKEN_QUERY, &mut raw_token) == 0 {
@@ -356,6 +342,7 @@ unsafe fn sid_string(sid: *mut core::ffi::c_void) -> Result<String, u32> {
 
 unsafe fn collect_process_identity_map(
     required_pids: &HashSet<u32>,
+    required_user_pids: &HashSet<u32>,
     account_cache: &mut AccountNameCache,
 ) -> Result<WtsProcessIdentitySnapshot, u32> {
     unsafe {
@@ -365,8 +352,9 @@ unsafe fn collect_process_identity_map(
                 row_error: None,
             });
         }
-        // WTS 进程枚举能一次拿到大量进程对应的 SID / Session 信息，
-        // 先建表再回填到快照里，比逐进程单查用户名更高效。
+        // WTS_PROCESS_INFO documents pUserSid as the SID from the process primary token. WTS is
+        // also the batch source for session IDs; direct token results remain authoritative when
+        // both sources are available because they are tied to a creation-time-verified handle.
         let mut process_info = null_mut::<WTS_PROCESS_INFOW>();
         let mut count = 0u32;
 
@@ -392,11 +380,13 @@ unsafe fn collect_process_identity_map(
             if !required_pids.contains(&pid) {
                 continue;
             }
-            let user_name = if pid == 0 {
+            let user_name = if !required_user_pids.contains(&pid) {
+                None
+            } else if pid == 0 {
                 Some("SYSTEM".to_string())
             } else {
                 match lookup_account_name_from_sid_cached(process.pUserSid, account_cache) {
-                    Ok(name) => name,
+                    Ok(name) => Some(name),
                     Err(error) => {
                         row_error.get_or_insert(error);
                         None
@@ -489,6 +479,7 @@ unsafe fn collect_process_entries(
         let mut entries = Vec::with_capacity(previous_samples.len().max(64));
         let mut next_samples = HashMap::with_capacity(previous_samples.len().max(64));
         let mut resolved_user_identities = HashSet::with_capacity(previous_samples.len().max(64));
+        let mut unresolved_user_errors = HashMap::with_capacity(previous_samples.len().max(64));
         let mut row_error = None;
         let mut process_entry = zeroed::<PROCESSENTRY32W>();
         process_entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
@@ -616,14 +607,17 @@ unsafe fn collect_process_entries(
                     && !resolved_user_identities.contains(&entry.identity)
                 {
                     // The token is tied to the already creation-time-verified process handle.
-                    // Access-denied and exit races remain row-local; WTS resolves those rows in
-                    // one identity-validated batch after the process walk completes.
-                    if let Ok(Some(user_name)) =
-                        query_process_account_name(info_handle, &mut cache.account_names)
-                    {
-                        entry.user_name_lower = user_name.to_lowercase();
-                        entry.user_name = user_name;
-                        resolved_user_identities.insert(entry.identity);
+                    // Access-denied and exit races remain row-local and are reported only if the
+                    // independently validated WTS primary-token SID cannot resolve the same row.
+                    match query_process_account_name(info_handle, &mut cache.account_names) {
+                        Ok(user_name) => {
+                            entry.user_name_lower = user_name.to_lowercase();
+                            entry.user_name = user_name;
+                            resolved_user_identities.insert(entry.identity);
+                        }
+                        Err(error) => {
+                            unresolved_user_errors.insert(entry.identity, error);
+                        }
                     }
                 }
 
@@ -686,27 +680,53 @@ unsafe fn collect_process_entries(
             }
         }
 
-        let required_identity_pids = entries
+        let required_user_pids = entries
             .iter()
             .filter(|entry| {
                 entry.pid != 0
                     && (!entry.identity.is_verified()
-                        || cache
-                            .metadata
-                            .get(&entry.identity)
-                            .is_none_or(|metadata| !metadata.user_identity_resolved))
+                        || !resolved_user_identities.contains(&entry.identity))
             })
             .map(|entry| entry.pid)
             .collect::<HashSet<_>>();
-        let identity_snapshot =
-            collect_process_identity_map(&required_identity_pids, &mut cache.account_names)?;
-        row_error = row_error.or(identity_snapshot.row_error);
-        for entry in entries.iter_mut().filter(|entry| entry.pid != 0) {
-            if merge_wts_process_identity(entry, identity_snapshot.identities.get(&entry.pid))
-                && entry.identity.is_verified()
-            {
-                resolved_user_identities.insert(entry.identity);
+        let required_identity_pids = entries
+            .iter()
+            .filter(|entry| {
+                entry.pid != 0
+                    && (entry.session_id.is_none() || required_user_pids.contains(&entry.pid))
+            })
+            .map(|entry| entry.pid)
+            .collect::<HashSet<_>>();
+        match collect_process_identity_map(
+            &required_identity_pids,
+            &required_user_pids,
+            &mut cache.account_names,
+        ) {
+            Ok(identity_snapshot) => {
+                row_error = row_error.or(identity_snapshot.row_error);
+                for entry in entries.iter_mut().filter(|entry| entry.pid != 0) {
+                    if merge_wts_process_identity(
+                        entry,
+                        identity_snapshot.identities.get(&entry.pid),
+                    ) && entry.identity.is_verified()
+                    {
+                        resolved_user_identities.insert(entry.identity);
+                        unresolved_user_errors.remove(&entry.identity);
+                    }
+                }
             }
+            Err(error) => {
+                row_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = entries
+            .iter()
+            .filter(|entry| {
+                entry.identity.is_verified() && !resolved_user_identities.contains(&entry.identity)
+            })
+            .find_map(|entry| unresolved_user_errors.get(&entry.identity).copied())
+        {
+            row_error.get_or_insert(error);
         }
 
         let current_identities = entries
@@ -720,10 +740,15 @@ unsafe fn collect_process_entries(
         for entry in entries.iter().filter(|entry| entry.identity.is_verified()) {
             let resolved = resolved_user_identities.contains(&entry.identity);
             if let Some(metadata) = cache.metadata.get_mut(&entry.identity) {
+                if metadata.is_32_bit.is_none() && entry.is_32_bit.is_some() {
+                    metadata.is_32_bit = entry.is_32_bit;
+                }
+                if metadata.session_id.is_none() && entry.session_id.is_some() {
+                    metadata.session_id = entry.session_id;
+                }
                 if resolved && !metadata.user_identity_resolved {
                     metadata.user_name.clone_from(&entry.user_name);
                     metadata.user_name_lower.clone_from(&entry.user_name_lower);
-                    metadata.session_id = entry.session_id;
                     metadata.user_identity_resolved = true;
                 }
             } else {
@@ -791,4 +816,20 @@ pub(super) fn cpu_percent_from_delta(delta_100ns: u64, total_delta_100ns: u64) -
     let rounded = (u128::from(delta_100ns) * 100 + u128::from(total_delta_100ns) / 2)
         / u128::from(total_delta_100ns);
     rounded.min(100) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    use super::{AccountNameCache, query_process_account_name};
+
+    #[test]
+    fn current_process_primary_token_resolves_to_a_non_empty_account_label() {
+        let mut cache = AccountNameCache::default();
+        let account_name = unsafe { query_process_account_name(GetCurrentProcess(), &mut cache) }
+            .expect("the current process primary token should expose TokenUser");
+
+        assert!(!account_name.is_empty());
+    }
 }

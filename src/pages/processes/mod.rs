@@ -169,6 +169,22 @@ impl DirtyRowRange {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionScrollPolicy {
+    PreserveViewport,
+    RevealSelection,
+}
+
+fn refresh_selection_scroll_policy(
+    requested_selection: Option<ProcIdentity>,
+) -> SelectionScrollPolicy {
+    if requested_selection.is_some() {
+        SelectionScrollPolicy::RevealSelection
+    } else {
+        SelectionScrollPolicy::PreserveViewport
+    }
+}
+
 #[derive(Default)]
 struct ProcessStrings {
     warning: String,
@@ -483,7 +499,7 @@ impl ProcessPageState {
                     self.selected_identity =
                         self.current_selected_identity().or(self.selected_identity);
                     self.resort_entries();
-                    self.rebuild_listview();
+                    self.rebuild_listview(SelectionScrollPolicy::PreserveViewport);
                     self.refresh_processes();
                     1
                 }
@@ -743,7 +759,11 @@ impl ProcessPageState {
 
             self.selected_identity = Some(self.entries[index].identity);
             let list_hwnd = self.list_hwnd();
-            self.set_list_selection(list_hwnd, Some(index));
+            self.set_list_selection(
+                list_hwnd,
+                Some(index),
+                SelectionScrollPolicy::RevealSelection,
+            );
             self.update_ui_state();
             true
         }
@@ -883,8 +903,9 @@ impl ProcessPageState {
                 .pending_find_identity
                 .take()
                 .filter(|identity| self.entries.iter().any(|entry| entry.identity == *identity));
+            let selection_scroll_policy = refresh_selection_scroll_policy(requested_selection);
             self.selected_identity = requested_selection.or(previous_selection);
-            self.rebuild_listview();
+            self.rebuild_listview(selection_scroll_policy);
             self.pass_count = self.pass_count.wrapping_add(1);
         }
     }
@@ -916,7 +937,7 @@ impl ProcessPageState {
         previous_len != self.entries.len()
     }
 
-    unsafe fn rebuild_listview(&mut self) {
+    unsafe fn rebuild_listview(&mut self, selection_scroll_policy: SelectionScrollPolicy) {
         unsafe {
             // 进程列表使用 LVS_OWNERDATA；刷新只更新虚拟项数量和索引映射，
             // 不再为每个进程创建、删除或移动 Win32 ListView 项。
@@ -962,7 +983,9 @@ impl ProcessPageState {
             }
 
             if bulk_update {
-                self.set_list_selection(list_hwnd, selected_index);
+                // Dynamic sort keys can move the selected process on every sample. Refreshes must
+                // preserve the user's wheel position; only an explicit navigation may reveal it.
+                self.set_list_selection(list_hwnd, selected_index, selection_scroll_policy);
                 finish_list_view_update(list_hwnd);
             } else {
                 dirty_rows.redraw_visible(list_hwnd, self.entries.len());
@@ -980,7 +1003,12 @@ impl ProcessPageState {
         }
     }
 
-    unsafe fn set_list_selection(&self, list_hwnd: HWND, selected_index: Option<usize>) {
+    unsafe fn set_list_selection(
+        &self,
+        list_hwnd: HWND,
+        selected_index: Option<usize>,
+        scroll_policy: SelectionScrollPolicy,
+    ) {
         unsafe {
             // Clearing all virtual item states is one ListView operation instead of an O(n) loop.
             let mut item = LVITEMW {
@@ -1003,7 +1031,9 @@ impl ProcessPageState {
                     index,
                     &mut item as *mut _ as LPARAM,
                 );
-                SendMessageW(list_hwnd, LVM_ENSUREVISIBLE, index, 0);
+                if scroll_policy == SelectionScrollPolicy::RevealSelection {
+                    SendMessageW(list_hwnd, LVM_ENSUREVISIBLE, index, 0);
+                }
             }
         }
     }
@@ -1330,7 +1360,8 @@ mod tests {
         system_time_delta, wts_identity_matches,
     };
     use super::{
-        ProcIdentity, ProcessPageState, reorder_process_columns, write_process_column_layout,
+        ProcIdentity, ProcessPageState, SelectionScrollPolicy, refresh_selection_scroll_policy,
+        reorder_process_columns, write_process_column_layout,
     };
     use crate::config::options::{ColumnId, Options};
     use std::collections::HashMap;
@@ -1385,6 +1416,22 @@ mod tests {
         );
         assert_eq!(reorder_process_columns(&active, &[1, 0, 2, 3]), None);
         assert_eq!(reorder_process_columns(&active, &[0, 2, 2, 3]), None);
+    }
+
+    #[test]
+    fn periodic_refresh_preserves_the_process_list_viewport() {
+        assert_eq!(
+            refresh_selection_scroll_policy(None),
+            SelectionScrollPolicy::PreserveViewport
+        );
+    }
+
+    #[test]
+    fn explicit_find_reveals_the_requested_process() {
+        assert_eq!(
+            refresh_selection_scroll_policy(Some(ProcIdentity::new(1234, 10))),
+            SelectionScrollPolicy::RevealSelection
+        );
     }
 
     #[test]
@@ -1531,6 +1578,22 @@ mod tests {
         assert!(!merge_wts_process_identity(&mut entry, Some(&identity)));
         assert!(entry.user_name.is_empty());
         assert_eq!(entry.session_id, Some(0));
+    }
+
+    #[test]
+    fn direct_token_account_name_is_not_overwritten_by_wts() {
+        let mut entry = empty_process_entry("service.exe");
+        entry.user_name = "DIRECT".to_string();
+        entry.user_name_lower = "direct".to_string();
+        let identity = WtsProcessIdentity {
+            user_name: Some("BATCH".to_string()),
+            session_id: 0,
+            image_name_lower: "service.exe".to_string(),
+        };
+
+        assert!(merge_wts_process_identity(&mut entry, Some(&identity)));
+        assert_eq!(entry.user_name, "DIRECT");
+        assert_eq!(entry.user_name_lower, "direct");
     }
 
     #[test]

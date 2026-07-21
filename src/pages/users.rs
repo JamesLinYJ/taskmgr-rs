@@ -23,9 +23,9 @@ use windows_sys::Win32::Foundation::{
 
 use windows_sys::Win32::System::RemoteDesktop::{
     WTS_CONNECTSTATE_CLASS, WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW, WTSActive, WTSClientName,
-    WTSConnectQuery, WTSConnected, WTSDisconnectSession, WTSDisconnected, WTSDown,
+    WTSConnectQuery, WTSConnected, WTSDisconnectSession, WTSDisconnected, WTSDomainName, WTSDown,
     WTSEnumerateSessionsW, WTSINFOW, WTSIdle, WTSInit, WTSListen, WTSLogoffSession,
-    WTSQuerySessionInformationW, WTSReset, WTSSendMessageW, WTSSessionInfo, WTSShadow,
+    WTSQuerySessionInformationW, WTSReset, WTSSendMessageW, WTSSessionInfo, WTSShadow, WTSUserName,
 };
 use windows_sys::Win32::UI::Controls::{
     LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW,
@@ -47,7 +47,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::config::options::Options;
 use crate::infrastructure::native::{
     OwnedWtsMemory, finish_list_view_update, get_window_userdata, loword, record_win32_error,
-    set_window_userdata, subclass_list_view, to_wide_null, window_rect_relative_to_page,
+    set_window_userdata, subclass_list_view, to_wide_null, widestr_ptr_to_string,
+    window_rect_relative_to_page,
 };
 use crate::infrastructure::worker::{SingleFlightWorker, keep_pending};
 use crate::ui::dialogs::dialog_box;
@@ -83,6 +84,11 @@ struct UserSessionSnapshot {
     session_name: String,
 }
 
+struct UserSessionCollection {
+    sessions: Vec<UserSessionSnapshot>,
+    row_error: Option<u32>,
+}
+
 struct UserSessionEntry {
     // `UserSessionEntry` 保存一行用户/会话信息以及最小重绘所需的脏标志。
     identity: UserSessionIdentity,
@@ -97,7 +103,7 @@ struct UserSessionEntry {
     dirty: bool,
 }
 
-type UserWorkerResult = Result<Vec<UserSessionSnapshot>, u32>;
+type UserWorkerResult = Result<UserSessionCollection, u32>;
 
 #[derive(Default)]
 struct MessageDialogResult {
@@ -119,6 +125,7 @@ pub struct UserPageState {
     sort_ascending: bool,
     worker: Option<SingleFlightWorker<(), UserWorkerResult>>,
     last_refresh_error: Option<u32>,
+    last_row_error: Option<u32>,
 }
 
 impl UserPageState {
@@ -398,9 +405,15 @@ impl UserPageState {
 
     fn apply_user_worker_result(&mut self, result: UserWorkerResult) {
         match result {
-            Ok(sessions) => {
+            Ok(collection) => {
                 self.last_refresh_error = None;
-                self.apply_session_snapshot(sessions);
+                if self.last_row_error != collection.row_error
+                    && let Some(error) = collection.row_error
+                {
+                    record_win32_error("user session metadata", error);
+                }
+                self.last_row_error = collection.row_error;
+                self.apply_session_snapshot(collection.sessions);
             }
             Err(error) => self.set_refresh_error(error),
         }
@@ -959,9 +972,8 @@ impl UserPageState {
 }
 
 fn collect_user_sessions() -> UserWorkerResult {
-    // WTSEnumerateSessionsW and all per-session queries run on the sampler thread. A single
-    // failed query rejects the whole candidate snapshot so the UI never mixes old and partial
-    // session data.
+    // Enumeration defines the candidate session set. Per-session fields are independent: a
+    // client-name or extended-info failure must not hide another session's verified user name.
     unsafe {
         let mut sessions_ptr = null_mut::<WTS_SESSION_INFOW>();
         let mut session_count = 0u32;
@@ -984,7 +996,10 @@ fn collect_user_sessions() -> UserWorkerResult {
             if let Some(memory) = OwnedWtsMemory::new(sessions_ptr) {
                 drop(memory);
             }
-            return Ok(Vec::new());
+            return Ok(UserSessionCollection {
+                sessions: Vec::new(),
+                row_error: None,
+            });
         }
 
         let Some(sessions_memory) = OwnedWtsMemory::new(sessions_ptr) else {
@@ -995,26 +1010,67 @@ fn collect_user_sessions() -> UserWorkerResult {
             usize::try_from(session_count).map_err(|_| ERROR_INVALID_DATA)?,
         );
         let mut sessions = Vec::with_capacity(raw_sessions.len());
+        let mut row_error = None;
         for raw_session in raw_sessions {
-            let info = query_session_info(raw_session.SessionId)?;
-            let identity = session_identity_from_info(&info);
-            if identity.user_name.is_empty() {
+            let session_id = raw_session.SessionId;
+            let user_name = match query_session_string(session_id, WTSUserName) {
+                Ok(user_name) => user_name,
+                Err(error) => {
+                    row_error.get_or_insert(error);
+                    continue;
+                }
+            };
+            if user_name.is_empty() {
                 continue;
             }
 
-            let client_name = query_session_string(raw_session.SessionId, WTSClientName)?;
+            let (domain_name, domain_is_trusted) =
+                match query_session_string(session_id, WTSDomainName) {
+                    Ok(domain_name) => (domain_name, true),
+                    Err(error) => {
+                        row_error.get_or_insert(error);
+                        (String::new(), false)
+                    }
+                };
+            let (logon_time_100ns, logon_time_is_trusted) = match query_session_info(session_id) {
+                Ok(info) => (info.LogonTime, true),
+                Err(error) => {
+                    row_error.get_or_insert(error);
+                    (0, false)
+                }
+            };
+            let client_name = match query_session_string(session_id, WTSClientName) {
+                Ok(client_name) => client_name,
+                Err(error) => {
+                    row_error.get_or_insert(error);
+                    String::new()
+                }
+            };
+            let identity = UserSessionIdentity {
+                session_id,
+                logon_time_100ns: if domain_is_trusted && logon_time_is_trusted {
+                    logon_time_100ns
+                } else {
+                    0
+                },
+                user_name,
+                domain_name,
+            };
             sessions.push(UserSessionSnapshot {
                 identity,
-                status: session_state_text(info.State),
+                status: session_state_text(raw_session.State),
                 client_name: if client_name.is_empty() {
                     "-".to_string()
                 } else {
                     client_name
                 },
-                session_name: wide_array_to_string(&info.WinStationName),
+                session_name: widestr_ptr_to_string(raw_session.pWinStationName),
             });
         }
-        Ok(sessions)
+        Ok(UserSessionCollection {
+            sessions,
+            row_error,
+        })
     }
 }
 
@@ -1052,23 +1108,6 @@ fn query_session_info(session_id: u32) -> Result<WTSINFOW, u32> {
     }
 }
 
-fn session_identity_from_info(info: &WTSINFOW) -> UserSessionIdentity {
-    UserSessionIdentity {
-        session_id: info.SessionId,
-        logon_time_100ns: info.LogonTime,
-        user_name: wide_array_to_string(&info.UserName),
-        domain_name: wide_array_to_string(&info.Domain),
-    }
-}
-
-fn wide_array_to_string(values: &[u16]) -> String {
-    let length = values
-        .iter()
-        .position(|value| *value == 0)
-        .unwrap_or(values.len());
-    String::from_utf16_lossy(&values[..length])
-}
-
 fn format_session_display_name(identity: &UserSessionIdentity, show_domain_names: bool) -> String {
     if show_domain_names && !identity.domain_name.is_empty() {
         format!("{}\\{}", identity.domain_name, identity.user_name)
@@ -1078,7 +1117,13 @@ fn format_session_display_name(identity: &UserSessionIdentity, show_domain_names
 }
 
 fn validate_session_identity(expected: &UserSessionIdentity) -> Result<(), u32> {
-    let current = session_identity_from_info(&query_session_info(expected.session_id)?);
+    let info = query_session_info(expected.session_id)?;
+    let current = UserSessionIdentity {
+        session_id: expected.session_id,
+        logon_time_100ns: info.LogonTime,
+        user_name: query_session_string(expected.session_id, WTSUserName)?,
+        domain_name: query_session_string(expected.session_id, WTSDomainName)?,
+    };
     validate_observed_session_identity(expected, &current)
 }
 
@@ -1105,9 +1150,9 @@ fn win32_error_or_gen_failure(error: u32) -> u32 {
 }
 
 fn query_session_string(session_id: u32, info_class: i32) -> Result<String, u32> {
-    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
     unsafe {
-        // 终端服务 API 返回的是系统分配的 UTF-16 缓冲区，需要在复制完字符串后手动释放。
+        // WTS allocates the UTF-16 result. Empty optional fields may be returned as a zero-byte
+        // result, while non-empty strings must include a terminator inside the reported buffer.
         let mut buffer = null_mut();
         let mut bytes = 0u32;
         let succeeded = WTSQuerySessionInformationW(
@@ -1124,6 +1169,12 @@ fn query_session_string(session_id: u32, info_class: i32) -> Result<String, u32>
             }
             return Err(win32_error_or_gen_failure(error));
         }
+        if bytes == 0 {
+            if let Some(buffer) = OwnedWtsMemory::new(buffer) {
+                drop(buffer);
+            }
+            return Ok(String::new());
+        }
         let Some(buffer) = OwnedWtsMemory::new(buffer) else {
             return Err(ERROR_INVALID_DATA);
         };
@@ -1131,10 +1182,9 @@ fn query_session_string(session_id: u32, info_class: i32) -> Result<String, u32>
             return Err(ERROR_INVALID_DATA);
         }
         let values = slice::from_raw_parts(buffer.as_ptr(), bytes as usize / size_of::<u16>());
-        let length = values
-            .iter()
-            .position(|value| *value == 0)
-            .unwrap_or(values.len());
+        let Some(length) = values.iter().position(|value| *value == 0) else {
+            return Err(ERROR_INVALID_DATA);
+        };
         Ok(String::from_utf16_lossy(&values[..length]))
     }
 }
@@ -1265,6 +1315,8 @@ fn get_dialog_item_text(hwnd: HWND, control_id: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 
     fn identity(session_id: u32, logon_time_100ns: i64) -> UserSessionIdentity {
         UserSessionIdentity {
@@ -1290,6 +1342,15 @@ mod tests {
         }
     }
 
+    fn snapshot(identity: UserSessionIdentity) -> UserSessionSnapshot {
+        UserSessionSnapshot {
+            identity,
+            status: "Active".to_string(),
+            client_name: "-".to_string(),
+            session_name: "Console".to_string(),
+        }
+    }
+
     #[test]
     fn reused_session_id_is_not_the_same_identity() {
         let expected = identity(1, 100);
@@ -1302,13 +1363,22 @@ mod tests {
     }
 
     #[test]
-    fn session_without_logon_time_is_not_actionable() {
+    fn session_without_logon_time_is_visible_but_not_actionable() {
         let expected = identity(1, 0);
         assert!(!expected.is_verified());
         assert_eq!(
             validate_observed_session_identity(&expected, &expected),
             Err(ERROR_INVALID_PARAMETER)
         );
+
+        let mut state = UserPageState::default();
+        state.apply_user_worker_result(Ok(UserSessionCollection {
+            sessions: vec![snapshot(expected.clone())],
+            row_error: Some(50),
+        }));
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].identity, expected);
+        assert_eq!(state.last_row_error, Some(50));
     }
 
     #[test]
@@ -1325,12 +1395,6 @@ mod tests {
     }
 
     #[test]
-    fn fixed_wide_string_stops_at_first_nul() {
-        let values = ['A' as u16, 'B' as u16, 0, 'C' as u16];
-        assert_eq!(wide_array_to_string(&values), "AB");
-    }
-
-    #[test]
     fn domain_visibility_only_changes_display_name() {
         let identity = identity(1, 100);
         assert_eq!(format_session_display_name(&identity, false), "James");
@@ -1338,5 +1402,23 @@ mod tests {
             format_session_display_name(&identity, true),
             "WORKGROUP\\James"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a live interactive Windows session and WTS service"]
+    fn live_collection_contains_the_current_interactive_session() {
+        let mut current_session_id = 0u32;
+        assert_ne!(
+            unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut current_session_id) },
+            0
+        );
+
+        let collection = collect_user_sessions().expect("WTS session enumeration should succeed");
+        let current = collection
+            .sessions
+            .iter()
+            .find(|session| session.identity.session_id == current_session_id)
+            .expect("the current interactive session should be present");
+        assert!(!current.identity.user_name.is_empty());
     }
 }

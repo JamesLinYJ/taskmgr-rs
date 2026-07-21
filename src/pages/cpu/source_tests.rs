@@ -12,13 +12,13 @@
 
 #[cfg(test)]
 mod tests {
-    use std::mem::size_of;
+    use std::mem::{offset_of, size_of};
     use std::slice;
 
     use windows_sys::Win32::System::SystemInformation::{
         CACHE_RELATIONSHIP, CacheUnified, GROUP_AFFINITY, GROUP_RELATIONSHIP,
         NUMA_NODE_RELATIONSHIP, PROCESSOR_ARCHITECTURE_AMD64, PROCESSOR_RELATIONSHIP,
-        RelationCache, RelationGroup, RelationNumaNodeEx, RelationProcessorCore,
+        RelationCache, RelationGroup, RelationNumaNode, RelationNumaNodeEx, RelationProcessorCore,
         RelationProcessorPackage, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
     };
 
@@ -70,7 +70,9 @@ mod tests {
         processor.GroupMask[0] = affinity(mask);
         let mut record = SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX {
             Relationship: relationship,
-            Size: size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>() as u32,
+            Size: (offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous)
+                + offset_of!(PROCESSOR_RELATIONSHIP, GroupMask)
+                + size_of::<GROUP_AFFINITY>()) as u32,
             ..Default::default()
         };
         record.Anonymous.Processor = processor;
@@ -86,7 +88,27 @@ mod tests {
         numa.Anonymous.GroupMask = affinity(mask);
         let mut record = SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX {
             Relationship: RelationNumaNodeEx,
-            Size: size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>() as u32,
+            Size: (offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous)
+                + offset_of!(NUMA_NODE_RELATIONSHIP, Anonymous)
+                + size_of::<GROUP_AFFINITY>()) as u32,
+            ..Default::default()
+        };
+        record.Anonymous.NumaNode = numa;
+        record_bytes(&record)
+    }
+
+    fn legacy_numa_record(mask: usize) -> Vec<u8> {
+        let mut numa = NUMA_NODE_RELATIONSHIP {
+            NodeNumber: 0,
+            GroupCount: 0,
+            ..Default::default()
+        };
+        numa.Anonymous.GroupMask = affinity(mask);
+        let mut record = SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX {
+            Relationship: RelationNumaNode,
+            Size: (offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous)
+                + offset_of!(NUMA_NODE_RELATIONSHIP, Anonymous)
+                + size_of::<GROUP_AFFINITY>()) as u32,
             ..Default::default()
         };
         record.Anonymous.NumaNode = numa;
@@ -104,7 +126,10 @@ mod tests {
         group.GroupInfo[0].ActiveProcessorMask = mask;
         let mut record = SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX {
             Relationship: RelationGroup,
-            Size: size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>() as u32,
+            Size: (offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous)
+                + offset_of!(GROUP_RELATIONSHIP, GroupInfo)
+                + size_of::<windows_sys::Win32::System::SystemInformation::PROCESSOR_GROUP_INFO>())
+                as u32,
             ..Default::default()
         };
         record.Anonymous.Group = group;
@@ -124,7 +149,31 @@ mod tests {
         cache.Anonymous.GroupMask = affinity(mask);
         let mut record = SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX {
             Relationship: RelationCache,
-            Size: size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>() as u32,
+            Size: (offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous)
+                + offset_of!(CACHE_RELATIONSHIP, Anonymous)
+                + size_of::<GROUP_AFFINITY>()) as u32,
+            ..Default::default()
+        };
+        record.Anonymous.Cache = cache;
+        record_bytes(&record)
+    }
+
+    fn legacy_cache_record(mask: usize) -> Vec<u8> {
+        let mut cache = CACHE_RELATIONSHIP {
+            Level: 2,
+            Associativity: 8,
+            LineSize: 64,
+            CacheSize: 1_048_576,
+            Type: CacheUnified,
+            GroupCount: 0,
+            ..Default::default()
+        };
+        cache.Anonymous.GroupMask = affinity(mask);
+        let mut record = SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX {
+            Relationship: RelationCache,
+            Size: (offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous)
+                + offset_of!(CACHE_RELATIONSHIP, Anonymous)
+                + size_of::<GROUP_AFFINITY>()) as u32,
             ..Default::default()
         };
         record.Anonymous.Cache = cache;
@@ -132,10 +181,12 @@ mod tests {
     }
 
     fn record_bytes(record: &SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) -> Vec<u8> {
+        let byte_len = record.Size as usize;
+        assert!(byte_len <= size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>());
         unsafe {
             slice::from_raw_parts(
                 (record as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX).cast::<u8>(),
-                size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(),
+                byte_len,
             )
             .to_vec()
         }
@@ -263,6 +314,39 @@ mod tests {
         assert_eq!(topology.caches.len(), 1);
         assert_eq!(topology.caches[0].instance_count, 1);
         assert_eq!(topology.caches[0].total_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn relation_all_accepts_pre_20h2_single_group_masks() {
+        let records = [
+            processor_record(RelationProcessorCore, 0b11),
+            processor_record(RelationProcessorPackage, 0b11),
+            legacy_numa_record(0b11),
+            group_record(0b11),
+            legacy_cache_record(0b11),
+        ]
+        .concat();
+
+        let topology = parse_relation_all(&records, &topology_key()).unwrap();
+        assert_eq!(topology.package_count, 1);
+        assert_eq!(topology.numa_node_count, 1);
+        assert_eq!(topology.group_count, 1);
+        assert_eq!(topology.caches.len(), 1);
+        assert_eq!(topology.caches[0].total_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn relation_all_rejects_zero_count_for_numa_node_ex() {
+        let mut records = valid_relation_all();
+        let numa_offset = processor_record(RelationProcessorCore, 0b11).len()
+            + processor_record(RelationProcessorPackage, 0b11).len();
+        let group_count_offset = numa_offset
+            + offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous)
+            + offset_of!(NUMA_NODE_RELATIONSHIP, GroupCount);
+        records[group_count_offset..group_count_offset + size_of::<u16>()]
+            .copy_from_slice(&0u16.to_ne_bytes());
+
+        assert!(parse_relation_all(&records, &topology_key()).is_err());
     }
 
     #[test]

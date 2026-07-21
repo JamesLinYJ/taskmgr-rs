@@ -266,6 +266,14 @@ struct CacheKey {
     associativity: Option<u8>,
 }
 
+#[derive(Clone, Copy)]
+enum GroupMaskCountMode {
+    Counted,
+    // Before Windows 10 20H2, NUMA/cache records exposed one GroupMask while the
+    // bytes now used by GroupCount remained zero.
+    LegacySingleMask,
+}
+
 pub(super) fn parse_relation_all(
     bytes: &[u8],
     key: &CpuTopologyKey,
@@ -366,6 +374,11 @@ pub(super) fn parse_relation_all(
                     record,
                     numa_offset + offset_of!(NUMA_NODE_RELATIONSHIP, GroupCount),
                     numa_offset + offset_of!(NUMA_NODE_RELATIONSHIP, Anonymous),
+                    if relationship == RELATION_NUMA_NODE_VALUE {
+                        GroupMaskCountMode::LegacySingleMask
+                    } else {
+                        GroupMaskCountMode::Counted
+                    },
                 )?;
                 validate_member_subset(&members, &expected)?;
                 insert_partition(&mut numa_members, &members)?;
@@ -405,6 +418,7 @@ pub(super) fn parse_relation_all(
                     record,
                     cache_offset + offset_of!(CACHE_RELATIONSHIP, GroupCount),
                     cache_offset + offset_of!(CACHE_RELATIONSHIP, Anonymous),
+                    GroupMaskCountMode::LegacySingleMask,
                 )?;
                 validate_member_subset(&members, &expected)?;
                 let cache_key = CacheKey {
@@ -481,6 +495,7 @@ fn parse_processor_members(record: &[u8]) -> Result<BTreeSet<LogicalProcessorId>
         record,
         HEADER_SIZE + offset_of!(PROCESSOR_RELATIONSHIP, GroupCount),
         HEADER_SIZE + offset_of!(PROCESSOR_RELATIONSHIP, GroupMask),
+        GroupMaskCountMode::Counted,
     )
 }
 
@@ -488,11 +503,16 @@ fn parse_group_members(
     record: &[u8],
     group_count_offset: usize,
     masks_offset: usize,
+    count_mode: GroupMaskCountMode,
 ) -> Result<BTreeSet<LogicalProcessorId>, CpuDetailError> {
-    let group_count = usize::from(read_value::<u16>(record, group_count_offset)?);
-    if group_count == 0 {
-        return invalid("CPU topology empty group mask list");
-    }
+    let declared_group_count = usize::from(read_value::<u16>(record, group_count_offset)?);
+    let group_count = match (declared_group_count, count_mode) {
+        (0, GroupMaskCountMode::LegacySingleMask) => 1,
+        (0, GroupMaskCountMode::Counted) => {
+            return invalid("CPU topology empty group mask list");
+        }
+        (count, _) => count,
+    };
     let required = group_count
         .checked_mul(size_of::<GROUP_AFFINITY>())
         .and_then(|size| masks_offset.checked_add(size))
