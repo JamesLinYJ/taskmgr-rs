@@ -13,13 +13,14 @@
 
 use std::sync::Arc;
 
-use windows_sys::Win32::Foundation::ERROR_INVALID_DATA;
+use windows_sys::Win32::Foundation::{ERROR_INVALID_DATA, STATUS_NOT_IMPLEMENTED};
 use windows_sys::Win32::System::Performance::{
     PDH_CSTATUS_INVALID_DATA, PDH_CSTATUS_NO_COUNTER, PDH_CSTATUS_NO_OBJECT, PDH_INVALID_PATH,
 };
 
+use crate::infrastructure::diagnostics::{self, Field, Level};
 use crate::infrastructure::native::{
-    record_hresult_error, record_ntstatus_error, record_pdh_error, record_win32_error,
+    record_hresult_error, record_ntstatus_error_with_fields, record_pdh_error, record_win32_error,
 };
 
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -85,21 +86,53 @@ pub(crate) enum GpuSampleError {
 
 impl GpuSampleError {
     pub(crate) fn record(&self) {
+        if self.is_kmt_capability_unavailable() {
+            let Self::NtStatus { status, .. } = *self else {
+                unreachable!("capability predicate only matches NTSTATUS errors");
+            };
+            diagnostics::event(
+                Level::Warn,
+                "gpu.kmt_capability_unavailable",
+                "gpu",
+                "D3DKMT physical-adapter enumeration is unavailable",
+                &[
+                    Field::text("capability", "physical_adapter_count"),
+                    Field::text("error_domain", "ntstatus"),
+                    Field::unsigned("error_code", u64::from(status as u32)),
+                ],
+            );
+            return;
+        }
         match *self {
             Self::Pdh { context, status } => record_pdh_error(context, status),
             Self::HResult { context, code } => record_hresult_error(context, code),
-            Self::NtStatus { context, status } => record_ntstatus_error(context, status),
+            Self::NtStatus { context, status } => record_ntstatus_error_with_fields(
+                context,
+                status,
+                &[Field::text("operation", context)],
+            ),
             Self::Win32 { context, code } => record_win32_error(context, code),
             Self::InvalidData { context } => record_win32_error(context, ERROR_INVALID_DATA),
         }
     }
 
     pub(crate) fn is_unsupported(&self) -> bool {
+        self.is_kmt_capability_unavailable()
+            || matches!(
+                self,
+                Self::Pdh {
+                    status: PDH_CSTATUS_NO_OBJECT | PDH_CSTATUS_NO_COUNTER | PDH_INVALID_PATH,
+                    ..
+                }
+            )
+    }
+
+    fn is_kmt_capability_unavailable(&self) -> bool {
         matches!(
             self,
-            Self::Pdh {
-                status: PDH_CSTATUS_NO_OBJECT | PDH_CSTATUS_NO_COUNTER | PDH_INVALID_PATH,
-                ..
+            Self::NtStatus {
+                context: "D3DKMT physical adapter count",
+                status: STATUS_NOT_IMPLEMENTED,
             }
         )
     }

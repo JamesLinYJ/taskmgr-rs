@@ -753,24 +753,27 @@ impl NetworkPageState {
     }
 
     unsafe fn drain_worker_results(&mut self) {
-        unsafe {
-            let drained = match self.worker.as_mut() {
-                Some(worker) => worker.drain(self.hwnd),
-                None => return,
-            };
-            for completion in drained.completions {
-                match completion.result {
-                    Ok(adapters) => {
-                        self.last_refresh_error = None;
-                        self.apply_adapter_snapshot(adapters, completion.sampled_at);
+        let drained = match self.worker.as_mut() {
+            Some(worker) => worker.drain(self.hwnd),
+            None => return,
+        };
+        for completion in drained.completions {
+            crate::infrastructure::diagnostics::with_operation_id(
+                completion.operation_id,
+                || unsafe {
+                    match completion.value.result {
+                        Ok(adapters) => {
+                            self.last_refresh_error = None;
+                            self.apply_adapter_snapshot(adapters, completion.value.sampled_at);
+                        }
+                        Err(error) => self.set_refresh_error(error),
                     }
-                    Err(error) => self.set_refresh_error(error),
-                }
-            }
-            if let Some(error) = drained.error {
-                self.worker = None;
-                self.set_refresh_error(error);
-            }
+                },
+            );
+        }
+        if let Some(error) = drained.error {
+            self.worker = None;
+            self.set_refresh_error(error);
         }
     }
 

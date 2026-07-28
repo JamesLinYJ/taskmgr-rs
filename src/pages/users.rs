@@ -45,10 +45,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::options::Options;
+use crate::infrastructure::diagnostics::Field;
 use crate::infrastructure::native::{
     OwnedWtsMemory, finish_list_view_update, get_window_userdata, loword, record_win32_error,
-    set_window_userdata, subclass_list_view, to_wide_null, widestr_ptr_to_string,
-    window_rect_relative_to_page,
+    record_win32_error_with_fields, set_window_userdata, subclass_list_view, to_wide_null,
+    widestr_ptr_to_string, window_rect_relative_to_page,
 };
 use crate::infrastructure::worker::{SingleFlightWorker, keep_pending};
 use crate::ui::dialogs::dialog_box;
@@ -86,7 +87,14 @@ struct UserSessionSnapshot {
 
 struct UserSessionCollection {
     sessions: Vec<UserSessionSnapshot>,
-    row_error: Option<u32>,
+    row_errors: Vec<UserSessionRowError>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UserSessionRowError {
+    session_id: u32,
+    field: &'static str,
+    code: u32,
 }
 
 struct UserSessionEntry {
@@ -125,7 +133,7 @@ pub struct UserPageState {
     sort_ascending: bool,
     worker: Option<SingleFlightWorker<(), UserWorkerResult>>,
     last_refresh_error: Option<u32>,
-    last_row_error: Option<u32>,
+    last_row_errors: Vec<UserSessionRowError>,
 }
 
 impl UserPageState {
@@ -394,8 +402,10 @@ impl UserPageState {
             Some(worker) => worker.drain(self.hwnd),
             None => return,
         };
-        for result in drained.completions {
-            self.apply_user_worker_result(result);
+        for completion in drained.completions {
+            crate::infrastructure::diagnostics::with_operation_id(completion.operation_id, || {
+                self.apply_user_worker_result(completion.value);
+            });
         }
         if let Some(error) = drained.error {
             self.worker = None;
@@ -407,12 +417,19 @@ impl UserPageState {
         match result {
             Ok(collection) => {
                 self.last_refresh_error = None;
-                if self.last_row_error != collection.row_error
-                    && let Some(error) = collection.row_error
-                {
-                    record_win32_error("user session metadata", error);
+                for error in &collection.row_errors {
+                    if !self.last_row_errors.contains(error) {
+                        record_win32_error_with_fields(
+                            "user session metadata",
+                            error.code,
+                            &[
+                                Field::unsigned("session_id", u64::from(error.session_id)),
+                                Field::text("field", error.field),
+                            ],
+                        );
+                    }
                 }
-                self.last_row_error = collection.row_error;
+                self.last_row_errors = collection.row_errors;
                 self.apply_session_snapshot(collection.sessions);
             }
             Err(error) => self.set_refresh_error(error),
@@ -998,7 +1015,7 @@ fn collect_user_sessions() -> UserWorkerResult {
             }
             return Ok(UserSessionCollection {
                 sessions: Vec::new(),
-                row_error: None,
+                row_errors: Vec::new(),
             });
         }
 
@@ -1010,13 +1027,17 @@ fn collect_user_sessions() -> UserWorkerResult {
             usize::try_from(session_count).map_err(|_| ERROR_INVALID_DATA)?,
         );
         let mut sessions = Vec::with_capacity(raw_sessions.len());
-        let mut row_error = None;
+        let mut row_errors = Vec::new();
         for raw_session in raw_sessions {
             let session_id = raw_session.SessionId;
             let user_name = match query_session_string(session_id, WTSUserName) {
                 Ok(user_name) => user_name,
                 Err(error) => {
-                    row_error.get_or_insert(error);
+                    row_errors.push(UserSessionRowError {
+                        session_id,
+                        field: "user_name",
+                        code: error,
+                    });
                     continue;
                 }
             };
@@ -1028,21 +1049,33 @@ fn collect_user_sessions() -> UserWorkerResult {
                 match query_session_string(session_id, WTSDomainName) {
                     Ok(domain_name) => (domain_name, true),
                     Err(error) => {
-                        row_error.get_or_insert(error);
+                        row_errors.push(UserSessionRowError {
+                            session_id,
+                            field: "domain_name",
+                            code: error,
+                        });
                         (String::new(), false)
                     }
                 };
             let (logon_time_100ns, logon_time_is_trusted) = match query_session_info(session_id) {
                 Ok(info) => (info.LogonTime, true),
                 Err(error) => {
-                    row_error.get_or_insert(error);
+                    row_errors.push(UserSessionRowError {
+                        session_id,
+                        field: "session_info",
+                        code: error,
+                    });
                     (0, false)
                 }
             };
             let client_name = match query_session_string(session_id, WTSClientName) {
                 Ok(client_name) => client_name,
                 Err(error) => {
-                    row_error.get_or_insert(error);
+                    row_errors.push(UserSessionRowError {
+                        session_id,
+                        field: "client_name",
+                        code: error,
+                    });
                     String::new()
                 }
             };
@@ -1069,7 +1102,7 @@ fn collect_user_sessions() -> UserWorkerResult {
         }
         Ok(UserSessionCollection {
             sessions,
-            row_error,
+            row_errors,
         })
     }
 }
@@ -1374,11 +1407,22 @@ mod tests {
         let mut state = UserPageState::default();
         state.apply_user_worker_result(Ok(UserSessionCollection {
             sessions: vec![snapshot(expected.clone())],
-            row_error: Some(50),
+            row_errors: vec![UserSessionRowError {
+                session_id: 1,
+                field: "session_info",
+                code: 50,
+            }],
         }));
         assert_eq!(state.sessions.len(), 1);
         assert_eq!(state.sessions[0].identity, expected);
-        assert_eq!(state.last_row_error, Some(50));
+        assert_eq!(
+            state.last_row_errors,
+            vec![UserSessionRowError {
+                session_id: 1,
+                field: "session_info",
+                code: 50,
+            }]
+        );
     }
 
     #[test]

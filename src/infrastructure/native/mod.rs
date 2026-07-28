@@ -19,6 +19,10 @@ pub use errors::{
     record_hresult_error, record_ntstatus_error, record_pdh_error, record_startup_timing,
     record_win32_error,
 };
+pub(crate) use errors::{
+    record_hresult_error_with_fields, record_ntstatus_error_with_fields,
+    record_pdh_error_with_fields, record_win32_error_with_fields,
+};
 pub use handles::{OwnedHandle, OwnedWtsMemory, destroy_icon_handle};
 pub use safety::{enable_debug_privilege, is_32_bit_process_handle, process_is_elevated};
 pub use ui::{

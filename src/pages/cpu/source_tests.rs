@@ -15,6 +15,10 @@ mod tests {
     use std::mem::{offset_of, size_of};
     use std::slice;
 
+    use windows::Win32::System::Wmi::WBEM_E_NOT_FOUND;
+    use windows_sys::Win32::System::Performance::{
+        PDH_CSTATUS_NO_COUNTER, PDH_CSTATUS_NO_OBJECT, PDH_INVALID_PATH,
+    };
     use windows_sys::Win32::System::SystemInformation::{
         CACHE_RELATIONSHIP, CacheUnified, GROUP_AFFINITY, GROUP_RELATIONSHIP,
         NUMA_NODE_RELATIONSHIP, PROCESSOR_ARCHITECTURE_AMD64, PROCESSOR_RELATIONSHIP,
@@ -22,14 +26,16 @@ mod tests {
         RelationProcessorPackage, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
     };
 
-    use crate::pages::cpu::firmware::{CpuFirmwareCollector, wmi_i4_to_u16, wmi_i4_to_u32};
+    use crate::pages::cpu::firmware::{
+        CpuFirmwareCollector, wmi_i4_to_u16, wmi_i4_to_u32, wmi_property_is_missing,
+    };
     use crate::pages::cpu::model::{
         CpuArchitecture, CpuComponentUpdate, CpuDetailRefresh, CpuDetailRequest, CpuTopologyKey,
     };
     use crate::pages::cpu::native::{CpuNativeCollector, parse_relation_all};
     use crate::pages::cpu::pdh::{
         PdhArrayValue, PdhProcessorInstance, effective_frequency_mhz, parse_processor_instance,
-        validate_frequencies,
+        pdh_counter_is_unavailable, validate_frequencies,
     };
     use crate::system::cpu_topology::{CoreClass, LogicalProcessorId, ProcessorTopologyIdentity};
 
@@ -303,6 +309,21 @@ mod tests {
         assert_eq!(wmi_i4_to_u32(i32::MAX), i32::MAX as u32);
         assert_eq!(wmi_i4_to_u32(i32::MIN), 0x8000_0000);
         assert_eq!(wmi_i4_to_u32(-1), u32::MAX);
+    }
+
+    #[test]
+    fn provider_absence_codes_are_classified_without_hiding_other_failures() {
+        assert!(wmi_property_is_missing(WBEM_E_NOT_FOUND.0));
+        assert!(!wmi_property_is_missing(0x8000_4005_u32 as i32));
+
+        for status in [
+            PDH_CSTATUS_NO_OBJECT,
+            PDH_CSTATUS_NO_COUNTER,
+            PDH_INVALID_PATH,
+        ] {
+            assert!(pdh_counter_is_unavailable(status));
+        }
+        assert!(!pdh_counter_is_unavailable(5));
     }
 
     #[test]

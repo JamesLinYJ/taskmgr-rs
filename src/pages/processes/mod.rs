@@ -833,18 +833,21 @@ impl ProcessPageState {
     }
 
     unsafe fn drain_worker_results(&mut self) {
-        unsafe {
-            let drain = match self.worker.as_mut() {
-                Some(worker) => worker.drain(self.hwnd_page),
-                None => return,
-            };
-            for completion in drain.completions {
-                self.apply_worker_completion(completion);
-            }
-            if let Some(error) = drain.error {
-                self.worker = None;
-                self.set_refresh_error(error);
-            }
+        let drain = match self.worker.as_mut() {
+            Some(worker) => worker.drain(self.hwnd_page),
+            None => return,
+        };
+        for completion in drain.completions {
+            crate::infrastructure::diagnostics::with_operation_id(
+                completion.operation_id,
+                || unsafe {
+                    self.apply_worker_completion(completion.value);
+                },
+            );
+        }
+        if let Some(error) = drain.error {
+            self.worker = None;
+            self.set_refresh_error(error);
         }
     }
 

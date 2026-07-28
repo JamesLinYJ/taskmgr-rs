@@ -37,9 +37,19 @@ debug-assertions = false
 incremental = false
 overflow-checks = false
 
+# 诊断构建沿用发布优化，但保留与发布二进制分离存放的完整符号。
+[profile.diagnostics]
+inherits = "release"
+debug = "full"
+strip = false
+
 # 仅启用当前项目实际使用到的 Win32 模块，避免无关绑定进入最终产物。
 [dependencies]
+crc32fast = "1.5.0"
 crossbeam-channel = "0.5.16"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
 windows-sys = { version = "0.61.2", features = [
     "Wdk_Graphics_Direct3D",
     "Win32_Devices_DeviceAndDriverInstallation",
@@ -51,10 +61,14 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Environment",
+    "Win32_System_IO",
+    "Win32_System_Kernel",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_ProcessStatus",
     "Win32_System_Performance",
     "Win32_System_Registry",
@@ -67,6 +81,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
     "Win32_System_VirtualDosMachines",
     "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

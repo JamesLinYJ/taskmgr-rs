@@ -57,6 +57,46 @@ rustup target add aarch64-pc-windows-msvc
 
 生成的文件位于 `target/<target>/release/taskmgr.exe`。
 
+## 诊断日志
+
+程序默认把经过脱敏的基础诊断日志写入
+`%LOCALAPPDATA%\taskmgr-rs\logs\<session-id>`。通过“帮助 > 诊断日志...”可以查看当前会话、
+为本次运行开启详细日志、带完整启动日志重启、打开日志目录，或保存 ZIP 诊断包。“包含敏感
+信息”和崩溃 minidump 都是默认关闭的单次会话选项；minidump 可能包含进程内存。诊断包不会
+自动上传，也不包含截图、注册表配置或完整进程清单。
+
+对应的命令行参数如下：
+
+```text
+--diagnostic
+--diagnostic=debug
+--diagnostic=trace
+--diagnostic-sensitive
+--diagnostic-minidump
+--diagnostic-dir=<绝对路径>
+```
+
+日志采用带版本的 JSON Lines 格式，单文件达到 10 MiB 后轮转，最多保留 10 个会话和
+200 MiB。常规目录不可用时会回退到 `%TEMP%`；两个目录都失败时仍保留原生调试器输出。
+
+在 Linux 上用 MinGW GNU 工具链生成优化后的 EXE、分离 DWARF 符号和匹配的 SHA-256：
+
+```bash
+./scripts/build-diagnostics.sh
+```
+
+Windows 上运行 `.\scripts\build-diagnostics.ps1` 会生成优化后的 MSVC EXE、单独的 PDB 和
+SHA-256。`.debug` 与 PDB 只保留在开发端；诊断包通过可执行文件哈希匹配符号。
+
+开发者验证错误链路时，可在启动前设置
+`TASKMGR_RS_DIAGNOSTIC_INJECT_SAMPLING_ERROR=ntstatus-once` 并同时传入 `--diagnostic=trace`。
+随后第一次手动“查看 > 立即刷新”会注入一次受控的 `STATUS_UNSUCCESSFUL`；后续采样自动恢复。
+该开关不写入配置，在普通或非详细启动下不会生效。
+
+验证崩溃符号链时，可设置 `TASKMGR_RS_DIAGNOSTIC_TEST_CRASH=access-violation`，并同时传入
+`--diagnostic=trace --diagnostic-minidump`。这会在崩溃记录器初始化后故意终止进程，仅应在
+隔离的测试运行中使用；普通、非详细或未启用 minidump 的启动会忽略该开关。
+
 ## 数据从哪里来
 
 CPU 拓扑来自 `GetLogicalProcessorInformationEx`，动态频率和系统速率使用 PDH，固件信息来自 WMI。GPU 适配器由 DXGI 枚举，引擎和显存使用 PDH，驱动属性来自 SetupAPI；温度等适配器数据只读取受支持的 `D3DKMTQueryAdapterInfo` 类型。
@@ -103,7 +143,7 @@ git diff --check
 
 ## 反馈问题
 
-可以直接开 [Issue](https://github.com/JamesLinYJ/taskmgr-rs/issues)。如果是采样或布局问题，请附上 Windows 版本、CPU/GPU 型号、出问题的页面、复现步骤和截图。这几项通常比一句“显示不对”更容易把问题查清楚。
+可以直接开 [Issue](https://github.com/JamesLinYJ/taskmgr-rs/issues)。如果是采样或布局问题，请附上 Windows 版本、CPU/GPU 型号、出问题的页面、复现步骤和截图。需要精确追踪 API 与源码行时，可以先查看隐私提示，再附上诊断包。这几项通常比一句“显示不对”更容易把问题查清楚。
 
 ## 许可证
 

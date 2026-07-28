@@ -158,6 +158,56 @@ pub fn localize_dialog(hwnd: HWND, dialog_id: u16) {
             set_dialog_item_text(hwnd, IDC_MESSAGE_TITLE_LABEL, TextKey::MessageTitleLabel);
             set_dialog_item_text(hwnd, IDC_MESSAGE_BODY_LABEL, TextKey::MessageLabel);
         }
+        IDD_DIAGNOSTICS => {
+            set_window_text(hwnd, TextKey::DiagnosticLogsTitle);
+            set_dialog_item_text(
+                hwnd,
+                IDC_DIAGNOSTIC_STATUS_LABEL,
+                TextKey::DiagnosticStatusLabel,
+            );
+            set_dialog_item_text(
+                hwnd,
+                IDC_DIAGNOSTIC_SESSION_LABEL,
+                TextKey::DiagnosticSessionLabel,
+            );
+            set_dialog_item_text(
+                hwnd,
+                IDC_DIAGNOSTIC_DIRECTORY_LABEL,
+                TextKey::DiagnosticDirectoryLabel,
+            );
+            set_dialog_item_text(
+                hwnd,
+                IDC_DIAGNOSTIC_DETAILED,
+                TextKey::DiagnosticDetailedCurrentSession,
+            );
+            set_dialog_item_text(
+                hwnd,
+                IDC_DIAGNOSTIC_SENSITIVE,
+                TextKey::DiagnosticIncludeSensitive,
+            );
+            set_dialog_item_text(
+                hwnd,
+                IDC_DIAGNOSTIC_MINIDUMP,
+                TextKey::DiagnosticCaptureMinidump,
+            );
+            set_dialog_item_text(
+                hwnd,
+                IDC_DIAGNOSTIC_PRIVACY_NOTICE,
+                TextKey::DiagnosticMinidumpPrivacy,
+            );
+            set_dialog_item_text(
+                hwnd,
+                IDC_DIAGNOSTIC_RESTART,
+                TextKey::DiagnosticRestartDetailed,
+            );
+            set_dialog_item_text(
+                hwnd,
+                IDC_DIAGNOSTIC_OPEN_FOLDER,
+                TextKey::DiagnosticOpenFolder,
+            );
+            set_dialog_item_text(hwnd, IDC_DIAGNOSTIC_EXPORT, TextKey::DiagnosticSaveBundle);
+            set_dialog_item_text(hwnd, IDCANCEL, TextKey::Close);
+        }
         _ => {}
     }
 }

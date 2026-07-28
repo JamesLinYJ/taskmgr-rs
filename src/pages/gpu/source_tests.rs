@@ -13,6 +13,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use windows_sys::Win32::Foundation::STATUS_NOT_IMPLEMENTED;
+
 use super::counters::{
     EngineReading, GpuCollector, MemoryReading, assemble_samples, parse_engine_instance,
     parse_memory_instance, percentage_to_u8, validated_engine_kinds,
@@ -104,6 +106,22 @@ fn physical_adapter_count_is_never_guessed() {
         Err(GpuSampleError::InvalidData {
             context: "D3DKMT physical adapter count"
         })
+    );
+}
+
+#[test]
+fn unimplemented_physical_adapter_query_is_an_explicit_unsupported_capability() {
+    let error = GpuSampleError::NtStatus {
+        context: "D3DKMT physical adapter count",
+        status: STATUS_NOT_IMPLEMENTED,
+    };
+    assert!(error.is_unsupported());
+    assert!(
+        !GpuSampleError::NtStatus {
+            context: "D3DKMT adapter performance data",
+            status: STATUS_NOT_IMPLEMENTED,
+        }
+        .is_unsupported()
     );
 }
 

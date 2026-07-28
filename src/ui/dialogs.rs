@@ -1088,6 +1088,133 @@ fn build_message_dialog() -> DialogSpec<'static> {
     }
 }
 
+fn build_diagnostics_dialog() -> DialogSpec<'static> {
+    DialogSpec {
+        style: DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        ex_style: 0,
+        x: 20,
+        y: 20,
+        cx: 342,
+        cy: 188,
+        title: "Diagnostic Logs",
+        font_name: DIALOG_FONT_NAME,
+        font_size: DIALOG_FONT_SIZE,
+        controls: vec![
+            static_text("Status:", IDC_DIAGNOSTIC_STATUS_LABEL, 0, 7, 8, 52, 9),
+            static_text(
+                "",
+                IDC_DIAGNOSTIC_STATUS,
+                SS_ENDELLIPSIS_STYLE,
+                62,
+                8,
+                272,
+                9,
+            ),
+            static_text("Session:", IDC_DIAGNOSTIC_SESSION_LABEL, 0, 7, 21, 52, 9),
+            static_text(
+                "",
+                IDC_DIAGNOSTIC_SESSION,
+                SS_ENDELLIPSIS_STYLE,
+                62,
+                21,
+                272,
+                9,
+            ),
+            static_text(
+                "Directory:",
+                IDC_DIAGNOSTIC_DIRECTORY_LABEL,
+                0,
+                7,
+                34,
+                52,
+                9,
+            ),
+            static_text(
+                "",
+                IDC_DIAGNOSTIC_DIRECTORY,
+                SS_ENDELLIPSIS_STYLE,
+                62,
+                34,
+                272,
+                18,
+            ),
+            button(
+                "Record detailed logs for this session",
+                IDC_DIAGNOSTIC_DETAILED,
+                BS_AUTOCHECKBOX_STYLE,
+                7,
+                58,
+                220,
+                12,
+            ),
+            button(
+                "Include sensitive information",
+                IDC_DIAGNOSTIC_SENSITIVE,
+                BS_AUTOCHECKBOX_STYLE,
+                7,
+                73,
+                220,
+                12,
+            ),
+            button(
+                "Create a minidump if the application crashes",
+                IDC_DIAGNOSTIC_MINIDUMP,
+                BS_AUTOCHECKBOX_STYLE,
+                7,
+                88,
+                250,
+                12,
+            ),
+            static_text(
+                "Memory dumps can contain private information.",
+                IDC_DIAGNOSTIC_PRIVACY_NOTICE,
+                0,
+                20,
+                102,
+                314,
+                10,
+            ),
+            button(
+                "Restart with Detailed Logging",
+                IDC_DIAGNOSTIC_RESTART,
+                0,
+                7,
+                120,
+                116,
+                16,
+            ),
+            button(
+                "Open Log Folder",
+                IDC_DIAGNOSTIC_OPEN_FOLDER,
+                0,
+                127,
+                120,
+                98,
+                16,
+            ),
+            button(
+                "Save Diagnostic Bundle...",
+                IDC_DIAGNOSTIC_EXPORT,
+                0,
+                229,
+                120,
+                105,
+                16,
+            ),
+            static_text(
+                "",
+                IDC_DIAGNOSTIC_EXPORT_STATUS,
+                SS_ENDELLIPSIS_STYLE,
+                7,
+                141,
+                327,
+                12,
+            ),
+            button("Close", 2, BS_DEFPUSHBUTTON_STYLE, 284, 163, 50, 14),
+        ],
+    }
+}
+
 fn dialog_spec(dialog_id: u16) -> Option<DialogSpec<'static>> {
     Some(match dialog_id {
         IDD_MAINWND => build_main_dialog(),
@@ -1101,6 +1228,7 @@ fn dialog_spec(dialog_id: u16) -> Option<DialogSpec<'static>> {
         IDD_AFFINITY => build_affinity_dialog(),
         IDD_USERSPAGE => build_users_dialog(),
         IDD_MESSAGE => build_message_dialog(),
+        IDD_DIAGNOSTICS => build_diagnostics_dialog(),
         _ => return None,
     })
 }
@@ -1176,9 +1304,9 @@ pub fn dialog_box(
 mod tests {
     use super::{DialogTemplateBuilder, dialog_spec};
     use crate::ui::resource_ids::{
-        IDC_NICTOTALS, IDC_PROCLIST, IDC_TASKLIST, IDD_AFFINITY, IDD_CPUPAGE, IDD_GPUPAGE,
-        IDD_MAINWND, IDD_MESSAGE, IDD_NETPAGE, IDD_PERFPAGE, IDD_PROCPAGE, IDD_SELECTPROCCOLS,
-        IDD_TASKPAGE, IDD_USERSPAGE,
+        IDC_NICTOTALS, IDC_PROCLIST, IDC_TASKLIST, IDD_AFFINITY, IDD_CPUPAGE, IDD_DIAGNOSTICS,
+        IDD_GPUPAGE, IDD_MAINWND, IDD_MESSAGE, IDD_NETPAGE, IDD_PERFPAGE, IDD_PROCPAGE,
+        IDD_SELECTPROCCOLS, IDD_TASKPAGE, IDD_USERSPAGE,
     };
     use windows_sys::Win32::UI::Controls::LVS_OWNERDATA;
 
@@ -1196,6 +1324,7 @@ mod tests {
             IDD_AFFINITY,
             IDD_USERSPAGE,
             IDD_MESSAGE,
+            IDD_DIAGNOSTICS,
         ] {
             let template = DialogTemplateBuilder::new().build(dialog_spec(dialog_id).unwrap());
             assert!(!template.is_empty());

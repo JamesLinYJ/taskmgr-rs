@@ -21,6 +21,9 @@ mod system;
 mod ui;
 
 fn main() {
-    // `app::run` 内部负责 Win32 初始化，并返回最终的进程退出码。
-    std::process::exit(app::run());
+    // 诊断必须先于权限申请和 Win32 UI 初始化，才能覆盖完整启动链路。
+    infrastructure::diagnostics::initialize_from_env();
+    let exit_code = app::run();
+    infrastructure::diagnostics::shutdown();
+    std::process::exit(exit_code);
 }

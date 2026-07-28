@@ -12,7 +12,11 @@
 //!
 //! 这些类型不拥有原生句柄；来源模块只提交完整的单来源候选结果。
 
-use crate::infrastructure::native::{record_hresult_error, record_pdh_error, record_win32_error};
+use crate::infrastructure::diagnostics::Field;
+use crate::infrastructure::native::{
+    record_hresult_error, record_hresult_error_with_fields, record_pdh_error,
+    record_pdh_error_with_fields, record_win32_error,
+};
 use crate::system::cpu_topology::{
     LogicalProcessorId, ProcessorTopology, ProcessorTopologyIdentity,
 };
@@ -60,17 +64,59 @@ pub(crate) struct CpuDetailRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CpuDetailError {
-    Pdh { context: &'static str, status: u32 },
-    HResult { context: &'static str, code: i32 },
-    Win32 { context: &'static str, code: u32 },
-    InvalidData { context: &'static str },
+    Pdh {
+        context: &'static str,
+        status: u32,
+    },
+    PdhCounter {
+        context: &'static str,
+        status: u32,
+        counter_path: &'static str,
+    },
+    HResult {
+        context: &'static str,
+        code: i32,
+    },
+    HResultProperty {
+        context: &'static str,
+        code: i32,
+        property: &'static str,
+    },
+    Win32 {
+        context: &'static str,
+        code: u32,
+    },
+    InvalidData {
+        context: &'static str,
+    },
 }
 
 impl CpuDetailError {
     pub(crate) fn record(&self) {
         match *self {
             Self::Pdh { context, status } => record_pdh_error(context, status),
+            Self::PdhCounter {
+                context,
+                status,
+                counter_path,
+            } => record_pdh_error_with_fields(
+                context,
+                status,
+                &[Field::text("counter_path", counter_path)],
+            ),
             Self::HResult { context, code } => record_hresult_error(context, code),
+            Self::HResultProperty {
+                context,
+                code,
+                property,
+            } => record_hresult_error_with_fields(
+                context,
+                code,
+                &[
+                    Field::text("wmi_class", "Win32_Processor"),
+                    Field::text("property", property),
+                ],
+            ),
             Self::Win32 { context, code } => record_win32_error(context, code),
             Self::InvalidData { context } => record_win32_error(context, ERROR_INVALID_DATA),
         }
@@ -185,7 +231,7 @@ pub(crate) struct CpuDynamicInfo {
     pub(crate) average_frequency_mhz: u64,
     pub(crate) minimum_frequency_mhz: u64,
     pub(crate) maximum_frequency_mhz: u64,
-    pub(crate) processor_queue_length: u64,
+    pub(crate) processor_queue_length: Option<u64>,
     pub(crate) context_switches_per_second: Option<u64>,
     pub(crate) system_calls_per_second: Option<u64>,
 }

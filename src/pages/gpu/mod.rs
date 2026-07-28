@@ -394,19 +394,26 @@ impl GpuPageState {
         }
 
         for completion in drained.completions {
-            match completion {
-                Ok(GpuCollectOutcome::Inventory(inventory)) => {
-                    self.commit_inventory(inventory);
-                    request_follow_up = true;
-                }
-                Ok(GpuCollectOutcome::AwaitingBaseline { generation }) => {
-                    if self.inventory.as_ref().map(|value| value.generation) == Some(generation) {
-                        self.update_status();
+            let operation_id = completion.operation_id;
+            crate::infrastructure::diagnostics::with_operation_id(
+                operation_id,
+                || match completion.value {
+                    Ok(GpuCollectOutcome::Inventory(inventory)) => {
+                        self.commit_inventory(inventory);
+                        request_follow_up = true;
                     }
-                }
-                Ok(GpuCollectOutcome::Dynamic(snapshot)) => self.commit_dynamic_snapshot(snapshot),
-                Err(error) => self.handle_dynamic_error(error),
-            }
+                    Ok(GpuCollectOutcome::AwaitingBaseline { generation }) => {
+                        if self.inventory.as_ref().map(|value| value.generation) == Some(generation)
+                        {
+                            self.update_status();
+                        }
+                    }
+                    Ok(GpuCollectOutcome::Dynamic(snapshot)) => {
+                        self.commit_dynamic_snapshot(snapshot);
+                    }
+                    Err(error) => self.handle_dynamic_error(error),
+                },
+            );
         }
 
         if request_follow_up
@@ -432,10 +439,12 @@ impl GpuPageState {
             });
         }
         for completion in drained.completions {
-            match completion {
-                Ok(snapshot) => self.commit_metadata_snapshot(snapshot),
-                Err(error) => self.handle_metadata_error(error),
-            }
+            crate::infrastructure::diagnostics::with_operation_id(completion.operation_id, || {
+                match completion.value {
+                    Ok(snapshot) => self.commit_metadata_snapshot(snapshot),
+                    Err(error) => self.handle_metadata_error(error),
+                }
+            });
         }
         self.update_status();
     }
