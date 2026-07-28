@@ -417,7 +417,9 @@ impl CpuPageState {
         }
 
         for completion in drained.completions {
-            self.commit_native_snapshot(completion);
+            crate::infrastructure::diagnostics::with_operation_id(completion.operation_id, || {
+                self.commit_native_snapshot(completion.value);
+            });
         }
 
         if !self.native_busy()
@@ -443,7 +445,9 @@ impl CpuPageState {
             });
         }
         for completion in drained.completions {
-            self.commit_firmware_snapshot(completion);
+            crate::infrastructure::diagnostics::with_operation_id(completion.operation_id, || {
+                self.commit_firmware_snapshot(completion.value);
+            });
         }
         if !self.firmware_busy()
             && let Some(refresh) = self.queued_firmware_refresh.take()
@@ -666,7 +670,8 @@ impl CpuPageState {
                 .map(|value| value.to_string())
                 .unwrap_or_else(not_available),
             dynamic
-                .map(|value| value.processor_queue_length.to_string())
+                .and_then(|value| value.processor_queue_length)
+                .map(|value| value.to_string())
                 .unwrap_or_else(not_available),
             dynamic
                 .and_then(|value| value.context_switches_per_second)
@@ -1721,7 +1726,7 @@ mod tests {
             average_frequency_mhz: 4_268,
             minimum_frequency_mhz: 3_200,
             maximum_frequency_mhz: 5_100,
-            processor_queue_length: 0,
+            processor_queue_length: Some(0),
             context_switches_per_second: None,
             system_calls_per_second: None,
         };

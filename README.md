@@ -57,6 +57,52 @@ rustup target add aarch64-pc-windows-msvc
 
 The executable is written to `target/<target>/release/taskmgr.exe`.
 
+## Diagnostic logs
+
+Redacted basic diagnostics are recorded by default under
+`%LOCALAPPDATA%\taskmgr-rs\logs\<session-id>`. Open **Help > Diagnostic Logs...** to inspect the
+active session, enable detailed logging for this run, restart while capturing the complete startup
+sequence, open the log folder, or save a ZIP diagnostic bundle. Sensitive fields and crash
+minidumps are separate, session-only choices and are off by default. A minidump can contain process
+memory. Bundles are never uploaded automatically and do not include screenshots, registry options,
+or a full process list.
+
+The corresponding command-line switches are:
+
+```text
+--diagnostic
+--diagnostic=debug
+--diagnostic=trace
+--diagnostic-sensitive
+--diagnostic-minidump
+--diagnostic-dir=<absolute-path>
+```
+
+Logs use versioned JSON Lines records, rotate at 10 MiB per file, and retain at most 10 sessions and
+200 MiB. If the normal directory is unavailable, logging falls back to `%TEMP%`; native debugger
+output remains available if both locations fail.
+
+To create an optimized GNU build with separate DWARF symbols and a matching executable SHA-256:
+
+```bash
+./scripts/build-diagnostics.sh
+```
+
+On Windows, `.\scripts\build-diagnostics.ps1` creates an optimized MSVC executable, a separate PDB,
+and its SHA-256. Keep `.debug` and PDB files on the developer side; the diagnostic bundle identifies
+the executable by hash.
+
+To validate the end-to-end failure chain, developers may set
+`TASKMGR_RS_DIAGNOSTIC_INJECT_SAMPLING_ERROR=ntstatus-once` and start with `--diagnostic=trace`.
+The first manual **View > Refresh Now** then injects one controlled `STATUS_UNSUCCESSFUL`; sampling
+recovers automatically afterward. This switch is never persisted and is ignored outside a detailed
+startup.
+
+For crash-symbol validation, set `TASKMGR_RS_DIAGNOSTIC_TEST_CRASH=access-violation` and also pass
+`--diagnostic=trace --diagnostic-minidump`. This intentionally terminates the process after the
+crash recorder is installed, so use it only in an isolated test run. Ordinary, non-detailed, or
+non-minidump starts ignore the switch.
+
 ## Data sources
 
 CPU topology comes from `GetLogicalProcessorInformationEx`. PDH supplies dynamic frequency and system rates, and WMI supplies firmware data. GPU adapters are enumerated through DXGI; engine and memory counters come from PDH; driver properties come from SetupAPI. Temperature and similar adapter data are read only through supported `D3DKMTQueryAdapterInfo` query types.
@@ -103,7 +149,7 @@ git diff --check
 
 ## Reporting a problem
 
-Open an [Issue](https://github.com/JamesLinYJ/taskmgr-rs/issues) and include the Windows version, CPU and GPU models, the affected page, steps to reproduce, and a screenshot. Those details usually make sampling and layout bugs much easier to pin down.
+Open an [Issue](https://github.com/JamesLinYJ/taskmgr-rs/issues) and include the Windows version, CPU and GPU models, the affected page, steps to reproduce, and a screenshot. For failures that need precise API or source-line tracing, attach a diagnostic bundle after reviewing its privacy warning. Those details usually make sampling and layout bugs much easier to pin down.
 
 ## License
 

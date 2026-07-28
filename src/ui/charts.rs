@@ -13,6 +13,7 @@
 //! 记录 HRESULT，调用方只在已知的 GDI 后端或已记录的帧失败后使用 GDI 绘制器。
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Foundation::RECT as WinRect;
 use windows::Win32::Graphics::Direct2D::Common::{
@@ -27,6 +28,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
 use windows::Win32::Graphics::Gdi::HDC as WinHdc;
 use windows_numerics::Vector2;
 
+use crate::infrastructure::diagnostics::{self, Field, Level};
 use crate::infrastructure::native::record_hresult_error;
 
 type SysRect = windows_sys::Win32::Foundation::RECT;
@@ -34,6 +36,7 @@ type SysHdc = windows_sys::Win32::Graphics::Gdi::HDC;
 
 const GRID_STROKE_WIDTH: f32 = 1.0;
 const SERIES_STROKE_WIDTH: f32 = 2.0;
+static CHART_BACKEND_FALLBACK_RECORDED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 pub enum ChartColor {
@@ -80,10 +83,7 @@ impl ChartRenderer {
         let backend = match Direct2DRenderer::new() {
             Ok(renderer) => RendererBackend::Direct2D(renderer),
             Err(error) => {
-                record_hresult_error(
-                    "Direct2D chart initialization; selecting GDI backend",
-                    error,
-                );
+                record_backend_fallback(error);
                 RendererBackend::Gdi
             }
         };
@@ -315,6 +315,29 @@ impl Drop for ChartFrame<'_> {
     }
 }
 
+#[track_caller]
+fn record_backend_fallback(error: i32) {
+    if !mark_backend_fallback_recorded(&CHART_BACKEND_FALLBACK_RECORDED) {
+        return;
+    }
+    diagnostics::event(
+        Level::Warn,
+        "charts.backend_fallback",
+        "charts",
+        "Direct2D chart initialization failed; GDI was selected",
+        &[
+            Field::text("source_backend", "direct2d"),
+            Field::text("target_backend", "gdi"),
+            Field::text("error_domain", "hresult"),
+            Field::unsigned("error_code", u64::from(error as u32)),
+        ],
+    );
+}
+
+fn mark_backend_fallback_recorded(state: &AtomicBool) -> bool {
+    !state.swap(true, Ordering::AcqRel)
+}
+
 fn windows_error_code(error: windows::core::Error) -> i32 {
     error.code().0
 }
@@ -367,5 +390,17 @@ fn color(red: u8, green: u8, blue: u8) -> D2D1_COLOR_F {
         g: f32::from(green) / 255.0,
         b: f32::from(blue) / 255.0,
         a: 1.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_fallback_is_reported_once_per_process_state() {
+        let state = AtomicBool::new(false);
+        assert!(mark_backend_fallback_recorded(&state));
+        assert!(!mark_backend_fallback_recorded(&state));
     }
 }

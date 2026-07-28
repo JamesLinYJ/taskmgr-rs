@@ -761,8 +761,10 @@ impl TaskPageState {
             Some(worker) => worker.drain(self.hwnd_page),
             None => return,
         };
-        for result in drained.completions {
-            self.apply_task_worker_result(result);
+        for completion in drained.completions {
+            crate::infrastructure::diagnostics::with_operation_id(completion.operation_id, || {
+                self.apply_task_worker_result(completion.value);
+            });
         }
         if let Some(error) = drained.error {
             self.snapshot_worker = None;
@@ -787,7 +789,9 @@ impl TaskPageState {
             None => return,
         };
         for completion in drained.completions {
-            self.apply_task_icon_completion(completion);
+            crate::infrastructure::diagnostics::with_operation_id(completion.operation_id, || {
+                self.apply_task_icon_completion(completion.value);
+            });
         }
         if let Some(error) = drained.error {
             self.icon_worker = None;

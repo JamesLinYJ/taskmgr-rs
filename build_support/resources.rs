@@ -28,6 +28,15 @@ use crate::resource::{
 const APPLICATION_ICON_SIZES: &[u32] = &[16, 20, 24, 32, 40, 48, 64, 256];
 const DEFAULT_PROCESS_ICON_SIZES: &[u32] = &[16, 20, 24, 32, 40, 48, 64];
 const TRAY_ICON_SIZES: &[u32] = &[16, 20, 24, 32];
+const ADMIN_TRUST_INFO: &str = r#"
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+"#;
 
 pub(crate) fn compile() {
     println!("cargo:rerun-if-changed=Cargo.toml");
@@ -38,8 +47,8 @@ pub(crate) fn compile() {
         return;
     }
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-    if target_env != "msvc" {
-        panic!("taskmgr-rs Windows resources require the MSVC target environment");
+    if target_env != "msvc" && target_env != "gnu" {
+        panic!("taskmgr-rs Windows resources require the MSVC or GNU target environment");
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
@@ -99,22 +108,64 @@ pub(crate) fn compile() {
         writeln!(rc_content, "{resource_id} BITMAP \"{}\"", rc_path(path)).unwrap();
     }
 
+    let manifest_path = assets_dir.join("windows/taskmgr.manifest");
+    println!("cargo:rerun-if-changed={}", manifest_path.display());
+
     let mut resources = winresource::WindowsResource::new();
     resources.append_rc_content(&rc_content);
+    if target_env == "gnu" {
+        let embedded_manifest = if env::var("PROFILE").unwrap_or_default() == "release" {
+            generate_admin_manifest(&manifest_path, &generated_dir)
+        } else {
+            manifest_path.clone()
+        };
+        resources.set_manifest_file(&rc_path(&embedded_manifest));
+    }
     resources
         .compile()
         .unwrap_or_else(|error| panic!("failed to compile Windows resources: {error}"));
 
-    let manifest_path = assets_dir.join("windows/taskmgr.manifest");
-    println!("cargo:rerun-if-changed={}", manifest_path.display());
-    println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
-    println!(
-        "cargo:rustc-link-arg=/MANIFESTINPUT:{}",
-        manifest_path.display()
-    );
-    if env::var("PROFILE").unwrap_or_default() == "release" {
-        println!("cargo:rustc-link-arg=/MANIFESTUAC:level='requireAdministrator' uiAccess='false'");
+    if target_env == "msvc" {
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+        println!(
+            "cargo:rustc-link-arg=/MANIFESTINPUT:{}",
+            manifest_path.display()
+        );
+        if env::var("PROFILE").unwrap_or_default() == "release" {
+            println!(
+                "cargo:rustc-link-arg=/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
+            );
+        }
     }
+}
+
+fn generate_admin_manifest(source: &Path, generated_dir: &Path) -> PathBuf {
+    let manifest = fs::read_to_string(source)
+        .unwrap_or_else(|error| panic!("failed to read manifest {}: {error}", source.display()));
+    if manifest.contains("<requestedExecutionLevel") {
+        panic!(
+            "manifest {} already declares a requested execution level",
+            source.display()
+        );
+    }
+
+    let closing_tag = "</assembly>";
+    let closing_offset = manifest
+        .rfind(closing_tag)
+        .unwrap_or_else(|| panic!("manifest {} has no closing assembly tag", source.display()));
+    let mut generated = String::with_capacity(manifest.len() + ADMIN_TRUST_INFO.len());
+    generated.push_str(&manifest[..closing_offset]);
+    generated.push_str(ADMIN_TRUST_INFO);
+    generated.push_str(&manifest[closing_offset..]);
+
+    let output = generated_dir.join("taskmgr-admin.manifest");
+    fs::write(&output, generated).unwrap_or_else(|error| {
+        panic!(
+            "failed to write generated administrator manifest {}: {error}",
+            output.display()
+        )
+    });
+    output
 }
 
 fn icon_specs(assets_dir: &Path) -> Vec<(u16, IconSpec)> {

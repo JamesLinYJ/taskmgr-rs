@@ -24,7 +24,8 @@ use windows::Win32::System::Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE};
 use windows::Win32::System::Variant::{VARIANT, VT_BSTR, VT_EMPTY, VT_I4, VT_NULL, VariantClear};
 use windows::Win32::System::Wmi::{
     CIM_STRING, CIM_UINT16, CIM_UINT32, IWbemClassObject, IWbemLocator, IWbemServices,
-    WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE, WbemLocator,
+    WBEM_E_NOT_FOUND, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE,
+    WbemLocator,
 };
 use windows::core::{BSTR, PCWSTR};
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
@@ -33,6 +34,7 @@ use super::model::{
     CpuComponentUpdate, CpuDetailError, CpuDetailRefresh, CpuDetailRequest, CpuFirmwareProcessor,
     CpuFirmwareSnapshot, CpuTopologyKey, invalid, invalid_error,
 };
+use crate::infrastructure::diagnostics::{self, Field, Level};
 use crate::infrastructure::native::{record_hresult_error, record_startup_timing, to_wide_null};
 
 pub(crate) struct CpuFirmwareCollector {
@@ -88,7 +90,7 @@ impl CpuFirmwareCollector {
                     unsafe { GetTickCount64() }.wrapping_sub(query_started_ms),
                 );
                 record_startup_timing(
-                    "CPU firmware completed",
+                    "CPU firmware",
                     unsafe { GetTickCount64() }.wrapping_sub(self.startup_started_ms),
                 );
                 self.timing_recorded = true;
@@ -228,6 +230,7 @@ impl CpuWmiProvider {
         })?;
 
         let mut processors = Vec::new();
+        let mut row_index = 0u64;
         loop {
             let mut objects: [Option<IWbemClassObject>; 1] = [None];
             let mut returned = 0u32;
@@ -247,22 +250,39 @@ impl CpuWmiProvider {
             let object = objects[0]
                 .take()
                 .ok_or_else(|| invalid_error("Win32_Processor null object"))?;
-            let device_id = get_wmi_string(&object, "DeviceID")?
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| invalid_error("Win32_Processor DeviceID"))?;
+            let current_row = row_index;
+            row_index = row_index
+                .checked_add(1)
+                .ok_or_else(|| invalid_error("Win32_Processor row index overflow"))?;
+            let Some(device_id) =
+                get_wmi_string(&object, "DeviceID", current_row)?.filter(|value| !value.is_empty())
+            else {
+                diagnostics::event(
+                    Level::Warn,
+                    "cpu.wmi_processor_skipped",
+                    "cpu",
+                    "Win32_Processor row was skipped because its required identity is unavailable",
+                    &[
+                        Field::text("wmi_class", "Win32_Processor"),
+                        Field::text("property", "DeviceID"),
+                        Field::unsigned("row_index", current_row),
+                    ],
+                );
+                continue;
+            };
             processors.push(CpuFirmwareProcessor {
                 device_id,
-                name: get_wmi_string(&object, "Name")?,
-                manufacturer: get_wmi_string(&object, "Manufacturer")?,
-                socket: get_wmi_string(&object, "SocketDesignation")?,
-                processor_id: get_wmi_string(&object, "ProcessorId")?,
-                family: get_wmi_u16(&object, "Family")?,
-                level: get_wmi_u16(&object, "Level")?,
-                revision: get_wmi_u16(&object, "Revision")?,
-                stepping: get_wmi_string(&object, "Stepping")?,
-                address_width: get_wmi_u16(&object, "AddressWidth")?,
-                data_width: get_wmi_u16(&object, "DataWidth")?,
-                max_clock_mhz: get_wmi_u32(&object, "MaxClockSpeed")?,
+                name: get_wmi_string(&object, "Name", current_row)?,
+                manufacturer: get_wmi_string(&object, "Manufacturer", current_row)?,
+                socket: get_wmi_string(&object, "SocketDesignation", current_row)?,
+                processor_id: get_wmi_string(&object, "ProcessorId", current_row)?,
+                family: get_wmi_u16(&object, "Family", current_row)?,
+                level: get_wmi_u16(&object, "Level", current_row)?,
+                revision: get_wmi_u16(&object, "Revision", current_row)?,
+                stepping: get_wmi_string(&object, "Stepping", current_row)?,
+                address_width: get_wmi_u16(&object, "AddressWidth", current_row)?,
+                data_width: get_wmi_u16(&object, "DataWidth", current_row)?,
+                max_clock_mhz: get_wmi_u32(&object, "MaxClockSpeed", current_row)?,
             });
         }
         if processors.is_empty() {
@@ -308,72 +328,190 @@ struct WmiProperty {
     cim_type: i32,
 }
 
-fn get_wmi_property(object: &IWbemClassObject, name: &str) -> Result<WmiProperty, CpuDetailError> {
-    let name = to_wide_null(name);
+fn get_wmi_property(
+    object: &IWbemClassObject,
+    name: &'static str,
+    row_index: u64,
+) -> Result<Option<WmiProperty>, CpuDetailError> {
+    let wide_name = to_wide_null(name);
     let mut value = OwnedVariant::new();
     let mut cim_type = 0;
-    unsafe {
+    let result = unsafe {
         object.Get(
-            PCWSTR(name.as_ptr()),
+            PCWSTR(wide_name.as_ptr()),
             0,
             value.as_mut_ptr(),
             Some(&mut cim_type),
             None,
         )
+    };
+    match result {
+        Ok(()) => Ok(Some(WmiProperty { value, cim_type })),
+        Err(error) if wmi_property_is_missing(error.code().0) => {
+            record_wmi_property_unavailable(name, row_index, "not_found", &[]);
+            Ok(None)
+        }
+        Err(error) => Err(CpuDetailError::HResultProperty {
+            context: "IWbemClassObject::Get CPU property",
+            code: error.code().0,
+            property: name,
+        }),
     }
-    .map_err(|error| CpuDetailError::HResult {
-        context: "IWbemClassObject::Get CPU property",
-        code: error.code().0,
-    })?;
-    Ok(WmiProperty { value, cim_type })
 }
 
-fn get_wmi_string(object: &IWbemClassObject, name: &str) -> Result<Option<String>, CpuDetailError> {
-    let property = get_wmi_property(object, name)?;
+fn get_wmi_string(
+    object: &IWbemClassObject,
+    name: &'static str,
+    row_index: u64,
+) -> Result<Option<String>, CpuDetailError> {
+    let Some(property) = get_wmi_property(object, name, row_index)? else {
+        return Ok(None);
+    };
     if property.cim_type != CIM_STRING.0 {
-        return invalid("Win32_Processor string CIM type");
+        record_wmi_property_unavailable(
+            name,
+            row_index,
+            "unexpected_cim_type",
+            &[Field::signed("cim_type", i64::from(property.cim_type))],
+        );
+        return Ok(None);
     }
     let inner = property.value.value();
     match inner.vt {
-        VT_EMPTY | VT_NULL => Ok(None),
+        VT_EMPTY | VT_NULL => {
+            record_wmi_property_unavailable(name, row_index, "empty_value", &[]);
+            Ok(None)
+        }
         VT_BSTR => {
             let bstr: &ManuallyDrop<BSTR> = unsafe { &inner.Anonymous.bstrVal };
             // `VT_BSTR` proves the active union member; `ManuallyDrop<T>` has the same layout as
             // `T`, while `VariantClear` remains the sole owner responsible for releasing it.
             let bstr = unsafe { &*(bstr as *const ManuallyDrop<BSTR>).cast::<BSTR>() };
-            let string = String::from_utf16(bstr)
-                .map_err(|_| invalid_error("Win32_Processor string encoding"))?;
+            let string = match String::from_utf16(bstr) {
+                Ok(value) => value,
+                Err(_) => {
+                    record_wmi_property_unavailable(name, row_index, "invalid_utf16", &[]);
+                    return Ok(None);
+                }
+            };
             let trimmed = string.trim();
             Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
         }
-        _ => invalid("Win32_Processor string VARIANT type"),
+        variant_type => {
+            record_wmi_property_unavailable(
+                name,
+                row_index,
+                "unexpected_variant_type",
+                &[Field::unsigned("variant_type", u64::from(variant_type.0))],
+            );
+            Ok(None)
+        }
     }
 }
 
-fn get_wmi_u16(object: &IWbemClassObject, name: &str) -> Result<Option<u16>, CpuDetailError> {
-    let property = get_wmi_property(object, name)?;
+fn get_wmi_u16(
+    object: &IWbemClassObject,
+    name: &'static str,
+    row_index: u64,
+) -> Result<Option<u16>, CpuDetailError> {
+    let Some(property) = get_wmi_property(object, name, row_index)? else {
+        return Ok(None);
+    };
     if property.cim_type != CIM_UINT16.0 {
-        return invalid("Win32_Processor u16 CIM type");
+        record_wmi_property_unavailable(
+            name,
+            row_index,
+            "unexpected_cim_type",
+            &[Field::signed("cim_type", i64::from(property.cim_type))],
+        );
+        return Ok(None);
     }
     let inner = property.value.value();
     match inner.vt {
-        VT_EMPTY | VT_NULL => Ok(None),
-        VT_I4 => wmi_i4_to_u16(unsafe { inner.Anonymous.lVal }).map(Some),
-        _ => invalid("Win32_Processor u16 VARIANT type"),
+        VT_EMPTY | VT_NULL => {
+            record_wmi_property_unavailable(name, row_index, "empty_value", &[]);
+            Ok(None)
+        }
+        VT_I4 => match wmi_i4_to_u16(unsafe { inner.Anonymous.lVal }) {
+            Ok(value) => Ok(Some(value)),
+            Err(_) => {
+                record_wmi_property_unavailable(name, row_index, "integer_overflow", &[]);
+                Ok(None)
+            }
+        },
+        variant_type => {
+            record_wmi_property_unavailable(
+                name,
+                row_index,
+                "unexpected_variant_type",
+                &[Field::unsigned("variant_type", u64::from(variant_type.0))],
+            );
+            Ok(None)
+        }
     }
 }
 
-fn get_wmi_u32(object: &IWbemClassObject, name: &str) -> Result<Option<u32>, CpuDetailError> {
-    let property = get_wmi_property(object, name)?;
+fn get_wmi_u32(
+    object: &IWbemClassObject,
+    name: &'static str,
+    row_index: u64,
+) -> Result<Option<u32>, CpuDetailError> {
+    let Some(property) = get_wmi_property(object, name, row_index)? else {
+        return Ok(None);
+    };
     if property.cim_type != CIM_UINT32.0 {
-        return invalid("Win32_Processor u32 CIM type");
+        record_wmi_property_unavailable(
+            name,
+            row_index,
+            "unexpected_cim_type",
+            &[Field::signed("cim_type", i64::from(property.cim_type))],
+        );
+        return Ok(None);
     }
     let inner = property.value.value();
     match inner.vt {
-        VT_EMPTY | VT_NULL => Ok(None),
+        VT_EMPTY | VT_NULL => {
+            record_wmi_property_unavailable(name, row_index, "empty_value", &[]);
+            Ok(None)
+        }
         VT_I4 => Ok(Some(wmi_i4_to_u32(unsafe { inner.Anonymous.lVal }))),
-        _ => invalid("Win32_Processor u32 VARIANT type"),
+        variant_type => {
+            record_wmi_property_unavailable(
+                name,
+                row_index,
+                "unexpected_variant_type",
+                &[Field::unsigned("variant_type", u64::from(variant_type.0))],
+            );
+            Ok(None)
+        }
     }
+}
+
+#[track_caller]
+fn record_wmi_property_unavailable(
+    property: &'static str,
+    row_index: u64,
+    reason: &'static str,
+    extra_fields: &[Field],
+) {
+    let mut fields = vec![
+        Field::text("wmi_class", "Win32_Processor"),
+        Field::text("property", property),
+        Field::unsigned("row_index", row_index),
+        Field::text("reason", reason),
+    ];
+    fields.extend_from_slice(extra_fields);
+    diagnostics::event(
+        Level::Warn,
+        "cpu.wmi_property_unavailable",
+        "cpu",
+        "optional Win32_Processor property is unavailable",
+        &fields,
+    );
+}
+
+pub(super) fn wmi_property_is_missing(code: i32) -> bool {
+    code == WBEM_E_NOT_FOUND.0
 }
 
 pub(super) fn wmi_i4_to_u16(value: i32) -> Result<u16, CpuDetailError> {

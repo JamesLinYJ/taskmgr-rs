@@ -67,6 +67,10 @@ const MENU_STATUS_HELP_KEYS: &[(&str, &str)] = &[
         "crate::ui::resource_ids::IDM_PROC_ENDTREE",
     ),
     ("IDM_HELP", "crate::ui::resource_ids::IDM_HELP"),
+    (
+        "IDM_DIAGNOSTICS",
+        "crate::ui::resource_ids::IDM_DIAGNOSTICS",
+    ),
     ("IDM_PROCCOLS", "crate::ui::resource_ids::IDM_PROCCOLS"),
     ("IDM_REFRESH", "crate::ui::resource_ids::IDM_REFRESH"),
     ("IDM_AFFINITY", "crate::ui::resource_ids::IDM_AFFINITY"),

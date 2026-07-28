@@ -10,5 +10,6 @@
 
 //! 与具体页面无关的线程执行器和 Win32 基础封装。
 
+pub(crate) mod diagnostics;
 pub(crate) mod native;
 pub(crate) mod worker;

@@ -16,6 +16,7 @@
 
 use std::mem::{size_of, zeroed};
 use std::sync::Arc;
+use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{
     ERROR_BROKEN_PIPE, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, GetLastError, HWND,
@@ -23,10 +24,16 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 
-use crate::infrastructure::worker::{SingleFlightWorker, keep_pending};
+use crate::infrastructure::diagnostics::{self, Field, Level};
+use crate::infrastructure::native::{record_ntstatus_error, record_win32_error};
+use crate::infrastructure::worker::{
+    CorrelatedCompletion, RequestDisposition, SingleFlightWorker, keep_pending,
+};
 use crate::system::cpu_sampler::{ProcessorPerformance, query_processor_performance};
 use crate::system::cpu_topology::{ProcessorTopology, query_processor_topology};
 use crate::ui::resource_ids::PWM_SYSTEM_WORKER_COMPLETE;
+
+const STATUS_UNSUCCESSFUL: i32 = 0xC000_0001_u32 as i32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SystemSampleError {
@@ -107,15 +114,17 @@ impl SystemSampler {
         Ok(())
     }
 
-    pub(crate) fn request(&mut self, notify_hwnd: HWND) -> Result<(), u32> {
+    pub(crate) fn request(&mut self, notify_hwnd: HWND) -> Result<RequestDisposition, u32> {
         self.worker
             .as_mut()
             .ok_or(ERROR_BROKEN_PIPE)?
             .request((), notify_hwnd)
-            .map(|_| ())
     }
 
-    pub(crate) fn drain(&mut self, notify_hwnd: HWND) -> Result<Vec<SystemSampleResult>, u32> {
+    pub(crate) fn drain(
+        &mut self,
+        notify_hwnd: HWND,
+    ) -> Result<Vec<CorrelatedCompletion<SystemSampleResult>>, u32> {
         let drained = self
             .worker
             .as_mut()
@@ -164,20 +173,92 @@ impl SystemCollector {
     }
 
     fn collect(&mut self) -> SystemSampleResult {
-        query_processor_performance(
+        let collect_started = Instant::now();
+        let processor_started = Instant::now();
+        if diagnostics::take_requested_sampling_fault() {
+            record_ntstatus_error(
+                "diagnostic injected processor performance query",
+                STATUS_UNSUCCESSFUL,
+            );
+            diagnostics::event_with(
+                Level::Error,
+                "sampling.processor_query_failed",
+                "sampling",
+                "controlled processor performance query failure was injected",
+                None,
+                Some(duration_ms(processor_started)),
+                &[
+                    Field::signed("ntstatus", i64::from(STATUS_UNSUCCESSFUL)),
+                    Field::boolean("injected", true),
+                ],
+            );
+            return Err(SystemSampleError::NtStatus(STATUS_UNSUCCESSFUL));
+        }
+        if let Err(status) = query_processor_performance(
             self.expected_processor_count.max(1),
             &mut self.processor_info,
-        )
-        .map_err(SystemSampleError::NtStatus)?;
+        ) {
+            record_ntstatus_error("querying processor performance", status);
+            diagnostics::event_with(
+                Level::Error,
+                "sampling.processor_query_failed",
+                "sampling",
+                "processor performance query failed",
+                None,
+                Some(duration_ms(processor_started)),
+                &[Field::signed("ntstatus", i64::from(status))],
+            );
+            return Err(SystemSampleError::NtStatus(status));
+        }
+        diagnostics::event_with(
+            Level::Trace,
+            "sampling.processor_query_completed",
+            "sampling",
+            "processor performance query completed",
+            None,
+            Some(duration_ms(processor_started)),
+            &[Field::unsigned(
+                "processor_count",
+                self.processor_info.len() as u64,
+            )],
+        );
         if self.processor_info.is_empty() {
+            diagnostics::event(
+                Level::Error,
+                "sampling.processor_query_empty",
+                "sampling",
+                "processor performance query returned no processors",
+                &[],
+            );
             return Err(SystemSampleError::Win32(ERROR_INVALID_DATA));
         }
 
+        let performance_started = Instant::now();
         let mut performance = unsafe { zeroed::<PERFORMANCE_INFORMATION>() };
         performance.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
         if unsafe { K32GetPerformanceInfo(&mut performance, performance.cb) } == 0 {
-            return Err(SystemSampleError::Win32(last_error_or_gen_failure()));
+            let error = last_error_or_gen_failure();
+            record_win32_error("K32GetPerformanceInfo system sampling", error);
+            diagnostics::event_with(
+                Level::Error,
+                "sampling.performance_info_failed",
+                "sampling",
+                "system performance information query failed",
+                None,
+                Some(duration_ms(performance_started)),
+                &[Field::unsigned("win32_error", u64::from(error))],
+            );
+            return Err(SystemSampleError::Win32(error));
         }
+        diagnostics::event_with(
+            Level::Trace,
+            "sampling.performance_info_completed",
+            "sampling",
+            "system performance information query completed",
+            None,
+            Some(duration_ms(performance_started)),
+            &[],
+        );
 
         let current_cpu_times = self
             .processor_info
@@ -235,8 +316,24 @@ impl SystemCollector {
         self.previous_cpu_times = current_cpu_times;
         self.previous_timestamp_ms = Some(timestamp_ms);
         self.processor_topology = Some(processor_topology);
+        diagnostics::event_with(
+            Level::Trace,
+            "sampling.collection_completed",
+            "sampling",
+            "coherent system sample collection completed",
+            None,
+            Some(duration_ms(collect_started)),
+            &[
+                Field::unsigned("processor_count", sample.processor_count as u64),
+                Field::boolean("cpu_delta_valid", sample.cpu_delta_valid),
+            ],
+        );
         Ok(sample)
     }
+}
+
+fn duration_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 struct CpuDelta {

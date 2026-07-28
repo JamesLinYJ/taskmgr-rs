@@ -19,14 +19,15 @@ use std::slice;
 
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::System::Performance::{
-    PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE,
-    PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY,
-    PDH_MORE_DATA, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
-    PdhGetFormattedCounterArrayW, PdhGetFormattedCounterValue, PdhOpenQueryW,
+    PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_NO_COUNTER, PDH_CSTATUS_NO_OBJECT, PDH_CSTATUS_VALID_DATA,
+    PDH_FMT_COUNTERVALUE, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_FMT_LARGE, PDH_HCOUNTER,
+    PDH_HQUERY, PDH_INVALID_PATH, PDH_MORE_DATA, PdhAddEnglishCounterW, PdhCloseQuery,
+    PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhGetFormattedCounterValue, PdhOpenQueryW,
 };
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 
 use super::model::{CpuDetailError, CpuDynamicInfo, invalid, invalid_error};
+use crate::infrastructure::diagnostics::{self, Field, Level};
 use crate::infrastructure::native::{record_pdh_error, to_wide_null};
 use crate::system::cpu_topology::LogicalProcessorId;
 
@@ -41,9 +42,9 @@ pub(super) struct CpuPdhQuery {
     query: PDH_HQUERY,
     frequency: PDH_HCOUNTER,
     performance: PDH_HCOUNTER,
-    context_switches: PDH_HCOUNTER,
-    system_calls: PDH_HCOUNTER,
-    processor_queue: PDH_HCOUNTER,
+    context_switches: Option<PDH_HCOUNTER>,
+    system_calls: Option<PDH_HCOUNTER>,
+    processor_queue: Option<PDH_HCOUNTER>,
     expected_processor_count: usize,
     processor_indices: Option<HashMap<PdhProcessorInstance, usize>>,
     nominal_values: Vec<i64>,
@@ -85,9 +86,9 @@ impl CpuPdhQuery {
             query,
             frequency: null_mut(),
             performance: null_mut(),
-            context_switches: null_mut(),
-            system_calls: null_mut(),
-            processor_queue: null_mut(),
+            context_switches: None,
+            system_calls: None,
+            processor_queue: None,
             expected_processor_count: expected_processors.len(),
             processor_indices: None,
             nominal_values: Vec::new(),
@@ -99,23 +100,51 @@ impl CpuPdhQuery {
         };
         result.frequency = result.add_counter(FREQUENCY_COUNTER_PATH)?;
         result.performance = result.add_counter(PERFORMANCE_COUNTER_PATH)?;
-        result.context_switches = result.add_counter(CONTEXT_SWITCH_COUNTER_PATH)?;
-        result.system_calls = result.add_counter(SYSTEM_CALL_COUNTER_PATH)?;
-        result.processor_queue = result.add_counter(PROCESSOR_QUEUE_COUNTER_PATH)?;
+        result.context_switches = result.add_optional_counter(CONTEXT_SWITCH_COUNTER_PATH)?;
+        result.system_calls = result.add_optional_counter(SYSTEM_CALL_COUNTER_PATH)?;
+        result.processor_queue = result.add_optional_counter(PROCESSOR_QUEUE_COUNTER_PATH)?;
         Ok(result)
     }
 
-    fn add_counter(&self, path: &str) -> Result<PDH_HCOUNTER, CpuDetailError> {
-        let path = to_wide_null(path);
+    fn add_counter(&self, path: &'static str) -> Result<PDH_HCOUNTER, CpuDetailError> {
+        let wide_path = to_wide_null(path);
         let mut counter = null_mut();
-        let status = unsafe { PdhAddEnglishCounterW(self.query, path.as_ptr(), 0, &mut counter) };
+        let status =
+            unsafe { PdhAddEnglishCounterW(self.query, wide_path.as_ptr(), 0, &mut counter) };
         if status != ERROR_SUCCESS {
-            return Err(CpuDetailError::Pdh {
+            return Err(CpuDetailError::PdhCounter {
                 context: "PdhAddEnglishCounterW for CPU diagnostics",
                 status,
+                counter_path: path,
             });
         }
         Ok(counter)
+    }
+
+    fn add_optional_counter(
+        &self,
+        path: &'static str,
+    ) -> Result<Option<PDH_HCOUNTER>, CpuDetailError> {
+        match self.add_counter(path) {
+            Ok(counter) => Ok(Some(counter)),
+            Err(CpuDetailError::PdhCounter { status, .. })
+                if pdh_counter_is_unavailable(status) =>
+            {
+                diagnostics::event(
+                    Level::Warn,
+                    "cpu.pdh_counter_unavailable",
+                    "cpu",
+                    "optional CPU performance counter is unavailable",
+                    &[
+                        Field::text("counter_path", path),
+                        Field::text("error_domain", "pdh"),
+                        Field::unsigned("error_code", u64::from(status)),
+                    ],
+                );
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(super) fn reset_sample_baseline(&mut self) {
@@ -134,17 +163,32 @@ impl CpuPdhQuery {
             self.sample_baseline_ready = true;
             return Ok(CpuPdhCollectOutcome::Primed(unsafe { GetTickCount64() }));
         }
-        let frequencies = query_counter_array(self.frequency, PDH_FMT_LARGE, |value| unsafe {
-            value.Anonymous.largeValue
-        })?;
-        let performance = query_counter_array(self.performance, PDH_FMT_DOUBLE, |value| unsafe {
-            value.Anonymous.doubleValue
-        })?;
+        let frequencies = query_counter_array(
+            self.frequency,
+            FREQUENCY_COUNTER_PATH,
+            PDH_FMT_LARGE,
+            |value| unsafe { value.Anonymous.largeValue },
+        )?;
+        let performance = query_counter_array(
+            self.performance,
+            PERFORMANCE_COUNTER_PATH,
+            PDH_FMT_DOUBLE,
+            |value| unsafe { value.Anonymous.doubleValue },
+        )?;
         let (average_frequency_mhz, minimum_frequency_mhz, maximum_frequency_mhz) =
             self.validate_frequencies(&frequencies, &performance)?;
-        let processor_queue_length = query_single_counter(self.processor_queue)?;
-        let context_switches_per_second = Some(query_single_counter(self.context_switches)?);
-        let system_calls_per_second = Some(query_single_counter(self.system_calls)?);
+        let processor_queue_length = self
+            .processor_queue
+            .map(|counter| query_single_counter(counter, PROCESSOR_QUEUE_COUNTER_PATH))
+            .transpose()?;
+        let context_switches_per_second = self
+            .context_switches
+            .map(|counter| query_single_counter(counter, CONTEXT_SWITCH_COUNTER_PATH))
+            .transpose()?;
+        let system_calls_per_second = self
+            .system_calls
+            .map(|counter| query_single_counter(counter, SYSTEM_CALL_COUNTER_PATH))
+            .transpose()?;
         Ok(CpuPdhCollectOutcome::Sample(CpuDynamicInfo {
             average_frequency_mhz,
             minimum_frequency_mhz,
@@ -223,6 +267,7 @@ pub(super) struct PdhArrayValue<T> {
 
 fn query_counter_array<T>(
     counter: PDH_HCOUNTER,
+    counter_path: &'static str,
     format: u32,
     extract: impl Fn(&PDH_FMT_COUNTERVALUE) -> T,
 ) -> Result<Vec<PdhArrayValue<T>>, CpuDetailError> {
@@ -237,9 +282,10 @@ fn query_counter_array<T>(
             null_mut(),
         );
         if status != PDH_MORE_DATA {
-            return Err(CpuDetailError::Pdh {
+            return Err(CpuDetailError::PdhCounter {
                 context: "PdhGetFormattedCounterArrayW CPU size query",
                 status,
+                counter_path,
             });
         }
         if byte_count == 0 || byte_count > MAX_PDH_ARRAY_BYTES {
@@ -254,9 +300,10 @@ fn query_counter_array<T>(
             storage.as_mut_ptr().cast(),
         );
         if status != ERROR_SUCCESS {
-            return Err(CpuDetailError::Pdh {
+            return Err(CpuDetailError::PdhCounter {
                 context: "PdhGetFormattedCounterArrayW CPU data query",
                 status,
+                counter_path,
             });
         }
         let used_bytes = byte_count as usize;
@@ -277,7 +324,7 @@ fn query_counter_array<T>(
         );
         let mut values = Vec::with_capacity(items.len());
         for item in items {
-            validate_pdh_status(item.FmtValue.CStatus)?;
+            validate_pdh_status(item.FmtValue.CStatus, counter_path)?;
             values.push(PdhArrayValue {
                 instance: read_bounded_wide(item.szName, base, end)?,
                 value: extract(&item.FmtValue),
@@ -287,30 +334,42 @@ fn query_counter_array<T>(
     }
 }
 
-fn query_single_counter(counter: PDH_HCOUNTER) -> Result<u64, CpuDetailError> {
+fn query_single_counter(
+    counter: PDH_HCOUNTER,
+    counter_path: &'static str,
+) -> Result<u64, CpuDetailError> {
     let mut value = unsafe { zeroed::<PDH_FMT_COUNTERVALUE>() };
     let status =
         unsafe { PdhGetFormattedCounterValue(counter, PDH_FMT_LARGE, null_mut(), &mut value) };
     if status != ERROR_SUCCESS {
-        return Err(CpuDetailError::Pdh {
+        return Err(CpuDetailError::PdhCounter {
             context: "PdhGetFormattedCounterValue for CPU diagnostics",
             status,
+            counter_path,
         });
     }
-    validate_pdh_status(value.CStatus)?;
+    validate_pdh_status(value.CStatus, counter_path)?;
     let value = unsafe { value.Anonymous.largeValue };
     u64::try_from(value).map_err(|_| invalid_error("CPU PDH negative counter value"))
 }
 
-fn validate_pdh_status(status: u32) -> Result<(), CpuDetailError> {
+fn validate_pdh_status(status: u32, counter_path: &'static str) -> Result<(), CpuDetailError> {
     if matches!(status, PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA) {
         Ok(())
     } else {
-        Err(CpuDetailError::Pdh {
+        Err(CpuDetailError::PdhCounter {
             context: "CPU PDH formatted counter status",
             status,
+            counter_path,
         })
     }
+}
+
+pub(super) fn pdh_counter_is_unavailable(status: u32) -> bool {
+    matches!(
+        status,
+        PDH_CSTATUS_NO_OBJECT | PDH_CSTATUS_NO_COUNTER | PDH_INVALID_PATH
+    )
 }
 
 #[cfg(test)]

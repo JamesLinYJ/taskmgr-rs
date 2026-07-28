@@ -121,6 +121,7 @@ fn build_perf_view_menu() -> MenuResult<PopupMenu> {
 fn build_common_help_menu() -> MenuResult<PopupMenu> {
     let mut menu = PopupMenu::new()?;
     append_item(&mut menu, IDM_HELP, TextKey::HelpTopics)?;
+    append_item(&mut menu, IDM_DIAGNOSTICS, TextKey::DiagnosticLogs)?;
     append_separator(&mut menu)?;
     append_item(&mut menu, IDM_ABOUT, TextKey::AboutTaskManager)?;
     Ok(menu)
@@ -342,7 +343,7 @@ mod tests {
     use super::*;
     use std::mem::{size_of, zeroed};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetMenuItemCount, GetMenuItemInfoW, MENUITEMINFOW, MFT_SEPARATOR, MIIM_FTYPE,
+        GetMenuItemCount, GetMenuItemID, GetMenuItemInfoW, MENUITEMINFOW, MFT_SEPARATOR, MIIM_FTYPE,
     };
 
     #[test]
@@ -366,6 +367,23 @@ mod tests {
                 );
                 assert_eq!(info.fType & MFT_SEPARATOR != 0, should_be_separator);
             }
+        }
+    }
+
+    #[test]
+    fn diagnostics_is_between_help_topics_and_the_about_separator() {
+        let menu = build_common_help_menu().expect("help menu should build");
+        unsafe {
+            assert_eq!(GetMenuItemCount(menu.as_raw()), 4);
+            assert_eq!(GetMenuItemID(menu.as_raw(), 0), u32::from(IDM_HELP));
+            assert_eq!(GetMenuItemID(menu.as_raw(), 1), u32::from(IDM_DIAGNOSTICS));
+
+            let mut separator = zeroed::<MENUITEMINFOW>();
+            separator.cbSize = size_of::<MENUITEMINFOW>() as u32;
+            separator.fMask = MIIM_FTYPE;
+            assert_ne!(GetMenuItemInfoW(menu.as_raw(), 2, 1, &mut separator), 0);
+            assert_ne!(separator.fType & MFT_SEPARATOR, 0);
+            assert_eq!(GetMenuItemID(menu.as_raw(), 3), u32::from(IDM_ABOUT));
         }
     }
 }

@@ -13,6 +13,7 @@
 //! 并统一协调各个页面的初始化、激活和定时刷新。
 
 pub(crate) mod controllers;
+mod diagnostics_dialog;
 pub(crate) mod page_host;
 pub(crate) mod page_registry;
 
@@ -81,14 +82,16 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use self::controllers::{
     MenuController, RuntimeStatsController, TrayController, WindowModeController,
 };
+use self::diagnostics_dialog::DiagnosticDialogOutcome;
 use self::page_host::{DialogPage, RefreshReason, default_pages};
 use self::page_registry::{MinimumSizePolicy, PageId};
 use crate::config::options::{Options, update_speed_timer_interval};
+use crate::infrastructure::diagnostics::{self, Field, Level};
 use crate::infrastructure::native::{
     call_window_proc, destroy_icon_handle, enable_debug_privilege, format_resource_string, height,
-    hiword, loword, process_is_elevated, record_hresult_error, record_ntstatus_error,
-    record_startup_timing, record_win32_error, sanitize_task_manager_menu, set_dialog_msg_result,
-    set_style, set_window_userdata_ptr, to_wide_null, width, window_userdata_non_null,
+    hiword, loword, process_is_elevated, record_hresult_error, record_startup_timing,
+    record_win32_error, sanitize_task_manager_menu, set_dialog_msg_result, set_style,
+    set_window_userdata_ptr, to_wide_null, width, window_userdata_non_null,
 };
 use crate::system::cpu_topology::CpuTopologyError;
 use crate::system::process_identity::ProcIdentity;
@@ -149,6 +152,12 @@ struct GlobalStrings {
     fmt_mem: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SystemSampleFailure {
+    error: SystemSampleError,
+    operation_id: Option<u64>,
+}
+
 pub struct App {
     // 主应用状态对象统一持有主窗口、菜单、页面和托盘/定时器相关状态。
     hinstance: HINSTANCE,
@@ -166,7 +175,7 @@ pub struct App {
     pages: [DialogPage; PageId::COUNT],
     stats: RuntimeStatsController,
     system_sampler: SystemSampler,
-    last_system_sample_error: Option<SystemSampleError>,
+    last_system_sample_error: Option<SystemSampleFailure>,
     last_cpu_topology_error: Option<CpuTopologyError>,
     last_system_worker_error: Option<u32>,
     window_mode: WindowModeController,
@@ -181,12 +190,39 @@ pub fn run() -> i32 {
     // 主窗口过程通过窗口 user data 回到这份状态，而不是依赖可变全局单例。
     // 安全性: 进程启动阶段尚未暴露任何窗口回调，`App` 只在当前线程初始化并运行。
     unsafe {
+        diagnostics::event(
+            Level::Info,
+            "app.startup_entered",
+            "app",
+            "application startup entered before privilege initialization",
+            &[],
+        );
+        let privilege_operation = diagnostics::next_operation_id();
+        let privilege_started_ms = GetTickCount64();
         if let Err(error) = enable_debug_privilege() {
             record_win32_error("enabling SeDebugPrivilege", error);
             match process_is_elevated() {
                 Ok(false) => {
+                    diagnostics::event_with(
+                        Level::Warn,
+                        "privilege.elevation_required",
+                        "app",
+                        "debug privilege was unavailable and an elevated relaunch is required",
+                        Some(privilege_operation),
+                        Some(GetTickCount64().wrapping_sub(privilege_started_ms)),
+                        &[Field::unsigned("win32_error", u64::from(error))],
+                    );
                     return match relaunch_elevated() {
-                        Ok(()) => 0,
+                        Ok(()) => {
+                            diagnostics::event(
+                                Level::Info,
+                                "privilege.elevated_relaunch_started",
+                                "app",
+                                "elevated replacement process was started",
+                                &[],
+                            );
+                            0
+                        }
                         Err(relaunch_error) => {
                             record_win32_error("elevated relaunch", relaunch_error);
                             1
@@ -200,6 +236,15 @@ pub fn run() -> i32 {
                 }
             }
         }
+        diagnostics::event_with(
+            Level::Info,
+            "privilege.debug_enabled",
+            "app",
+            "SeDebugPrivilege enabled",
+            Some(privilege_operation),
+            Some(GetTickCount64().wrapping_sub(privilege_started_ms)),
+            &[],
+        );
 
         let hinstance = GetModuleHandleW(null());
         let mut app = App::new(hinstance);
@@ -207,25 +252,41 @@ pub fn run() -> i32 {
     }
 }
 
-unsafe fn relaunch_elevated() -> Result<(), u32> {
-    unsafe {
-        let executable = env::current_exe()
-            .map_err(|error| error.raw_os_error().unwrap_or(ERROR_GEN_FAILURE as i32) as u32)?;
-        let executable = to_wide_null(&executable.to_string_lossy());
-        let verb = to_wide_null("runas");
-        let result = ShellExecuteW(
+fn relaunch_elevated() -> Result<(), u32> {
+    launch_replacement(&diagnostics::elevated_relaunch_parameters(), true)
+}
+
+fn relaunch_detailed() -> Result<(), u32> {
+    let elevated = process_is_elevated()?;
+    launch_replacement(&diagnostics::detailed_restart_parameters(), !elevated)
+}
+
+fn launch_replacement(parameters: &[u16], elevate: bool) -> Result<(), u32> {
+    let executable = env::current_exe()
+        .map_err(|error| error.raw_os_error().unwrap_or(ERROR_GEN_FAILURE as i32) as u32)?;
+    let executable = to_wide_null(&executable.to_string_lossy());
+    let verb = to_wide_null(if elevate { "runas" } else { "open" });
+    let parameters = if parameters == [0] {
+        null()
+    } else {
+        parameters.as_ptr()
+    };
+    // Safety: all UTF-16 inputs are NUL-terminated and ShellExecuteW consumes them
+    // synchronously. A return value above 32 confirms that Windows accepted the launch.
+    let result = unsafe {
+        ShellExecuteW(
             null_mut(),
             verb.as_ptr(),
             executable.as_ptr(),
-            null(),
+            parameters,
             null(),
             SW_SHOWNORMAL,
-        ) as isize;
-        if result > 32 {
-            Ok(())
-        } else {
-            Err(result.max(1) as u32)
-        }
+        )
+    } as isize;
+    if result > 32 {
+        Ok(())
+    } else {
+        Err(result.max(1) as u32)
     }
 }
 
@@ -336,6 +397,16 @@ impl App {
 
     fn run_main(&mut self) -> i32 {
         let startup_started_ms = unsafe { GetTickCount64() };
+        let startup_operation = diagnostics::next_operation_id();
+        diagnostics::event_with(
+            Level::Info,
+            "app.startup_sequence_started",
+            "app",
+            "main application startup sequence started",
+            Some(startup_operation),
+            None,
+            &[],
+        );
         // 启动链路按“单实例检查 -> 环境初始化 -> 创建主对话框 -> 进入消息循环”展开。
         // 这样既能兼容经典 Task Manager 的行为，也便于在失败点提前退出。
         if !self.acquire_startup_mutex() {
@@ -452,7 +523,7 @@ impl App {
 
         // 安全性: message loop runs on the UI thread; `message` is a valid MSG buffer for all
         // synchronous Win32 message APIs used inside the loop.
-        unsafe {
+        let exit_code = unsafe {
             SetProcessShutdownParameters(1, 0);
 
             let mut message = zeroed::<MSG>();
@@ -497,7 +568,17 @@ impl App {
                     DispatchMessageW(&raw const message);
                 }
             }
-        }
+        };
+        diagnostics::event_with(
+            Level::Info,
+            "app.message_loop_exited",
+            "app",
+            "main message loop exited",
+            Some(startup_operation),
+            Some(unsafe { GetTickCount64() }.wrapping_sub(startup_started_ms)),
+            &[Field::signed("exit_code", i64::from(exit_code))],
+        );
+        exit_code
     }
 
     fn acquire_startup_mutex(&mut self) -> bool {
@@ -723,6 +804,19 @@ impl App {
                 .set_base_styles(framed_style, borderless_window_style(framed_style));
 
             self.options.load(self.min_width, self.min_height);
+            diagnostics::event(
+                Level::Info,
+                "config.options_loaded",
+                "config",
+                "binary application options loaded and validated",
+                &[
+                    Field::signed("current_page", i64::from(self.options.current_page)),
+                    Field::unsigned("timer_interval_ms", u64::from(self.options.timer_interval)),
+                    Field::boolean("always_on_top", self.options.always_on_top()),
+                    Field::boolean("hide_when_minimized", self.options.hide_when_minimized()),
+                    Field::boolean("no_title", self.options.no_title()),
+                ],
+            );
 
             SetWindowPos(
                 hwnd,
@@ -953,7 +1047,21 @@ impl App {
     fn activate_page(&mut self, page_id: PageId) -> Result<(), u32> {
         // 切页不仅是隐藏/显示子对话框，还要同步菜单、页面选项和尺寸布局。
         // 如果新页面激活失败，会尽量恢复上一个页面，避免主窗口进入空白状态。
+        let operation_id = diagnostics::next_operation_id();
+        let started_ms = unsafe { GetTickCount64() };
         let index = page_id.index();
+        diagnostics::event_with(
+            Level::Debug,
+            "page.activation_started",
+            "ui",
+            "page activation started",
+            Some(operation_id),
+            None,
+            &[
+                Field::text("page", format!("{page_id:?}")),
+                Field::signed("previous_page", i64::from(self.options.current_page)),
+            ],
+        );
 
         if page_uses_normal_minimum(self.options.no_title(), page_id) {
             self.ensure_window_minimum_size()?;
@@ -982,6 +1090,15 @@ impl App {
                 self.refresh_tray_icon();
                 self.refresh_status_bar();
                 self.pages[index].show_and_focus();
+                diagnostics::event_with(
+                    Level::Info,
+                    "page.activation_completed",
+                    "ui",
+                    "page activation completed",
+                    Some(operation_id),
+                    Some(unsafe { GetTickCount64() }.wrapping_sub(started_ms)),
+                    &[Field::text("page", format!("{page_id:?}"))],
+                );
                 Ok(())
             }
             Err(error) => {
@@ -998,6 +1115,18 @@ impl App {
                     self.update_menu_states();
                     self.size_active_page();
                 }
+                diagnostics::event_with(
+                    Level::Error,
+                    "page.activation_failed",
+                    "ui",
+                    "page activation failed and the prior page was restored",
+                    Some(operation_id),
+                    Some(unsafe { GetTickCount64() }.wrapping_sub(started_ms)),
+                    &[
+                        Field::text("page", format!("{page_id:?}")),
+                        Field::unsigned("win32_error", u64::from(error)),
+                    ],
+                );
                 Err(if error == 0 { ERROR_GEN_FAILURE } else { error })
             }
         }
@@ -1112,7 +1241,47 @@ impl App {
         let Some(page_id) = active_page_id(self.options.current_page) else {
             return;
         };
-        self.pages[page_id.index()].timer_event(&self.options, self.stats.processor_count, reason);
+        let trace_enabled = diagnostics::enabled(Level::Trace);
+        let parent_operation_id = trace_enabled
+            .then(diagnostics::current_operation_id)
+            .flatten();
+        let operation_id = trace_enabled.then(diagnostics::next_operation_id);
+        let started_ms = trace_enabled.then(|| unsafe { GetTickCount64() });
+        if let Some(operation_id) = operation_id {
+            diagnostics::with_operation_id(operation_id, || {
+                self.pages[page_id.index()].timer_event(
+                    &self.options,
+                    self.stats.processor_count,
+                    reason,
+                );
+            });
+        } else {
+            self.pages[page_id.index()].timer_event(
+                &self.options,
+                self.stats.processor_count,
+                reason,
+            );
+        }
+        if let (Some(operation_id), Some(started_ms)) = (operation_id, started_ms) {
+            let mut fields = vec![
+                Field::text("page", format!("{page_id:?}")),
+                Field::text("reason", format!("{reason:?}")),
+            ];
+            if let Some(parent_operation_id) =
+                parent_operation_id.filter(|parent| *parent != operation_id)
+            {
+                fields.push(Field::unsigned("parent_operation_id", parent_operation_id));
+            }
+            diagnostics::event_with(
+                Level::Trace,
+                "page.refresh_dispatched",
+                "ui",
+                "active page refresh chain was dispatched",
+                Some(operation_id),
+                Some(unsafe { GetTickCount64() }.wrapping_sub(started_ms)),
+                &fields,
+            );
+        }
     }
 
     fn size_active_page(&mut self) {
@@ -1373,25 +1542,73 @@ impl App {
                 GetForegroundWindow() == hwnd && GetAsyncKeyState(i32::from(VK_CONTROL)) < 0
             }
         {
+            diagnostics::event(
+                Level::Trace,
+                "timer.refresh_suppressed",
+                "ui",
+                "periodic refresh was suppressed while Control is held",
+                &[],
+            );
             return;
         }
 
-        self.refresh_active_page(if force {
+        let reason = if force {
             RefreshReason::User
         } else {
             RefreshReason::Periodic
-        });
-        self.request_system_sample();
+        };
+        if diagnostics::enabled(Level::Trace) {
+            let parent_operation_id = diagnostics::current_operation_id();
+            let operation_id = diagnostics::next_operation_id();
+            let started_ms = unsafe { GetTickCount64() };
+            diagnostics::with_operation_id(operation_id, || {
+                if force {
+                    diagnostics::arm_requested_sampling_fault();
+                }
+                self.refresh_active_page(reason);
+                self.request_system_sample();
+            });
+            let mut fields = vec![Field::boolean("forced", force)];
+            if let Some(parent_operation_id) =
+                parent_operation_id.filter(|parent| *parent != operation_id)
+            {
+                fields.push(Field::unsigned("parent_operation_id", parent_operation_id));
+            }
+            diagnostics::event_with(
+                Level::Trace,
+                "timer.refresh_chain_completed",
+                "ui",
+                "timer refresh chain was dispatched",
+                Some(operation_id),
+                Some(unsafe { GetTickCount64() }.wrapping_sub(started_ms)),
+                &fields,
+            );
+        } else {
+            self.refresh_active_page(reason);
+            self.request_system_sample();
+        }
     }
 
     fn request_system_sample(&mut self) {
         match self.system_sampler.request(self.main_hwnd) {
-            Ok(()) => self.last_system_worker_error = None,
+            Ok(disposition) => {
+                self.last_system_worker_error = None;
+                diagnostics::event_with(
+                    Level::Trace,
+                    "sampling.request_accepted",
+                    "sampling",
+                    "system sampling request accepted by the single-flight worker",
+                    Some(disposition.operation_id()),
+                    None,
+                    &[Field::boolean("coalesced", disposition.was_coalesced())],
+                );
+            }
             Err(error) => self.record_system_worker_error("system sample request", error),
         }
     }
 
     fn handle_system_worker_completion(&mut self) {
+        let started_ms = unsafe { GetTickCount64() };
         let completions = match self.system_sampler.drain(self.main_hwnd) {
             Ok(completions) => {
                 self.last_system_worker_error = None;
@@ -1404,14 +1621,25 @@ impl App {
         };
 
         for completion in completions {
-            match completion {
+            diagnostics::with_operation_id(completion.operation_id, || match completion.value {
                 Ok(sample) => self.apply_system_sample(&sample),
                 Err(error) => self.record_system_sample_error(error),
-            }
+            });
         }
+        diagnostics::event_with(
+            Level::Trace,
+            "sampling.completions_applied",
+            "sampling",
+            "system sampling completions were applied on the UI thread",
+            None,
+            Some(unsafe { GetTickCount64() }.wrapping_sub(started_ms)),
+            &[],
+        );
     }
 
     fn apply_system_sample(&mut self, sample: &SystemSample) {
+        let started_ms = unsafe { GetTickCount64() };
+        let recovered_from = self.last_system_sample_error;
         self.record_cpu_topology_error(sample.processor_topology.error());
         let window_is_visible = unsafe { IsIconic(self.main_hwnd) == 0 };
         let redraw_performance_page =
@@ -1433,20 +1661,73 @@ impl App {
 
         self.stats.apply_sample(sample);
         self.last_system_sample_error = None;
+        if let Some(previous_error) = recovered_from {
+            let mut fields = match previous_error.error {
+                SystemSampleError::NtStatus(status) => vec![
+                    Field::text("previous_error_domain", "ntstatus"),
+                    Field::unsigned("previous_error_code", u64::from(status as u32)),
+                ],
+                SystemSampleError::Win32(error) => vec![
+                    Field::text("previous_error_domain", "win32"),
+                    Field::unsigned("previous_error_code", u64::from(error)),
+                ],
+            };
+            if let Some(operation_id) = previous_error.operation_id {
+                fields.push(Field::unsigned("previous_operation_id", operation_id));
+            }
+            diagnostics::event(
+                Level::Info,
+                "sampling.recovered",
+                "sampling",
+                "system sampling recovered after a previous failure",
+                &fields,
+            );
+        }
         self.refresh_tray_icon();
         self.refresh_status_bar();
+        diagnostics::event_with(
+            Level::Trace,
+            "sampling.sample_applied",
+            "sampling",
+            "system sample was applied to consumers",
+            None,
+            Some(unsafe { GetTickCount64() }.wrapping_sub(started_ms)),
+            &[
+                Field::unsigned("processor_count", sample.processor_count as u64),
+                Field::boolean("cpu_delta_valid", sample.cpu_delta_valid),
+            ],
+        );
     }
 
     fn record_system_sample_error(&mut self, error: SystemSampleError) {
         self.pages[PageId::Cpu.index()].mark_system_sample_error();
-        if self.last_system_sample_error == Some(error) {
+        if self
+            .last_system_sample_error
+            .is_some_and(|previous| previous.error == error)
+        {
             return;
         }
-        match error {
-            SystemSampleError::NtStatus(status) => record_ntstatus_error("system sampling", status),
-            SystemSampleError::Win32(error) => record_win32_error("system sampling", error),
-        }
-        self.last_system_sample_error = Some(error);
+        let fields = match error {
+            SystemSampleError::NtStatus(status) => vec![
+                Field::text("error_domain", "ntstatus"),
+                Field::unsigned("error_code", u64::from(status as u32)),
+            ],
+            SystemSampleError::Win32(error) => vec![
+                Field::text("error_domain", "win32"),
+                Field::unsigned("error_code", u64::from(error)),
+            ],
+        };
+        diagnostics::event(
+            Level::Warn,
+            "sampling.failed",
+            "sampling",
+            "system sampling entered a failed state",
+            &fields,
+        );
+        self.last_system_sample_error = Some(SystemSampleFailure {
+            error,
+            operation_id: diagnostics::current_operation_id(),
+        });
     }
 
     fn record_cpu_topology_error(&mut self, error: Option<CpuTopologyError>) {
@@ -1731,9 +2012,23 @@ impl App {
     fn on_command(&mut self, hwnd: HWND, command_id: u16) {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
+            let started_ms = GetTickCount64();
+            let operation_id = diagnostics::next_operation_id();
+            diagnostics::event_with(
+                Level::Info,
+                "ui.command_received",
+                "ui",
+                "window command received",
+                Some(operation_id),
+                None,
+                &[
+                    Field::unsigned("command_id", u64::from(command_id)),
+                    Field::signed("current_page", i64::from(self.options.current_page)),
+                ],
+            );
             // 主命令分发层只负责修改全局选项、切页和把页面专属命令转发到对应子页面。
             // 真正的进程/任务/用户操作都在各自页面状态对象里完成。
-            match command_id {
+            diagnostics::with_operation_id(operation_id, || match command_id {
                 IDM_HIDE => {
                     ShowWindow(hwnd, SW_MINIMIZE);
                 }
@@ -1816,6 +2111,62 @@ impl App {
                 IDM_REFRESH => {
                     self.on_timer(hwnd, true);
                 }
+                IDM_DIAGNOSTICS => {
+                    diagnostics::event_with(
+                        Level::Info,
+                        "diagnostics.dialog_opened",
+                        "diagnostics-ui",
+                        "diagnostic log dialog opened",
+                        Some(operation_id),
+                        None,
+                        &[],
+                    );
+                    match diagnostics_dialog::show(self.hinstance, hwnd, operation_id) {
+                        Ok(DiagnosticDialogOutcome::Closed) => {}
+                        Ok(DiagnosticDialogOutcome::RestartDetailed) => match relaunch_detailed() {
+                            Ok(()) => {
+                                diagnostics::event_with(
+                                    Level::Info,
+                                    "diagnostics.detailed_restart_started",
+                                    "diagnostics-ui",
+                                    "replacement process started with detailed diagnostics",
+                                    Some(operation_id),
+                                    None,
+                                    &[],
+                                );
+                                DestroyWindow(hwnd);
+                            }
+                            Err(error) => {
+                                record_win32_error("restarting with detailed diagnostics", error);
+                                let title = to_wide_null(text(TextKey::DiagnosticLogsTitle));
+                                let message = to_wide_null(&format!(
+                                    "{} ({error:#010X})",
+                                    text(TextKey::DiagnosticRestartFailed)
+                                ));
+                                MessageBoxW(
+                                    hwnd,
+                                    message.as_ptr(),
+                                    title.as_ptr(),
+                                    MB_OK | MB_ICONSTOP,
+                                );
+                            }
+                        },
+                        Err(error) => {
+                            record_win32_error("diagnostic dialog creation", error);
+                            let title = to_wide_null(text(TextKey::DiagnosticLogsTitle));
+                            let message = to_wide_null(&format!(
+                                "{} ({error:#010X})",
+                                text(TextKey::DiagnosticLoggingUnavailable)
+                            ));
+                            MessageBoxW(
+                                hwnd,
+                                message.as_ptr(),
+                                title.as_ptr(),
+                                MB_OK | MB_ICONSTOP,
+                            );
+                        }
+                    }
+                }
                 IDM_ABOUT => {
                     let title = to_wide_null(&self.strings.app_title);
                     let icon = load_icon_resource(
@@ -1880,7 +2231,16 @@ impl App {
                     self.show_help(hwnd);
                 }
                 _ => {}
-            }
+            });
+            diagnostics::event_with(
+                Level::Debug,
+                "ui.command_completed",
+                "ui",
+                "window command dispatch completed",
+                Some(operation_id),
+                Some(GetTickCount64().wrapping_sub(started_ms)),
+                &[Field::unsigned("command_id", u64::from(command_id))],
+            );
         }
     }
 
@@ -1995,6 +2355,17 @@ impl App {
     fn shutdown(&mut self) {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
+            let operation_id = diagnostics::next_operation_id();
+            let started_ms = GetTickCount64();
+            diagnostics::event_with(
+                Level::Info,
+                "app.shutdown_started",
+                "app",
+                "ordered application shutdown started",
+                Some(operation_id),
+                None,
+                &[],
+            );
             // 关闭顺序按“停定时器 -> 保存页面状态 -> 解绑菜单 -> 销毁页面资源”执行，
             // 避免主窗口继续引用页面即将释放的 HMENU。
             if self.timer_id != 0 {
@@ -2015,8 +2386,18 @@ impl App {
             }
 
             self.update_tray(NIM_DELETE, null_mut(), "");
-            if let Err(error) = self.options.save() {
-                record_win32_error("saving options", error);
+            match self.options.save() {
+                Ok(()) => diagnostics::event(
+                    Level::Info,
+                    "config.options_saved",
+                    "config",
+                    "application options saved",
+                    &[Field::signed(
+                        "current_page",
+                        i64::from(self.options.current_page),
+                    )],
+                ),
+                Err(error) => record_win32_error("saving options", error),
             }
 
             self.tray.clear_icons();
@@ -2030,6 +2411,15 @@ impl App {
                 self.accelerator_table = null_mut();
             }
 
+            diagnostics::event_with(
+                Level::Info,
+                "app.shutdown_completed",
+                "app",
+                "ordered application shutdown completed",
+                Some(operation_id),
+                Some(GetTickCount64().wrapping_sub(started_ms)),
+                &[],
+            );
             PostQuitMessage(0);
         }
     }
