@@ -17,11 +17,14 @@
 
 mod archive;
 mod crash;
+mod secure_fs;
 
 use std::cell::Cell;
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
+#[cfg(test)]
+use std::fs;
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
@@ -38,9 +41,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Foundation::{ERROR_GEN_FAILURE, GetLastError, SYSTEMTIME};
-use windows_sys::Win32::Storage::FileSystem::{
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-};
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::SystemInformation::{GetSystemTime, OSVERSIONINFOW};
@@ -49,6 +50,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use self::archive::StoredZipWriter;
+use self::secure_fs::{SecureDirectory, mark_delete, random_bytes, rename_within_directory};
 use crate::infrastructure::native::process_is_elevated;
 
 const LOG_SCHEMA_VERSION: u16 = 1;
@@ -355,8 +357,9 @@ impl SamplingFaultInjection {
 
 struct FileSink {
     file: File,
-    root_directory: PathBuf,
-    session_directory: PathBuf,
+    root_directory: SecureDirectory,
+    session_directory: SecureDirectory,
+    high_integrity: bool,
     process_id: u32,
     part: u32,
     bytes_written: u64,
@@ -437,9 +440,10 @@ pub(crate) fn initialize_from_env() {
 }
 
 impl Diagnostics {
-    fn new(config: DiagnosticConfig, sampling_fault_requested: bool) -> Self {
+    fn new(mut config: DiagnosticConfig, sampling_fault_requested: bool) -> Self {
         let mut startup_errors = Vec::new();
-        let (root_directory, session_directory) = prepare_directories(&config, &mut startup_errors);
+        let (root_directory, session_directory) =
+            prepare_directories(&mut config, &mut startup_errors);
         let file_sink = session_directory.as_ref().and_then(|session| {
             let root = root_directory.as_ref()?;
             match FileSink::open(root.clone(), session.clone(), process::id()) {
@@ -858,17 +862,32 @@ impl FileSink {
         session_directory: PathBuf,
         process_id: u32,
     ) -> io::Result<Self> {
-        let part = next_part_number(&session_directory, process_id)?;
-        let path = part_path(&session_directory, process_id, part);
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let bytes_written = file.metadata()?.len();
+        if session_directory.parent() != Some(root_directory.as_path()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "diagnostic session is not a direct child of its root",
+            ));
+        }
+        let root = SecureDirectory::open_absolute(&root_directory)?;
+        let session_name = session_directory.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "session name is missing")
+        })?;
+        let session = root.open_directory(session_name)?;
+        let high_integrity = process_is_elevated().unwrap_or(false);
+        let part = 0;
+        let file = session.create_file(
+            OsStr::new(&part_file_name(process_id, part)),
+            FILE_SHARE_READ,
+            high_integrity,
+        )?;
         Ok(Self {
             file,
-            root_directory,
-            session_directory,
+            root_directory: root,
+            session_directory: session,
+            high_integrity,
             process_id,
             part,
-            bytes_written,
+            bytes_written: 0,
         })
     }
 
@@ -897,12 +916,16 @@ impl FileSink {
         self.file.sync_data()?;
         let root_budget_before_next_part =
             LOG_ROOT_LIMIT_BYTES.saturating_sub(LOG_PART_LIMIT_BYTES);
-        cleanup_retention_with_limit(
+        cleanup_retention_in(
             &self.root_directory,
-            Some(&self.session_directory),
+            self.session_directory.path().file_name(),
             root_budget_before_next_part,
-        )?;
-        if directory_size(&self.root_directory)? > root_budget_before_next_part {
+        )
+        .map_err(|error| io::Error::new(error.kind(), format!("rotation retention: {error}")))?;
+        if directory_size_in(&self.root_directory)
+            .map_err(|error| io::Error::new(error.kind(), format!("rotation sizing: {error}")))?
+            > root_budget_before_next_part
+        {
             return Err(io::Error::other(
                 "the diagnostic log root cannot reserve another part within the 200 MiB limit",
             ));
@@ -911,11 +934,19 @@ impl FileSink {
             .part
             .checked_add(1)
             .ok_or_else(|| io::Error::other("diagnostic log part number overflow"))?;
-        let path = part_path(&self.session_directory, self.process_id, self.part);
-        self.file = OpenOptions::new()
-            .create_new(true)
-            .append(true)
-            .open(path)?;
+        self.file = self
+            .session_directory
+            .create_file(
+                OsStr::new(&part_file_name(self.process_id, self.part)),
+                FILE_SHARE_READ,
+                self.high_integrity,
+            )
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("creating rotated diagnostic part: {error}"),
+                )
+            })?;
         self.bytes_written = 0;
         Ok(())
     }
@@ -1080,7 +1111,7 @@ pub(crate) fn export_bundle(destination: &Path) -> Result<(), String> {
         .ok_or_else(|| "no diagnostic log root is available".to_string())?;
     let export_sessions =
         select_export_sessions(root_directory, session_directory).map_err(io_error)?;
-    let export_files = collect_export_files(&export_sessions).map_err(io_error)?;
+    let mut export_files = collect_export_files(&export_sessions).map_err(io_error)?;
     let executable_hash =
         executable_sha256().unwrap_or_else(|error| format!("unavailable: {error}"));
     let current_status = status();
@@ -1089,16 +1120,13 @@ pub(crate) fn export_bundle(destination: &Path) -> Result<(), String> {
         .sensitive_ever_enabled
         .load(Ordering::Acquire);
     let contains_dump = export_files.iter().any(|file| {
-        file.source
+        Path::new(&file.file_name)
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("dmp"))
     });
-    let contains_crash_record = export_files.iter().any(|file| {
-        file.source
-            .file_name()
-            .and_then(OsStr::to_str)
-            .is_some_and(|name| name.ends_with(".crash.json"))
-    });
+    let contains_crash_record = export_files
+        .iter()
+        .any(|file| file.file_name.ends_with(".crash.json"));
     let (created_utc, _) = utc_timestamp();
     let environment_manifest = runtime_environment_manifest();
     let manifest = json!({
@@ -1121,7 +1149,7 @@ pub(crate) fn export_bundle(destination: &Path) -> Result<(), String> {
             "dropped_events_total": current_status.dropped_events,
         },
         "environment": environment_manifest,
-        "sessions": export_sessions.iter().filter_map(|path| path.file_name()).map(|name| name.to_string_lossy()).collect::<Vec<_>>(),
+        "sessions": export_sessions.iter().map(|session| session.name.as_str()).collect::<Vec<_>>(),
         "privacy_notice": "Process memory dumps and logs collected with sensitive mode may contain private information. No data is uploaded automatically."
     });
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
@@ -1143,9 +1171,12 @@ pub(crate) fn export_bundle(destination: &Path) -> Result<(), String> {
         executable_hash,
     );
 
-    let temporary = temporary_bundle_path(destination);
+    let (destination_directory, destination_name) =
+        open_export_destination(destination).map_err(io_error)?;
+    let (mut temporary, temporary_name) =
+        create_temporary_bundle(&destination_directory).map_err(io_error)?;
     let result = (|| -> Result<(), String> {
-        let mut archive = StoredZipWriter::create(&temporary).map_err(io_error)?;
+        let mut archive = StoredZipWriter::from_file(&mut temporary);
         archive
             .add_bytes("manifest.json", &manifest_bytes)
             .map_err(io_error)?;
@@ -1155,16 +1186,17 @@ pub(crate) fn export_bundle(destination: &Path) -> Result<(), String> {
         archive
             .add_bytes("environment.json", &environment_bytes)
             .map_err(io_error)?;
-        for export in &export_files {
+        for export in &mut export_files {
             archive
-                .add_file_prefix(&export.archive_name, &export.source, export.length)
+                .add_open_file_prefix(&export.archive_name, &mut export.source, export.length)
                 .map_err(io_error)?;
         }
         archive.finish().map_err(io_error)?;
-        replace_bundle_file(&temporary, destination).map_err(io_error)
+        rename_within_directory(&temporary, &destination_directory, &destination_name, true)
+            .map_err(io_error)
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        let _ = mark_delete(&temporary);
     } else {
         event(
             Level::Info,
@@ -1175,31 +1207,92 @@ pub(crate) fn export_bundle(destination: &Path) -> Result<(), String> {
                 Field::sensitive_text("destination", destination.to_string_lossy()),
                 Field::unsigned("file_count", export_files.len() as u64),
                 Field::boolean("contains_minidump", contains_dump),
+                Field::text("temporary_name", temporary_name.to_string_lossy()),
             ],
         );
     }
     result
 }
 
-#[derive(Debug)]
+/// Atomically writes one user-requested diagnostic attachment without following a pathname after
+/// validation. The destination is never overwritten: callers must choose a fresh attachment name.
+pub(crate) fn write_secure_attachment(destination: &Path, contents: &[u8]) -> io::Result<()> {
+    let (destination_directory, destination_name) = open_export_destination(destination)?;
+    let (mut temporary, _) = create_temporary_bundle(&destination_directory)?;
+    let result = (|| {
+        temporary.write_all(contents)?;
+        temporary.sync_all()?;
+        rename_within_directory(&temporary, &destination_directory, &destination_name, false)
+    })();
+    if result.is_err() {
+        let _ = mark_delete(&temporary);
+    }
+    result
+}
+
 struct ExportFile {
-    source: PathBuf,
+    source: File,
+    file_name: String,
     archive_name: String,
     length: u64,
 }
 
-fn select_export_sessions(root: &Path, current: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut sessions = vec![current.to_path_buf()];
-    let mut crashed = fs::read_dir(root)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir() && path != current)
-        .filter(|path| directory_contains_crash(path))
-        .filter_map(|path| {
-            let modified = path.metadata().ok()?.modified().ok()?;
-            Some((modified, path))
-        })
-        .collect::<Vec<_>>();
+struct ExportSession {
+    name: String,
+    directory: SecureDirectory,
+}
+
+fn select_export_sessions(root: &Path, current: &Path) -> io::Result<Vec<ExportSession>> {
+    if current.parent() != Some(root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "current diagnostic session is not a direct child of its root",
+        ));
+    }
+    let current_name = current
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "session name is invalid"))?
+        .to_string();
+    let root = SecureDirectory::open_absolute(root)?;
+    let current_directory = root.open_directory(OsStr::new(&current_name))?;
+    let mut sessions = vec![ExportSession {
+        name: current_name.clone(),
+        directory: current_directory,
+    }];
+    let mut crashed = Vec::new();
+    for entry in root.entries()? {
+        let Some(name) = entry
+            .name
+            .to_str()
+            .filter(|name| name.starts_with("session-"))
+        else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case(&current_name) {
+            continue;
+        }
+        if entry.attributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+            || entry.attributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY
+                == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "diagnostic export encountered an untrusted session entry",
+            ));
+        }
+        let directory = root.open_directory(&entry.name)?;
+        if directory_contains_crash(&directory)? {
+            crashed.push((
+                entry.last_write_time,
+                ExportSession {
+                    name: name.to_string(),
+                    directory,
+                },
+            ));
+        }
+    }
     crashed.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     if let Some((_, previous_crash)) = crashed.into_iter().next() {
         sessions.push(previous_crash);
@@ -1207,29 +1300,34 @@ fn select_export_sessions(root: &Path, current: &Path) -> io::Result<Vec<PathBuf
     Ok(sessions)
 }
 
-fn collect_export_files(sessions: &[PathBuf]) -> io::Result<Vec<ExportFile>> {
+fn collect_export_files(sessions: &[ExportSession]) -> io::Result<Vec<ExportFile>> {
     let mut files = Vec::new();
     for session in sessions {
-        let Some(session_name) = session.file_name().and_then(OsStr::to_str) else {
-            continue;
-        };
-        for entry in fs::read_dir(session)? {
-            let entry = entry?;
-            let source = entry.path();
-            if !source.is_file() || !allowed_export_file(&source) {
+        for entry in session.directory.entries()? {
+            if entry.attributes
+                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+                != 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "diagnostic export refused to follow a reparse point",
+                ));
+            }
+            if entry.attributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY
+                != 0
+                || !allowed_export_file(&entry.name)
+            {
                 continue;
             }
-            let Some(file_name) = source
-                .file_name()
-                .and_then(OsStr::to_str)
-                .map(ToOwned::to_owned)
-            else {
+            let Some(file_name) = entry.name.to_str().map(ToOwned::to_owned) else {
                 continue;
             };
+            let source = session.directory.open_file(&entry.name)?;
             let length = source.metadata()?.len();
             files.push(ExportFile {
                 source,
-                archive_name: format!("sessions/{session_name}/{file_name}"),
+                file_name: file_name.clone(),
+                archive_name: format!("sessions/{}/{file_name}", session.name),
                 length,
             });
         }
@@ -1238,8 +1336,9 @@ fn collect_export_files(sessions: &[PathBuf]) -> io::Result<Vec<ExportFile>> {
     Ok(files)
 }
 
-fn allowed_export_file(path: &Path) -> bool {
-    path.extension()
+fn allowed_export_file(name: &OsStr) -> bool {
+    Path::new(name)
+        .extension()
         .and_then(OsStr::to_str)
         .is_some_and(|extension| {
             extension.eq_ignore_ascii_case("jsonl")
@@ -1248,18 +1347,33 @@ fn allowed_export_file(path: &Path) -> bool {
         })
 }
 
-fn directory_contains_crash(path: &Path) -> bool {
-    fs::read_dir(path).is_ok_and(|entries| {
-        entries.filter_map(Result::ok).any(|entry| {
-            let path = entry.path();
-            path.extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("dmp"))
-                || path
-                    .file_name()
-                    .and_then(OsStr::to_str)
-                    .is_some_and(|name| name.ends_with(".crash.json"))
-        })
-    })
+fn directory_contains_crash(directory: &SecureDirectory) -> io::Result<bool> {
+    for entry in directory.entries()? {
+        if entry.attributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "crash artifact discovery refused a reparse point",
+            ));
+        }
+        if entry.attributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY != 0
+        {
+            continue;
+        }
+        let path = Path::new(&entry.name);
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("dmp"))
+            || entry
+                .name
+                .to_str()
+                .is_some_and(|name| name.ends_with(".crash.json"))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn export_contains_crash_artifact() -> bool {
@@ -1275,7 +1389,7 @@ pub(crate) fn export_contains_crash_artifact() -> bool {
     select_export_sessions(root, current).is_ok_and(|sessions| {
         sessions
             .iter()
-            .any(|session| directory_contains_crash(session))
+            .any(|session| directory_contains_crash(&session.directory).unwrap_or(false))
     })
 }
 
@@ -1411,7 +1525,7 @@ fn quote_windows_argument(argument: &OsStr, output: &mut Vec<u16>) {
 }
 
 fn prepare_directories(
-    config: &DiagnosticConfig,
+    config: &mut DiagnosticConfig,
     errors: &mut Vec<String>,
 ) -> (Option<PathBuf>, Option<PathBuf>) {
     let default_root = env::var_os("LOCALAPPDATA")
@@ -1427,126 +1541,208 @@ fn prepare_directories(
 }
 
 fn prepare_directories_from_candidates(
-    config: &DiagnosticConfig,
+    config: &mut DiagnosticConfig,
     errors: &mut Vec<String>,
     candidates: impl IntoIterator<Item = PathBuf>,
 ) -> (Option<PathBuf>, Option<PathBuf>) {
     for root in candidates {
-        if let Err(error) = fs::create_dir_all(&root) {
-            errors.push(format!(
-                "unable to create diagnostic root {}: {error}",
-                root.display()
-            ));
-            continue;
-        }
-        if let Err(error) = cleanup_retention(&root, None) {
+        let root_handle = match SecureDirectory::open_or_create_absolute(&root) {
+            Ok(root) => root,
+            Err(error) => {
+                errors.push(format!(
+                    "unable to securely create diagnostic root {}: {error}",
+                    root.display()
+                ));
+                continue;
+            }
+        };
+        if let Err(error) = cleanup_retention_in(&root_handle, None, LOG_ROOT_LIMIT_BYTES) {
             errors.push(format!(
                 "unable to apply diagnostic retention in {}: {error}",
                 root.display()
             ));
         }
-        let session = root.join(&config.session_id);
-        match fs::create_dir_all(&session) {
-            Ok(()) => {
-                if let Err(error) = cleanup_retention_with_limit(
-                    &root,
-                    Some(&session),
-                    LOG_ROOT_LIMIT_BYTES.saturating_sub(LOG_PART_LIMIT_BYTES),
-                ) {
-                    errors.push(format!(
-                        "unable to finalize diagnostic retention in {}: {error}",
-                        root.display()
-                    ));
+        let high_integrity = process_is_elevated().unwrap_or(false);
+        let mut session_id = config.session_id.clone();
+        let mut session_handle = None;
+        for _ in 0..16 {
+            match root_handle.create_directory(OsStr::new(&session_id), high_integrity) {
+                Ok(session) => {
+                    session_handle = Some(session);
+                    break;
                 }
-                return (Some(root), Some(session));
+                Err(error) if is_name_collision(&error) => {
+                    session_id = generate_session_id();
+                }
+                Err(error) => {
+                    errors.push(format!(
+                        "unable to securely create diagnostic session {}: {error}",
+                        root.join(&session_id).display()
+                    ));
+                    break;
+                }
             }
-            Err(error) => errors.push(format!(
-                "unable to create diagnostic session {}: {error}",
-                session.display()
-            )),
         }
+        let Some(session_handle) = session_handle else {
+            errors.push(format!(
+                "unable to allocate an exclusive diagnostic session in {}",
+                root.display()
+            ));
+            continue;
+        };
+        config.session_id = session_id;
+        if let Err(error) = cleanup_retention_in(
+            &root_handle,
+            session_handle.path().file_name(),
+            LOG_ROOT_LIMIT_BYTES.saturating_sub(LOG_PART_LIMIT_BYTES),
+        ) {
+            errors.push(format!(
+                "unable to finalize diagnostic retention in {}: {error}",
+                root.display()
+            ));
+        }
+        return (Some(root), Some(session_handle.path().to_path_buf()));
     }
     (None, None)
 }
 
+#[cfg(test)]
 fn cleanup_retention(root: &Path, active_session: Option<&Path>) -> io::Result<()> {
     cleanup_retention_with_limit(root, active_session, LOG_ROOT_LIMIT_BYTES)
 }
 
+#[cfg(test)]
 fn cleanup_retention_with_limit(
     root: &Path,
     active_session: Option<&Path>,
     byte_limit: u64,
 ) -> io::Result<()> {
-    let mut sessions = fs::read_dir(root)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_dir()
-                && path
-                    .file_name()
-                    .and_then(OsStr::to_str)
-                    .is_some_and(|name| name.starts_with("session-"))
-        })
-        .filter_map(|path| {
-            let metadata = path.metadata().ok()?;
-            let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
-            let size = directory_size(&path).ok()?;
-            Some((modified, size, path))
-        })
-        .collect::<Vec<_>>();
+    if active_session.is_some_and(|active| active.parent() != Some(root)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "active diagnostic session is not a child of the retention root",
+        ));
+    }
+    let root_handle = SecureDirectory::open_absolute(root)?;
+    cleanup_retention_in(
+        &root_handle,
+        active_session.and_then(Path::file_name),
+        byte_limit,
+    )
+}
+
+fn cleanup_retention_in(
+    root: &SecureDirectory,
+    active_session: Option<&OsStr>,
+    byte_limit: u64,
+) -> io::Result<()> {
+    let mut sessions = Vec::new();
+    for entry in root.entries()? {
+        let Some(name) = entry
+            .name
+            .to_str()
+            .filter(|name| name.starts_with("session-"))
+        else {
+            continue;
+        };
+        if entry.attributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+            || entry.attributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY
+                == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "diagnostic session entry is not a trusted directory",
+            ));
+        }
+        let session = root.open_directory(&entry.name)?;
+        let size = directory_size_in(&session)?;
+        sessions.push((entry.last_write_time, size, OsString::from(name)));
+    }
     sessions.sort_by_key(|entry| entry.0);
     let mut total = sessions.iter().map(|entry| entry.1).sum::<u64>();
     let mut remaining = sessions.len();
-    for (_, size, path) in sessions {
+    for (_, size, name) in sessions {
         if remaining <= LOG_SESSION_LIMIT && total <= byte_limit {
             break;
         }
-        if active_session.is_some_and(|active| active == path) {
+        if active_session.is_some_and(|active| os_names_equal(active, &name)) {
             continue;
         }
-        fs::remove_dir_all(&path)?;
+        delete_directory_child(root, &name)?;
         total = total.saturating_sub(size);
         remaining = remaining.saturating_sub(1);
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn directory_size(path: &Path) -> io::Result<u64> {
+    let directory = SecureDirectory::open_absolute(path)?;
+    directory_size_in(&directory)
+}
+
+fn directory_size_in(directory: &SecureDirectory) -> io::Result<u64> {
     let mut total = 0u64;
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            total = total.saturating_add(directory_size(&entry.path())?);
-        } else if metadata.is_file() {
-            total = total.saturating_add(metadata.len());
+    for entry in directory.entries()? {
+        if entry.attributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "diagnostic retention encountered a reparse point",
+            ));
+        }
+        if entry.attributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY != 0
+        {
+            let child = directory.open_directory(&entry.name)?;
+            total = total.saturating_add(directory_size_in(&child)?);
+        } else {
+            let file = directory.open_file(&entry.name)?;
+            total = total.saturating_add(file.metadata()?.len());
         }
     }
     Ok(total)
 }
 
-fn next_part_number(session: &Path, process_id: u32) -> io::Result<u32> {
-    let prefix = format!("taskmgr-{process_id}-");
-    let mut next = 0u32;
-    for entry in fs::read_dir(session)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let Some(part) = name
-            .strip_prefix(&prefix)
-            .and_then(|value| value.strip_suffix(".jsonl"))
-            .and_then(|value| value.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        next = next.max(part.saturating_add(1));
+fn delete_directory_child(parent: &SecureDirectory, name: &OsStr) -> io::Result<()> {
+    let directory = parent.open_directory_for_delete(name)?;
+    for entry in directory.entries()? {
+        if entry.attributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "diagnostic retention refused to delete through a reparse point",
+            ));
+        }
+        if entry.attributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY != 0
+        {
+            delete_directory_child(&directory, &entry.name)?;
+        } else {
+            let file = directory.open_file_for_delete(&entry.name)?;
+            mark_delete(&file)?;
+        }
     }
-    Ok(next)
+    directory.delete_empty()
 }
 
+fn is_name_collision(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(80) | Some(183))
+}
+
+fn os_names_equal(left: &OsStr, right: &OsStr) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+fn part_file_name(process_id: u32, part: u32) -> String {
+    format!("taskmgr-{process_id}-{part:04}.jsonl")
+}
+
+#[cfg(test)]
 fn part_path(session: &Path, process_id: u32, part: u32) -> PathBuf {
-    session.join(format!("taskmgr-{process_id}-{part:04}.jsonl"))
+    session.join(part_file_name(process_id, part))
 }
 
 fn valid_session_id(value: &str) -> bool {
@@ -1558,6 +1754,15 @@ fn valid_session_id(value: &str) -> bool {
 }
 
 fn generate_session_id() -> String {
+    let mut random = [0u8; 16];
+    if random_bytes(&mut random).is_ok() {
+        let mut session = String::from("session-");
+        for byte in random {
+            use std::fmt::Write as _;
+            write!(session, "{byte:02x}").expect("writing into String cannot fail");
+        }
+        return session;
+    }
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1700,7 +1905,7 @@ fn record_runtime_environment() {
     );
 }
 
-fn runtime_environment_manifest() -> Value {
+pub(crate) fn runtime_environment_manifest() -> Value {
     let windows = windows_runtime_version();
     let wow64 = wow64_status();
     let administrator = process_is_elevated();
@@ -1785,38 +1990,47 @@ fn executable_sha256() -> Result<String, String> {
     Ok(output)
 }
 
-fn temporary_bundle_path(destination: &Path) -> PathBuf {
-    let file_name = destination
+fn open_export_destination(destination: &Path) -> io::Result<(SecureDirectory, OsString)> {
+    if !destination.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "diagnostic export destination must be absolute",
+        ));
+    }
+    let name = destination
         .file_name()
-        .and_then(OsStr::to_str)
-        .unwrap_or("taskmgr-rs-diagnostics.zip");
-    destination.with_file_name(format!(".{file_name}.{}.tmp", process::id()))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination name is missing"))?
+        .to_os_string();
+    let parent = destination.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination directory is missing",
+        )
+    })?;
+    Ok((SecureDirectory::open_absolute(parent)?, name))
 }
 
-fn replace_bundle_file(source: &Path, destination: &Path) -> io::Result<()> {
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    // Safety: both paths are NUL-terminated and remain alive for the synchronous rename.
-    if unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
+fn create_temporary_bundle(directory: &SecureDirectory) -> io::Result<(File, OsString)> {
+    for _ in 0..16 {
+        let mut random = [0u8; 16];
+        random_bytes(&mut random)?;
+        let mut name = String::from(".taskmgr-rs-export-");
+        for byte in random {
+            use std::fmt::Write as _;
+            write!(name, "{byte:02x}").expect("writing into String cannot fail");
+        }
+        name.push_str(".tmp");
+        let name = OsString::from(name);
+        match directory.create_user_attachment_file(&name, 0) {
+            Ok(file) => return Ok((file, name)),
+            Err(error) if is_name_collision(&error) => continue,
+            Err(error) => return Err(error),
+        }
     }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "unable to allocate a unique diagnostic export file",
+    ))
 }
 
 fn io_error(error: io::Error) -> String {
@@ -1832,6 +2046,7 @@ fn sampling_fault_requested(level: Level) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::fs::{symlink_dir, symlink_file};
 
     static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1866,6 +2081,22 @@ mod tests {
             "taskmgr-rs-diagnostics-test-{label}-{}-{sequence}",
             process::id()
         ))
+    }
+
+    fn create_test_directory_link(link: &Path, target: &Path) -> bool {
+        match symlink_dir(target, link) {
+            Ok(()) => true,
+            Err(error) if matches!(error.raw_os_error(), Some(5) | Some(1314)) => false,
+            Err(error) => panic!("directory symlink fixture should be created: {error}"),
+        }
+    }
+
+    fn create_test_file_link(link: &Path, target: &Path) -> bool {
+        match symlink_file(target, link) {
+            Ok(()) => true,
+            Err(error) if matches!(error.raw_os_error(), Some(5) | Some(1314)) => false,
+            Err(error) => panic!("file symlink fixture should be created: {error}"),
+        }
     }
 
     #[test]
@@ -2222,7 +2453,7 @@ mod tests {
         let blocked = outer.join("blocked");
         fs::write(&blocked, b"not a directory").expect("blocking file should be created");
         let fallback = outer.join("fallback");
-        let config = DiagnosticConfig {
+        let mut config = DiagnosticConfig {
             level: Level::Info,
             sensitive: false,
             minidump: false,
@@ -2231,8 +2462,11 @@ mod tests {
             parse_warnings: Vec::new(),
         };
         let mut errors = Vec::new();
-        let (root, session) =
-            prepare_directories_from_candidates(&config, &mut errors, [blocked, fallback.clone()]);
+        let (root, session) = prepare_directories_from_candidates(
+            &mut config,
+            &mut errors,
+            [blocked, fallback.clone()],
+        );
         let expected_session = fallback.join("session-fallback");
         assert_eq!(root.as_deref(), Some(fallback.as_path()));
         assert_eq!(session.as_deref(), Some(expected_session.as_path()));
@@ -2255,7 +2489,12 @@ mod tests {
         ] {
             fs::write(session.join(name), name).expect("fixture should be written");
         }
-        let files = collect_export_files(&[session]).expect("files should be collected");
+        let export_session = ExportSession {
+            name: "session-bundle".to_string(),
+            directory: SecureDirectory::open_absolute(&session)
+                .expect("session should open securely"),
+        };
+        let files = collect_export_files(&[export_session]).expect("files should be collected");
         let names = files
             .iter()
             .map(|file| file.archive_name.as_str())
@@ -2268,7 +2507,234 @@ mod tests {
                 "sessions/session-bundle/taskmgr-1-0000.jsonl",
             ]
         );
+        drop(files);
         fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn secure_root_rejects_a_directory_reparse_point() {
+        let outer = temporary_test_directory("root-reparse");
+        let target = outer.join("target");
+        let redirected = outer.join("redirected");
+        fs::create_dir_all(&target).expect("target should be created");
+        if !create_test_directory_link(&redirected, &target) {
+            fs::remove_dir_all(outer).expect("unsupported fixture should be removable");
+            return;
+        }
+
+        let error = SecureDirectory::open_or_create_absolute(&redirected)
+            .err()
+            .expect("redirected root must be rejected");
+        assert!(
+            error.to_string().contains("reparse"),
+            "unexpected error: {error}"
+        );
+
+        fs::remove_dir(&redirected).expect("directory link should be removable");
+        fs::remove_dir_all(outer).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn redirected_session_is_not_reused_and_its_target_is_untouched() {
+        let outer = temporary_test_directory("session-reparse");
+        let root = outer.join("root");
+        let target = outer.join("target");
+        let requested = root.join("session-requested");
+        fs::create_dir_all(&root).expect("root should be created");
+        fs::create_dir_all(&target).expect("target should be created");
+        fs::write(target.join("sentinel"), b"unchanged").expect("sentinel should be written");
+        if !create_test_directory_link(&requested, &target) {
+            fs::remove_dir_all(outer).expect("unsupported fixture should be removable");
+            return;
+        }
+        let mut config = DiagnosticConfig {
+            level: Level::Info,
+            sensitive: false,
+            minidump: false,
+            root_override: None,
+            session_id: "session-requested".to_string(),
+            parse_warnings: Vec::new(),
+        };
+        let mut errors = Vec::new();
+
+        let (_, session) =
+            prepare_directories_from_candidates(&mut config, &mut errors, [root.clone()]);
+        let session = session.expect("a fresh exclusive session should be created");
+        assert_ne!(session, requested);
+        assert_eq!(
+            fs::read(target.join("sentinel")).expect("sentinel should remain"),
+            b"unchanged"
+        );
+
+        fs::remove_dir(&session).expect("fresh session should be removable");
+        fs::remove_dir(&requested).expect("directory link should be removable");
+        fs::remove_dir_all(outer).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn precreated_log_part_is_never_opened_or_truncated() {
+        let root = temporary_test_directory("precreated-part");
+        let session = root.join("session-precreated");
+        fs::create_dir_all(&session).expect("session should be created");
+        let part = part_path(&session, 42, 0);
+        fs::write(&part, b"attacker-owned").expect("precreated part should be written");
+
+        assert!(
+            FileSink::open(root.clone(), session, 42).is_err(),
+            "exclusive log creation must reject an existing name"
+        );
+        assert_eq!(
+            fs::read(&part).expect("precreated part should remain readable"),
+            b"attacker-owned"
+        );
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn retention_refuses_a_redirected_session_without_touching_its_target() {
+        let outer = temporary_test_directory("retention-reparse");
+        let root = outer.join("root");
+        let target = outer.join("target");
+        let redirected = root.join("session-redirected");
+        fs::create_dir_all(&root).expect("root should be created");
+        fs::create_dir_all(&target).expect("target should be created");
+        fs::write(target.join("sentinel"), b"unchanged").expect("sentinel should be written");
+        if !create_test_directory_link(&redirected, &target) {
+            fs::remove_dir_all(outer).expect("unsupported fixture should be removable");
+            return;
+        }
+
+        assert!(
+            cleanup_retention_with_limit(&root, None, 0).is_err(),
+            "retention must reject a redirected session"
+        );
+        assert_eq!(
+            fs::read(target.join("sentinel")).expect("sentinel should remain"),
+            b"unchanged"
+        );
+
+        fs::remove_dir(&redirected).expect("directory link should be removable");
+        fs::remove_dir_all(outer).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn export_rejects_file_reparse_points_and_hard_links() {
+        let outer = temporary_test_directory("export-source-links");
+        let session_path = outer.join("session-links");
+        let outside = outer.join("outside.json");
+        fs::create_dir_all(&session_path).expect("session should be created");
+        fs::write(&outside, b"outside").expect("outside file should be written");
+        let hard_link = session_path.join("hard-link.json");
+        fs::hard_link(&outside, &hard_link).expect("hard-link fixture should be created");
+        let session = ExportSession {
+            name: "session-links".to_string(),
+            directory: SecureDirectory::open_absolute(&session_path)
+                .expect("session should open securely"),
+        };
+        assert!(
+            collect_export_files(&[session]).is_err(),
+            "hard-linked source must be rejected"
+        );
+        fs::remove_file(&hard_link).expect("hard link should be removable");
+
+        let file_link = session_path.join("file-link.json");
+        if create_test_file_link(&file_link, &outside) {
+            let session = ExportSession {
+                name: "session-links".to_string(),
+                directory: SecureDirectory::open_absolute(&session_path)
+                    .expect("session should open securely"),
+            };
+            assert!(
+                collect_export_files(&[session]).is_err(),
+                "file reparse point must be rejected"
+            );
+            fs::remove_file(&file_link).expect("file link should be removable");
+        }
+        assert_eq!(
+            fs::read(&outside).expect("outside file should remain"),
+            b"outside"
+        );
+        fs::remove_dir_all(outer).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn export_temp_files_are_random_exclusive_and_rename_by_directory_handle() {
+        let root = temporary_test_directory("export-temp");
+        fs::create_dir_all(&root).expect("destination directory should be created");
+        let directory =
+            SecureDirectory::open_absolute(&root).expect("destination should open securely");
+        let precreated = root.join("precreated.tmp");
+        fs::write(&precreated, b"unchanged").expect("precreated file should be written");
+        assert!(
+            directory
+                .create_user_attachment_file(OsStr::new("precreated.tmp"), 0)
+                .is_err(),
+            "exclusive creation must reject a precreated file"
+        );
+        assert_eq!(
+            fs::read(&precreated).expect("precreated file should remain"),
+            b"unchanged"
+        );
+
+        let (mut first, first_name) =
+            create_temporary_bundle(&directory).expect("first temp should be created");
+        let (second, second_name) =
+            create_temporary_bundle(&directory).expect("second temp should be created");
+        assert_ne!(first_name, second_name);
+        assert!(
+            fs::remove_file(root.join(&first_name)).is_err(),
+            "an open no-share temp cannot be replaced by pathname"
+        );
+        first
+            .write_all(b"new bundle")
+            .expect("temp should be writable");
+        first.sync_all().expect("temp should flush");
+        mark_delete(&second).expect("unused temp should be marked for deletion");
+        drop(second);
+
+        let destination = root.join("bundle.zip");
+        fs::write(&destination, b"old bundle").expect("destination should be precreated");
+        assert!(
+            rename_within_directory(&first, &directory, OsStr::new("bundle.zip"), false).is_err(),
+            "a no-replace rename must reject an existing destination"
+        );
+        assert_eq!(
+            fs::read(&destination).expect("existing destination should remain readable"),
+            b"old bundle"
+        );
+        rename_within_directory(&first, &directory, OsStr::new("bundle.zip"), true)
+            .expect("handle-relative replace should succeed");
+        drop(first);
+        drop(directory);
+        assert_eq!(
+            fs::read(&destination).expect("destination should be readable"),
+            b"new bundle"
+        );
+
+        fs::remove_file(precreated).expect("precreated fixture should be removable");
+        fs::remove_file(destination).expect("destination should be removable");
+        fs::remove_dir(root).expect("destination directory should be removable");
+    }
+
+    #[test]
+    fn export_destination_rejects_a_redirected_parent() {
+        let outer = temporary_test_directory("export-parent-reparse");
+        let target = outer.join("target");
+        let redirected = outer.join("redirected");
+        fs::create_dir_all(&target).expect("target should be created");
+        if !create_test_directory_link(&redirected, &target) {
+            fs::remove_dir_all(outer).expect("unsupported fixture should be removable");
+            return;
+        }
+
+        assert!(
+            open_export_destination(&redirected.join("bundle.zip")).is_err(),
+            "redirected export parent must be rejected"
+        );
+
+        fs::remove_dir(&redirected).expect("directory link should be removable");
+        fs::remove_dir_all(outer).expect("test directory should be removable");
     }
 
     #[test]

@@ -16,6 +16,10 @@
 
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::Arc,
+};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use windows_sys::Win32::Foundation::{
@@ -33,6 +37,8 @@ enum WorkerCommand<Request> {
         operation_id: u64,
     },
     Shutdown,
+    #[cfg(test)]
+    Disconnect,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -41,9 +47,20 @@ pub(crate) struct CorrelatedCompletion<Completion> {
     pub(crate) value: Completion,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum WorkerEvent<Completion> {
+    Completed(CorrelatedCompletion<Completion>),
+    CollectorPanicked { operation_id: u64 },
+}
+
+struct SubmitError<Request> {
+    code: u32,
+    request: Request,
+}
+
 pub(crate) struct BackgroundWorker<Request, Completion> {
     command_sender: Sender<WorkerCommand<Request>>,
-    completion_receiver: Option<Receiver<CorrelatedCompletion<Completion>>>,
+    completion_receiver: Option<Receiver<WorkerEvent<Completion>>>,
     thread: Option<JoinHandle<()>>,
     name: String,
 }
@@ -53,30 +70,38 @@ where
     Request: Send + 'static,
     Completion: Send + 'static,
 {
+    #[cfg(test)]
     pub(crate) fn spawn<Collect>(
         thread_name: &str,
         completion_message: u32,
         collect: Collect,
     ) -> Result<Self, u32>
     where
-        Collect: FnMut(Request) -> Completion + Send + 'static,
+        Collect: Fn(Request) -> Completion + Send + Sync + 'static,
     {
-        Self::spawn_initialized(thread_name, completion_message, move || collect)
+        let collect = Arc::new(collect);
+        Self::spawn_initialized(
+            thread_name,
+            completion_message,
+            Arc::new(move || {
+                let collect = Arc::clone(&collect);
+                move |request| collect(request)
+            }),
+        )
     }
 
     /// Constructs collector state on the worker thread before receiving requests.
-    pub(crate) fn spawn_initialized<Initialize, Collect>(
+    fn spawn_initialized<Initialize, Collect>(
         thread_name: &str,
         completion_message: u32,
-        initialize: Initialize,
+        initialize: Arc<Initialize>,
     ) -> Result<Self, u32>
     where
-        Initialize: FnOnce() -> Collect + Send + 'static,
+        Initialize: Fn() -> Collect + Send + Sync + 'static,
         Collect: FnMut(Request) -> Completion + 'static,
     {
         let (command_sender, command_receiver) = bounded::<WorkerCommand<Request>>(1);
-        let (completion_sender, completion_receiver) =
-            bounded::<CorrelatedCompletion<Completion>>(1);
+        let (completion_sender, completion_receiver) = bounded::<WorkerEvent<Completion>>(1);
         let name = thread_name.to_string();
         let worker_name = name.clone();
         let thread = thread::Builder::new()
@@ -89,7 +114,8 @@ where
                     "background worker started",
                     &[Field::text("worker", &worker_name)],
                 );
-                let mut collect = initialize();
+                let mut collect = None;
+                let mut restarting = false;
                 while let Ok(command) = command_receiver.recv() {
                     match command {
                         WorkerCommand::Run {
@@ -107,26 +133,59 @@ where
                                 None,
                                 &[Field::text("worker", &worker_name)],
                             );
-                            let completion =
-                                diagnostics::with_operation_id(operation_id, || collect(request));
+                            let completion = catch_unwind(AssertUnwindSafe(|| {
+                                let collect = collect.get_or_insert_with(|| {
+                                    let initialized = initialize();
+                                    if restarting {
+                                        diagnostics::event_with(
+                                            Level::Info,
+                                            "worker.collector_restarted",
+                                            "worker",
+                                            "background worker collector restarted after a panic",
+                                            Some(operation_id),
+                                            None,
+                                            &[Field::text("worker", &worker_name)],
+                                        );
+                                    }
+                                    initialized
+                                });
+                                diagnostics::with_operation_id(operation_id, || collect(request))
+                            }));
                             let duration_ms =
                                 u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                            diagnostics::event_with(
-                                Level::Trace,
-                                "worker.request_completed",
-                                "worker",
-                                "background worker request completed",
-                                Some(operation_id),
-                                Some(duration_ms),
-                                &[Field::text("worker", &worker_name)],
-                            );
-                            if completion_sender
-                                .send(CorrelatedCompletion {
-                                    operation_id,
-                                    value: completion,
-                                })
-                                .is_err()
-                            {
+                            let event = match completion {
+                                Ok(value) => {
+                                    restarting = false;
+                                    diagnostics::event_with(
+                                        Level::Trace,
+                                        "worker.request_completed",
+                                        "worker",
+                                        "background worker request completed",
+                                        Some(operation_id),
+                                        Some(duration_ms),
+                                        &[Field::text("worker", &worker_name)],
+                                    );
+                                    WorkerEvent::Completed(CorrelatedCompletion {
+                                        operation_id,
+                                        value,
+                                    })
+                                }
+                                Err(_) => {
+                                    collect = None;
+                                    restarting = true;
+                                    diagnostics::event_with(
+                                        Level::Error,
+                                        "worker.collector_panicked",
+                                        "worker",
+                                        "background worker collector panicked; its state was discarded",
+                                        Some(operation_id),
+                                        Some(duration_ms),
+                                        &[Field::text("worker", &worker_name)],
+                                    );
+                                    WorkerEvent::CollectorPanicked { operation_id }
+                                }
+                            };
+                            if completion_sender.send(event).is_err() {
                                 break;
                             }
                             let notify_hwnd = notify_hwnd as HWND;
@@ -151,6 +210,8 @@ where
                             );
                             break;
                         }
+                        #[cfg(test)]
+                        WorkerCommand::Disconnect => break,
                     }
                 }
             })
@@ -164,9 +225,11 @@ where
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn submit(&self, request: Request, notify_hwnd: HWND) -> Result<u64, u32> {
         let operation_id = diagnostics::next_operation_id();
-        self.submit_with_operation_id(request, notify_hwnd, operation_id)?;
+        self.submit_with_operation_id(request, notify_hwnd, operation_id)
+            .map_err(|error| error.code)?;
         Ok(operation_id)
     }
 
@@ -175,14 +238,22 @@ where
         request: Request,
         notify_hwnd: HWND,
         operation_id: u64,
-    ) -> Result<(), u32> {
+    ) -> Result<(), SubmitError<Request>> {
         self.command_sender
             .send(WorkerCommand::Run {
                 request,
                 notify_hwnd: notify_hwnd as isize,
                 operation_id,
             })
-            .map_err(|_| ERROR_BROKEN_PIPE)?;
+            .map_err(|error| {
+                let WorkerCommand::Run { request, .. } = error.0 else {
+                    unreachable!("only a run command is submitted through this path");
+                };
+                SubmitError {
+                    code: ERROR_BROKEN_PIPE,
+                    request,
+                }
+            })?;
         let parent_operation_id = diagnostics::current_operation_id();
         let mut fields = vec![Field::text("worker", &self.name)];
         if let Some(parent_operation_id) =
@@ -202,15 +273,18 @@ where
         Ok(())
     }
 
-    pub(crate) fn try_recv(&self) -> Result<CorrelatedCompletion<Completion>, TryRecvError> {
+    fn try_recv(&self) -> Result<WorkerEvent<Completion>, TryRecvError> {
         self.completion_receiver
             .as_ref()
             .ok_or(TryRecvError::Disconnected)?
             .try_recv()
     }
 
-    fn name(&self) -> &str {
-        &self.name
+    #[cfg(test)]
+    fn disconnect(&self) {
+        self.command_sender
+            .send(WorkerCommand::Disconnect)
+            .expect("test worker should accept disconnect");
     }
 }
 
@@ -259,8 +333,13 @@ pub(crate) struct WorkerDrain<Completion> {
     pub(crate) error: Option<u32>,
 }
 
+type WorkerSpawner<Request, Completion> =
+    Box<dyn Fn() -> Result<BackgroundWorker<Request, Completion>, u32> + Send + Sync>;
+
 pub(crate) struct SingleFlightWorker<Request, Completion> {
-    worker: BackgroundWorker<Request, Completion>,
+    worker: Option<BackgroundWorker<Request, Completion>>,
+    restart: WorkerSpawner<Request, Completion>,
+    name: String,
     merge_pending: fn(&mut Request, Request),
     pending: Option<Request>,
     pending_operation_id: Option<u64>,
@@ -279,12 +358,13 @@ where
         collect: Collect,
     ) -> Result<Self, u32>
     where
-        Collect: FnMut(Request) -> Completion + Send + 'static,
+        Collect: Fn(Request) -> Completion + Send + Sync + 'static,
     {
-        Ok(Self::new(
-            BackgroundWorker::spawn(thread_name, completion_message, collect)?,
-            merge_pending,
-        ))
+        let collect = Arc::new(collect);
+        Self::spawn_initialized(thread_name, completion_message, merge_pending, move || {
+            let collect = Arc::clone(&collect);
+            move |request| collect(request)
+        })
     }
 
     pub(crate) fn spawn_initialized<Initialize, Collect>(
@@ -294,25 +374,86 @@ where
         initialize: Initialize,
     ) -> Result<Self, u32>
     where
-        Initialize: FnOnce() -> Collect + Send + 'static,
+        Initialize: Fn() -> Collect + Send + Sync + 'static,
         Collect: FnMut(Request) -> Completion + 'static,
     {
-        Ok(Self::new(
-            BackgroundWorker::spawn_initialized(thread_name, completion_message, initialize)?,
-            merge_pending,
-        ))
+        let initialize = Arc::new(initialize);
+        let name = thread_name.to_string();
+        let restart_name = name.clone();
+        let restart_initialize = Arc::clone(&initialize);
+        let restart: WorkerSpawner<Request, Completion> = Box::new(move || {
+            BackgroundWorker::spawn_initialized(
+                &restart_name,
+                completion_message,
+                Arc::clone(&restart_initialize),
+            )
+        });
+        let worker =
+            BackgroundWorker::spawn_initialized(thread_name, completion_message, initialize)?;
+        Ok(Self::new(worker, restart, name, merge_pending))
     }
 
     fn new(
         worker: BackgroundWorker<Request, Completion>,
+        restart: WorkerSpawner<Request, Completion>,
+        name: String,
         merge_pending: fn(&mut Request, Request),
     ) -> Self {
         Self {
-            worker,
+            worker: Some(worker),
+            restart,
+            name,
             merge_pending,
             pending: None,
             pending_operation_id: None,
             in_flight: false,
+        }
+    }
+
+    fn ensure_worker(&mut self) -> Result<(), u32> {
+        if self.worker.is_some() {
+            return Ok(());
+        }
+        self.worker = Some((self.restart)()?);
+        diagnostics::event(
+            Level::Info,
+            "worker.thread_restarted",
+            "worker",
+            "background worker thread restarted after channel disconnection",
+            &[Field::text("worker", &self.name)],
+        );
+        Ok(())
+    }
+
+    fn submit_request(
+        &mut self,
+        request: Request,
+        notify_hwnd: HWND,
+        operation_id: u64,
+    ) -> Result<(), SubmitError<Request>> {
+        if let Err(code) = self.ensure_worker() {
+            return Err(SubmitError { code, request });
+        }
+        let result = self
+            .worker
+            .as_ref()
+            .expect("worker was ensured")
+            .submit_with_operation_id(request, notify_hwnd, operation_id);
+        match result {
+            Ok(()) => Ok(()),
+            Err(first_error) => {
+                self.worker = None;
+                if let Err(code) = self.ensure_worker() {
+                    return Err(SubmitError {
+                        code,
+                        request: first_error.request,
+                    });
+                }
+                self.worker
+                    .as_ref()
+                    .expect("worker was restarted")
+                    .submit_with_operation_id(first_error.request, notify_hwnd, operation_id)
+            }
         }
     }
 
@@ -333,7 +474,7 @@ where
                 .pending_operation_id
                 .unwrap_or_else(diagnostics::next_operation_id);
             let mut fields = vec![
-                Field::text("worker", self.worker.name()),
+                Field::text("worker", &self.name),
                 Field::boolean("replaced_existing_pending", already_pending),
             ];
             if let Some(parent_operation_id) =
@@ -353,7 +494,9 @@ where
             return Ok(RequestDisposition::Coalesced(operation_id));
         }
 
-        let operation_id = self.worker.submit(request, notify_hwnd)?;
+        let operation_id = diagnostics::next_operation_id();
+        self.submit_request(request, notify_hwnd, operation_id)
+            .map_err(|error| error.code)?;
         self.in_flight = true;
         Ok(RequestDisposition::Submitted(operation_id))
     }
@@ -362,36 +505,55 @@ where
         let mut completions = Vec::new();
         let mut error = None;
         loop {
-            match self.worker.try_recv() {
-                Ok(completion) => {
+            let event = match self.worker.as_ref() {
+                Some(worker) => worker.try_recv(),
+                None => Err(TryRecvError::Disconnected),
+            };
+            match event {
+                Ok(WorkerEvent::Completed(completion)) => {
                     self.in_flight = false;
                     completions.push(completion);
+                }
+                Ok(WorkerEvent::CollectorPanicked { operation_id }) => {
+                    self.in_flight = false;
+                    error.get_or_insert(ERROR_GEN_FAILURE);
+                    diagnostics::event_with(
+                        Level::Warn,
+                        "worker.request_failed_after_panic",
+                        "worker",
+                        "background worker request failed after a collector panic",
+                        Some(operation_id),
+                        None,
+                        &[Field::text("worker", &self.name)],
+                    );
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.in_flight = false;
-                    self.pending = None;
-                    self.pending_operation_id = None;
-                    error = Some(ERROR_BROKEN_PIPE);
+                    self.worker = None;
+                    error.get_or_insert(ERROR_BROKEN_PIPE);
+                    if let Err(restart_error) = self.ensure_worker() {
+                        error = Some(restart_error);
+                    }
                     break;
                 }
             }
         }
 
-        if error.is_none()
-            && !self.in_flight
+        if !self.in_flight
             && let Some(request) = self.pending.take()
         {
             let operation_id = self
                 .pending_operation_id
                 .take()
                 .unwrap_or_else(diagnostics::next_operation_id);
-            match self
-                .worker
-                .submit_with_operation_id(request, notify_hwnd, operation_id)
-            {
+            match self.submit_request(request, notify_hwnd, operation_id) {
                 Ok(()) => self.in_flight = true,
-                Err(submit_error) => error = Some(submit_error),
+                Err(submit_error) => {
+                    self.pending = Some(submit_error.request);
+                    self.pending_operation_id = Some(operation_id);
+                    error = Some(submit_error.code);
+                }
             }
         }
 
@@ -409,9 +571,9 @@ where
                 operation_id,
                 None,
                 &[
-                    Field::text("worker", self.worker.name()),
+                    Field::text("worker", &self.name),
                     Field::unsigned("completion_count", completions.len() as u64),
-                    Field::boolean("disconnected", error.is_some()),
+                    Field::boolean("request_failed", error.is_some()),
                     Field::boolean("follow_up_in_flight", self.in_flight),
                 ],
             );
@@ -426,6 +588,14 @@ where
 
     pub(crate) fn has_pending(&self) -> bool {
         self.pending.is_some()
+    }
+
+    #[cfg(test)]
+    fn disconnect(&self) {
+        self.worker
+            .as_ref()
+            .expect("test worker should exist")
+            .disconnect();
     }
 }
 
@@ -451,7 +621,7 @@ mod tests {
     use std::ptr::null_mut;
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::{Duration, Instant};
 
@@ -469,10 +639,10 @@ mod tests {
                 .expect("receiver should exist")
                 .recv_timeout(Duration::from_secs(2))
                 .expect("completion should arrive"),
-            CorrelatedCompletion {
+            WorkerEvent::Completed(CorrelatedCompletion {
                 operation_id,
                 value: 42,
-            }
+            })
         );
     }
 
@@ -548,31 +718,101 @@ mod tests {
     }
 
     #[test]
-    fn worker_panic_is_reported_as_a_disconnected_completion_channel() {
-        let mut worker = SingleFlightWorker::spawn(
+    fn collector_panic_discards_state_and_runs_the_pending_request_after_reinitializing() {
+        let initialize_count = Arc::new(AtomicUsize::new(0));
+        let panic_once = Arc::new(AtomicBool::new(true));
+        let initialize_count_by_worker = Arc::clone(&initialize_count);
+        let panic_once_by_worker = Arc::clone(&panic_once);
+        let mut worker = SingleFlightWorker::spawn_initialized(
             "taskmgr-rs-worker-panic-test",
             0,
-            keep_pending,
-            |(): ()| -> () { panic!("synthetic collector panic") },
+            replace_pending,
+            move || {
+                initialize_count_by_worker.fetch_add(1, Ordering::AcqRel);
+                let panic_once = Arc::clone(&panic_once_by_worker);
+                move |value: u32| {
+                    assert!(
+                        !panic_once.swap(false, Ordering::AcqRel),
+                        "synthetic collector panic"
+                    );
+                    value * 2
+                }
+            },
         )
         .expect("worker should start");
+        worker.request(1, null_mut()).expect("request should queue");
         worker
-            .request((), null_mut())
-            .expect("request should queue");
-        worker
-            .request((), null_mut())
+            .request(2, null_mut())
             .expect("follow-up request should coalesce");
         assert!(worker.has_pending());
 
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let drained = worker.drain(null_mut());
-            if drained.error == Some(ERROR_BROKEN_PIPE) {
-                assert!(!worker.is_in_flight());
+            if drained.error == Some(ERROR_GEN_FAILURE) {
+                assert!(drained.completions.is_empty());
+                assert!(worker.is_in_flight());
                 assert!(!worker.has_pending());
                 break;
             }
+            assert!(Instant::now() < deadline, "panic report timed out");
+            thread::yield_now();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let drained = worker.drain(null_mut());
+            assert_eq!(drained.error, None);
+            if let Some(completion) = drained.completions.first() {
+                assert_eq!(completion.value, 4);
+                assert_eq!(initialize_count.load(Ordering::Acquire), 2);
+                assert!(!worker.is_in_flight());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "reinitialized collector timed out"
+            );
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn disconnected_worker_thread_is_recreated_before_the_next_request() {
+        let mut worker = SingleFlightWorker::spawn(
+            "taskmgr-rs-worker-restart-test",
+            0,
+            keep_pending,
+            |value: u32| value + 1,
+        )
+        .expect("worker should start");
+        worker.disconnect();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let drained = worker.drain(null_mut());
+            if drained.error == Some(ERROR_BROKEN_PIPE) {
+                break;
+            }
             assert!(Instant::now() < deadline, "disconnect timed out");
+            thread::yield_now();
+        }
+
+        worker
+            .request(41, null_mut())
+            .expect("replacement worker should accept a request");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let drained = worker.drain(null_mut());
+            assert_eq!(drained.error, None);
+            if let Some(completion) = drained.completions.first() {
+                assert_eq!(completion.value, 42);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "replacement worker completion timed out"
+            );
             thread::yield_now();
         }
     }

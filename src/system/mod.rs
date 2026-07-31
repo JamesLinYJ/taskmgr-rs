@@ -11,6 +11,7 @@
 //! 系统级采样、处理器拓扑和稳定进程身份。
 
 pub(crate) mod cpu_sampler;
+pub(crate) mod cpu_sets;
 pub(crate) mod cpu_topology;
 pub(crate) mod process_identity;
 pub(crate) mod sampler;

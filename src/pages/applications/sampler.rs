@@ -29,13 +29,13 @@ use windows_sys::core::BOOL;
 
 use super::{TaskIdentity, WorkerTaskEntry, last_error_or_gen_failure, window_matches_identity};
 use crate::system::process_identity::{
-    ProcIdentity, query_process_identity_for_pid, query_process_is_32_bit,
+    ProcIdentity, query_process_identity_for_pid, query_process_needs_32_bit_suffix,
 };
 
 #[derive(Default)]
 pub(super) struct TaskSamplerCache {
     desktop_names: Option<(String, String)>,
-    bitness_by_process: HashMap<ProcIdentity, bool>,
+    suffix_by_process: HashMap<ProcIdentity, bool>,
 }
 
 pub(super) struct TaskWorkerSnapshot {
@@ -97,7 +97,7 @@ fn collect_tasks_current_winsta_worker(
         let mut context = WindowEnumContext {
             tasks: &mut tasks as *mut Vec<WorkerTaskEntry>,
             seen_tasks: &mut seen_tasks as *mut HashSet<TaskIdentity>,
-            bitness_by_process: &mut cache.bitness_by_process as *mut HashMap<ProcIdentity, bool>,
+            suffix_by_process: &mut cache.suffix_by_process as *mut HashMap<ProcIdentity, bool>,
             process_identities: &mut process_identities
                 as *mut HashMap<u32, Result<ProcIdentity, u32>>,
             row_error: None,
@@ -118,7 +118,7 @@ fn collect_tasks_current_winsta_worker(
             .map(|task| task.identity.process)
             .collect::<HashSet<_>>();
         cache
-            .bitness_by_process
+            .suffix_by_process
             .retain(|identity, _| current_processes.contains(identity));
         Ok(TaskWorkerSnapshot {
             tasks,
@@ -131,7 +131,7 @@ fn collect_tasks_current_winsta_worker(
 struct WindowEnumContext {
     tasks: *mut Vec<WorkerTaskEntry>,
     seen_tasks: *mut HashSet<TaskIdentity>,
-    bitness_by_process: *mut HashMap<ProcIdentity, bool>,
+    suffix_by_process: *mut HashMap<ProcIdentity, bool>,
     process_identities: *mut HashMap<u32, Result<ProcIdentity, u32>>,
     row_error: Option<u32>,
     main_hwnd: HWND,
@@ -196,13 +196,13 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         if !seen_tasks.insert(identity) {
             return 1;
         }
-        let bitness_by_process = &mut *context.bitness_by_process;
-        let is_32_bit = if let Some(&cached) = bitness_by_process.get(&process) {
+        let suffix_by_process = &mut *context.suffix_by_process;
+        let show_32_bit_suffix = if let Some(&cached) = suffix_by_process.get(&process) {
             Some(cached)
         } else {
-            match query_process_is_32_bit(process) {
+            match query_process_needs_32_bit_suffix(process) {
                 Ok(detected) => {
-                    bitness_by_process.insert(process, detected);
+                    suffix_by_process.insert(process, detected);
                     Some(detected)
                 }
                 Err(error) => {
@@ -221,7 +221,7 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         tasks.push(WorkerTaskEntry {
             identity,
             title,
-            is_32_bit,
+            show_32_bit_suffix,
             winstation: context.winstation.clone(),
             desktop: context.desktop.clone(),
             is_hung: IsHungAppWindow(hwnd) != 0,

@@ -28,7 +28,9 @@ The release files are not code-signed at the moment, so Windows may show a Smart
 
 ## Windows support
 
-Most development and hands-on testing currently happens on Windows 11 x86_64. The code uses Win32, PDH, DXGI, WMI, and WDDM interfaces available on Windows 10 and 11, but the project does not yet have a complete OS and hardware test matrix.
+Most development and hands-on testing currently happens on Windows 11 x86_64. The
+[compatibility matrix](docs/compatibility-matrix.md) records Windows/architecture and GPU evidence
+without treating a cross-build or an unrecorded development machine as hardware verification.
 
 The GPU page needs the `GPU Engine` and `GPU Adapter Memory` performance counters exposed by Windows and the display driver. When those counters are missing, the page reports that state instead of drawing a flat 0% graph.
 
@@ -41,6 +43,17 @@ Install stable Rust, the MSVC C++ Build Tools, and a Windows SDK. The repository
 ```powershell
 cargo build --release
 ```
+
+To build the 32-bit x86 executable:
+
+```powershell
+rustup target add i686-pc-windows-msvc
+cargo build --release --target i686-pc-windows-msvc
+# Or use: .\scripts\release-clean.ps1 -Target i686-pc-windows-msvc
+```
+
+The x86 build still queries both the process and native machine types. It keeps the `(32-bit)`
+suffix when running under WOW64 on 64-bit Windows, and omits it only on native 32-bit Windows.
 
 For a release build with local paths remapped:
 
@@ -76,11 +89,18 @@ The corresponding command-line switches are:
 --diagnostic-sensitive
 --diagnostic-minidump
 --diagnostic-dir=<absolute-path>
+--diagnostic-capabilities=<absolute-path-to-new-json>
 ```
 
 Logs use versioned JSON Lines records, rotate at 10 MiB per file, and retain at most 10 sessions and
 200 MiB. If the normal directory is unavailable, logging falls back to `%TEMP%`; native debugger
 output remains available if both locations fail.
+
+The capability command queries processor groups, CPU Sets, DXGI/driver metadata, and the exact GPU
+PDH counter paths used by the application, writes an attachable JSON report, and exits without
+opening the UI. Unsupported capabilities and native error codes stay explicit. The destination
+must be absolute and must not already exist; see the
+[matrix and test checklist](docs/compatibility-matrix.md) for usage and privacy details.
 
 To create an optimized GNU build with separate DWARF symbols and a matching executable SHA-256:
 
@@ -149,7 +169,7 @@ git diff --check
 
 ## Reporting a problem
 
-Open an [Issue](https://github.com/JamesLinYJ/taskmgr-rs/issues) and include the Windows version, CPU and GPU models, the affected page, steps to reproduce, and a screenshot. For failures that need precise API or source-line tracing, attach a diagnostic bundle after reviewing its privacy warning. Those details usually make sampling and layout bugs much easier to pin down.
+Open an [Issue](https://github.com/JamesLinYJ/taskmgr-rs/issues) and include the Windows version, CPU and GPU models, the affected page, steps to reproduce, and a screenshot. For compatibility failures, attach a capability JSON; for failures that need precise API or source-line tracing, attach a diagnostic bundle after reviewing its privacy warning. Those details usually make sampling and layout bugs much easier to pin down.
 
 ## License
 

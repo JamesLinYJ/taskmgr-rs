@@ -16,6 +16,7 @@ pub(crate) mod controllers;
 mod diagnostics_dialog;
 pub(crate) mod page_host;
 pub(crate) mod page_registry;
+mod single_instance;
 
 use std::env;
 use std::mem::{size_of, zeroed};
@@ -28,8 +29,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Shell::{IShellDispatch, Shell};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, ERROR_GEN_FAILURE, ERROR_INVALID_PARAMETER, ERROR_TIMEOUT,
-    HANDLE, HINSTANCE, HWND, LPARAM, POINT, RECT, TRUE, WAIT_ABANDONED, WAIT_OBJECT_0,
-    WAIT_TIMEOUT, WPARAM,
+    HANDLE, HINSTANCE, HWND, LPARAM, POINT, RECT, TRUE, WAIT_TIMEOUT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     COLOR_3DFACE, CreateRectRgn, DCX_CACHE, DCX_CLIPSIBLINGS, DCX_INTERSECTRGN, DeleteObject,
@@ -43,8 +43,8 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::System::Threading::{
-    ALL_PROCESSOR_GROUPS, CreateMutexW, GetActiveProcessorCount, ReleaseMutex,
-    SetProcessShutdownParameters, WaitForSingleObject,
+    ALL_PROCESSOR_GROUPS, GetActiveProcessorCount, ReleaseMutex, SetProcessShutdownParameters,
+    WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Controls::{
     ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ICC_TAB_CLASSES, INITCOMMONCONTROLSEX,
@@ -59,24 +59,23 @@ use windows_sys::Win32::UI::Shell::{NIM_ADD, NIM_DELETE, ShellAboutW, ShellExecu
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CheckMenuItem, CheckMenuRadioItem, CreateWindowExW, DefWindowProcW, DeleteMenu,
     DestroyAcceleratorTable, DestroyWindow, DispatchMessageW, DrawMenuBar, EnableMenuItem,
-    FindWindowW, GWL_STYLE, GetClassInfoW, GetClientRect, GetCursorPos, GetDlgItem,
-    GetForegroundWindow, GetMenu, GetMenuItemInfoW, GetMessageW, GetShellWindow, GetWindowLongW,
-    GetWindowPlacement, GetWindowRect, HACCEL, HELP_FINDER, HICON, HMENU, HTCAPTION, HTCLIENT,
-    HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDCANCEL, IsDialogMessageW, IsIconic, IsWindowVisible,
-    IsZoomed, KillTimer, LR_DEFAULTCOLOR, LR_DEFAULTSIZE, MB_ICONSTOP, MB_OK, MENUITEMINFOW,
-    MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_SYSMENU,
-    MF_UNCHECKED, MIIM_ID, MINMAXINFO, MSG, MessageBoxW, OpenIcon, PostMessageW, PostQuitMessage,
-    RegisterClassW, SIZE_MINIMIZED, SMTO_ABORTIFHUNG, SW_HIDE, SW_MINIMIZE, SW_SHOW,
-    SW_SHOWMAXIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SendMessageTimeoutW,
-    SendMessageW, SetForegroundWindow, SetMenu, SetMenuDefaultItem, SetTimer, SetWindowLongW,
-    SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TrackPopupMenuEx,
-    TranslateAcceleratorW, TranslateMessage, WINDOWPLACEMENT, WM_CLOSE, WM_COMMAND, WM_CREATE,
-    WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITDIALOG, WM_INITMENU,
-    WM_LBUTTONDBLCLK, WM_MENUSELECT, WM_MOVE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCRBUTTONDOWN,
-    WM_NCRBUTTONUP, WM_NOTIFY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETICON, WM_SETREDRAW, WM_SIZE,
-    WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_DLGFRAME, WS_MAXIMIZEBOX,
-    WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_TILEDWINDOW, WS_VISIBLE,
+    GWL_STYLE, GetClassInfoW, GetClientRect, GetCursorPos, GetDlgItem, GetForegroundWindow,
+    GetMenu, GetMenuItemInfoW, GetMessageW, GetShellWindow, GetWindowLongW, GetWindowPlacement,
+    GetWindowRect, HACCEL, HELP_FINDER, HICON, HMENU, HTCAPTION, HTCLIENT, HWND_NOTOPMOST,
+    HWND_TOP, HWND_TOPMOST, IDCANCEL, IsDialogMessageW, IsIconic, IsWindowVisible, IsZoomed,
+    KillTimer, LR_DEFAULTCOLOR, LR_DEFAULTSIZE, MB_ICONSTOP, MB_OK, MENUITEMINFOW, MF_BYCOMMAND,
+    MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_SYSMENU, MF_UNCHECKED, MIIM_ID,
+    MINMAXINFO, MSG, MessageBoxW, OpenIcon, PostMessageW, PostQuitMessage, RegisterClassW,
+    SIZE_MINIMIZED, SW_HIDE, SW_MINIMIZE, SW_SHOW, SW_SHOWMAXIMIZED, SW_SHOWMINNOACTIVE,
+    SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREDRAW,
+    SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetMenu, SetMenuDefaultItem,
+    SetTimer, SetWindowLongW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD,
+    TrackPopupMenuEx, TranslateAcceleratorW, TranslateMessage, WINDOWPLACEMENT, WM_CLOSE,
+    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO,
+    WM_INITDIALOG, WM_INITMENU, WM_LBUTTONDBLCLK, WM_MENUSELECT, WM_MOVE, WM_NCHITTEST,
+    WM_NCLBUTTONDBLCLK, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETICON, WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS,
+    WS_DLGFRAME, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_TILEDWINDOW, WS_VISIBLE,
 };
 
 use self::controllers::{
@@ -103,8 +102,8 @@ use crate::ui::menus::build_popup_menu;
 use crate::ui::resource_ids::*;
 use crate::ui::runtime_menu::PopupMenu;
 
-const STARTUP_MUTEX_NAME: &str = "NTShell Taskman Startup Mutex";
 const FINDME_TIMEOUT: u32 = 10_000;
+const STARTUP_MUTEX_WAIT_TIMEOUT: u32 = 500;
 static FRAME_BASE_WNDPROC: OnceLock<
     Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> isize>,
 > = OnceLock::new();
@@ -409,9 +408,7 @@ impl App {
         );
         // 启动链路按“单实例检查 -> 环境初始化 -> 创建主对话框 -> 进入消息循环”展开。
         // 这样既能兼容经典 Task Manager 的行为，也便于在失败点提前退出。
-        if !self.acquire_startup_mutex() {
-            return 1;
-        }
+        self.acquire_startup_mutex();
         if self.activate_existing_instance() {
             self.release_startup_mutex();
             return 0;
@@ -581,41 +578,40 @@ impl App {
         exit_code
     }
 
-    fn acquire_startup_mutex(&mut self) -> bool {
-        // 命名互斥体用于串行化启动窗口，避免两个实例同时完成“是否已有实例”的判断。
-        let mutex_name = to_wide_null(STARTUP_MUTEX_NAME);
-        // 安全性: `mutex_name` is NUL-terminated and the returned handle is owned by App until
-        // `release_startup_mutex`.
-        unsafe {
-            self.startup_mutex = CreateMutexW(null_mut(), TRUE, mutex_name.as_ptr());
-            if self.startup_mutex.is_null() {
-                record_win32_error(
-                    "startup mutex creation",
-                    windows_sys::Win32::Foundation::GetLastError(),
-                );
-                return false;
+    fn acquire_startup_mutex(&mut self) {
+        // The mutex narrows a benign startup race; an existing object is never trusted as proof
+        // that another taskmgr-rs process exists.
+        let created = match single_instance::create_startup_mutex() {
+            Ok(created) => created,
+            Err(error) => {
+                record_win32_error("startup mutex creation; continuing unlocked", error);
+                return;
             }
+        };
+        self.startup_mutex = created.handle;
+        if created.owned {
+            self.startup_mutex_owned = true;
+            return;
+        }
 
-            if windows_sys::Win32::Foundation::GetLastError() != ERROR_ALREADY_EXISTS {
+        // Safety: create_startup_mutex returned one live mutex handle owned by App.
+        let wait_result =
+            unsafe { WaitForSingleObject(self.startup_mutex, STARTUP_MUTEX_WAIT_TIMEOUT) };
+        match single_instance::classify_mutex_wait(wait_result) {
+            single_instance::MutexWaitDecision::Owned => {
                 self.startup_mutex_owned = true;
-                return true;
             }
-
-            let wait_result = WaitForSingleObject(self.startup_mutex, FINDME_TIMEOUT);
-            if wait_result == WAIT_OBJECT_0 || wait_result == WAIT_ABANDONED {
-                self.startup_mutex_owned = true;
-                true
-            } else {
+            single_instance::MutexWaitDecision::ProceedUnlocked => {
                 let error = if wait_result == WAIT_TIMEOUT {
                     ERROR_TIMEOUT
                 } else {
-                    let error = windows_sys::Win32::Foundation::GetLastError();
+                    let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
                     if error == 0 { ERROR_GEN_FAILURE } else { error }
                 };
-                record_win32_error("startup mutex wait", error);
-                CloseHandle(self.startup_mutex);
+                record_win32_error("startup mutex unavailable; continuing unlocked", error);
+                // Safety: the handle is owned here and was never acquired in this branch.
+                unsafe { CloseHandle(self.startup_mutex) };
                 self.startup_mutex = null_mut();
-                false
             }
         }
     }
@@ -659,33 +655,8 @@ impl App {
     }
 
     fn activate_existing_instance(&self) -> bool {
-        // 与历史版本一致，靠主窗口标题找到已运行实例，并通过自定义消息把它激活到前台。
         let title = text(TextKey::AppTitle).to_string();
-        if title.is_empty() {
-            return false;
-        }
-
-        let title_wide = to_wide_null(&title);
-        // 安全性: `title_wide` is NUL-terminated and lives through the FindWindowW call.
-        let existing_hwnd = unsafe { FindWindowW(null(), title_wide.as_ptr()) };
-        if existing_hwnd.is_null() {
-            return false;
-        }
-
-        let mut result = 0usize;
-        // 安全性: `existing_hwnd` was returned by FindWindowW and `result` is a valid out param.
-        (unsafe {
-            SendMessageTimeoutW(
-                existing_hwnd,
-                PWM_ACTIVATE,
-                0,
-                0,
-                SMTO_ABORTIFHUNG,
-                FINDME_TIMEOUT,
-                &mut result,
-            )
-        }) != 0
-            && result as u32 == PWM_ACTIVATE
+        single_instance::activate_authenticated_instance(&title, PWM_ACTIVATE, FINDME_TIMEOUT)
     }
 
     fn task_manager_disabled(&self) -> bool {

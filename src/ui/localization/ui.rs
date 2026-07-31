@@ -145,6 +145,7 @@ pub fn localize_dialog(hwnd: HWND, dialog_id: u16) {
             set_dialog_item_text(hwnd, IDOK, TextKey::Ok);
             set_dialog_item_text(hwnd, IDCANCEL, TextKey::Cancel);
             set_dialog_item_text(hwnd, IDC_AFFINITY_GROUP, TextKey::Processors);
+            set_dialog_item_text(hwnd, IDC_AFFINITY_GROUP_LABEL, TextKey::CpuGroups);
             set_dialog_item_text(
                 hwnd,
                 IDC_AFFINITY_DESC,

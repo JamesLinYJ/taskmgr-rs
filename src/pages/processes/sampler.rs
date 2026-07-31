@@ -42,7 +42,7 @@ use windows_sys::Win32::System::Threading::{
 
 use super::model::{DirtyColumns, ProcEntry, ProcStaticMetadata};
 use crate::infrastructure::native::{
-    OwnedHandle, OwnedWtsMemory, is_32_bit_process_handle, widestr_ptr_to_string,
+    OwnedHandle, OwnedWtsMemory, process_needs_32_bit_suffix_handle, widestr_ptr_to_string,
 };
 use crate::system::cpu_sampler::{
     ProcessorPerformance, checked_summed_processor_times, query_processor_performance,
@@ -507,7 +507,7 @@ unsafe fn collect_process_entries(
                 pid,
                 image_name: image_name.clone(),
                 image_name_lower: image_name.to_lowercase(),
-                is_32_bit: None,
+                show_32_bit_suffix: None,
                 user_name: String::new(),
                 user_name_lower: String::new(),
                 session_id: None,
@@ -589,9 +589,10 @@ unsafe fn collect_process_entries(
                         resolved_user_identities.insert(entry.identity);
                     }
                 }
-                if entry.identity.is_verified() && entry.is_32_bit.is_none() {
-                    entry.is_32_bit = match is_32_bit_process_handle(info_handle) {
-                        Ok(is_32_bit) => Some(is_32_bit),
+                if entry.identity.is_verified() && entry.show_32_bit_suffix.is_none() {
+                    entry.show_32_bit_suffix = match process_needs_32_bit_suffix_handle(info_handle)
+                    {
+                        Ok(show_suffix) => Some(show_suffix),
                         Err(error) => {
                             row_error.get_or_insert(if error == 0 {
                                 ERROR_GEN_FAILURE
@@ -740,8 +741,8 @@ unsafe fn collect_process_entries(
         for entry in entries.iter().filter(|entry| entry.identity.is_verified()) {
             let resolved = resolved_user_identities.contains(&entry.identity);
             if let Some(metadata) = cache.metadata.get_mut(&entry.identity) {
-                if metadata.is_32_bit.is_none() && entry.is_32_bit.is_some() {
-                    metadata.is_32_bit = entry.is_32_bit;
+                if metadata.show_32_bit_suffix.is_none() && entry.show_32_bit_suffix.is_some() {
+                    metadata.show_32_bit_suffix = entry.show_32_bit_suffix;
                 }
                 if metadata.session_id.is_none() && entry.session_id.is_some() {
                     metadata.session_id = entry.session_id;
@@ -755,7 +756,7 @@ unsafe fn collect_process_entries(
                 cache.metadata.insert(
                     entry.identity,
                     ProcStaticMetadata {
-                        is_32_bit: entry.is_32_bit,
+                        show_32_bit_suffix: entry.show_32_bit_suffix,
                         user_name: entry.user_name.clone(),
                         user_name_lower: entry.user_name_lower.clone(),
                         session_id: entry.session_id,

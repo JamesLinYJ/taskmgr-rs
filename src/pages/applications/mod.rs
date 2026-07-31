@@ -140,7 +140,7 @@ pub struct TaskEntry {
     pub title: String,
     display_title: String,
     title_lower: String,
-    pub is_32_bit: Option<bool>,
+    pub show_32_bit_suffix: Option<bool>,
     pub winstation: String,
     winstation_lower: String,
     pub desktop: String,
@@ -156,7 +156,7 @@ pub struct TaskEntry {
 struct WorkerTaskEntry {
     identity: TaskIdentity,
     title: String,
-    is_32_bit: Option<bool>,
+    show_32_bit_suffix: Option<bool>,
     winstation: String,
     desktop: String,
     is_hung: bool,
@@ -767,7 +767,6 @@ impl TaskPageState {
             });
         }
         if let Some(error) = drained.error {
-            self.snapshot_worker = None;
             self.set_refresh_error(error);
         }
     }
@@ -794,7 +793,6 @@ impl TaskPageState {
             });
         }
         if let Some(error) = drained.error {
-            self.icon_worker = None;
             self.pending_icon_identities.clear();
             self.set_icon_error(error);
         }
@@ -894,7 +892,6 @@ impl TaskPageState {
             for identity in identities {
                 self.pending_icon_identities.remove(&identity);
             }
-            self.icon_worker = None;
             self.set_icon_error(error);
         }
     }
@@ -981,12 +978,14 @@ impl TaskPageState {
         }
 
         if self.snapshot_worker.is_none() {
-            let mut cache = TaskSamplerCache::default();
-            self.snapshot_worker = Some(SingleFlightWorker::spawn(
+            self.snapshot_worker = Some(SingleFlightWorker::spawn_initialized(
                 "taskmgr-rs-task-sampler",
                 PWM_TASK_WORKER_COMPLETE,
                 keep_pending,
-                move |main_hwnd: isize| collect_tasks_worker(main_hwnd, &mut cache),
+                || {
+                    let mut cache = TaskSamplerCache::default();
+                    move |main_hwnd: isize| collect_tasks_worker(main_hwnd, &mut cache)
+                },
             )?);
         }
         if self.icon_worker.is_none() {
@@ -1321,18 +1320,18 @@ impl TaskEntry {
         let WorkerTaskEntry {
             identity,
             title,
-            is_32_bit,
+            show_32_bit_suffix,
             winstation,
             desktop,
             is_hung,
         } = worker;
-        let display_title = task_display_title(&title, is_32_bit);
+        let display_title = task_display_title(&title, show_32_bit_suffix);
         Self {
             identity,
             title_lower: title.to_lowercase(),
             title,
             display_title,
-            is_32_bit,
+            show_32_bit_suffix,
             winstation_lower: winstation.to_lowercase(),
             winstation,
             desktop_lower: desktop.to_lowercase(),
@@ -1366,16 +1365,16 @@ fn update_task_entry(
         mark_task_column_changed(task, &mut changed, TaskColumnId::Desktop);
     }
     let title_changed = task.title != worker.title;
-    let bitness_changed = task.is_32_bit != worker.is_32_bit;
+    let bitness_changed = task.show_32_bit_suffix != worker.show_32_bit_suffix;
     if title_changed {
         task.title.clone_from(&worker.title);
         task.title_lower = worker.title.to_lowercase();
     }
     if bitness_changed {
-        task.is_32_bit = worker.is_32_bit;
+        task.show_32_bit_suffix = worker.show_32_bit_suffix;
     }
     if title_changed || bitness_changed {
-        task.display_title = task_display_title(&task.title, task.is_32_bit);
+        task.display_title = task_display_title(&task.title, task.show_32_bit_suffix);
         mark_task_column_changed(task, &mut changed, TaskColumnId::Name);
     }
     if task.is_hung != worker.is_hung {
@@ -1386,8 +1385,8 @@ fn update_task_entry(
     changed
 }
 
-fn task_display_title(title: &str, is_32_bit: Option<bool>) -> String {
-    match is_32_bit {
+fn task_display_title(title: &str, show_32_bit_suffix: Option<bool>) -> String {
+    match show_32_bit_suffix {
         Some(true) => append_32_bit_suffix(title, true).into_owned(),
         Some(false) | None => title.to_string(),
     }

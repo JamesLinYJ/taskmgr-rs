@@ -1,6 +1,10 @@
 param(
     [switch]$UseNightlyBuildStd,
-    [ValidateSet("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc")]
+    [ValidateSet(
+        "x86_64-pc-windows-msvc",
+        "i686-pc-windows-msvc",
+        "aarch64-pc-windows-msvc"
+    )]
     [string]$Target = "x86_64-pc-windows-msvc"
 )
 

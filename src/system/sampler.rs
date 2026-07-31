@@ -104,12 +104,14 @@ impl SystemSampler {
         if processor_count == 0 {
             return Err(ERROR_INVALID_DATA);
         }
-        let mut collector = SystemCollector::new(processor_count);
-        self.worker = Some(SingleFlightWorker::spawn(
+        self.worker = Some(SingleFlightWorker::spawn_initialized(
             "taskmgr-rs-system-sampler",
             PWM_SYSTEM_WORKER_COMPLETE,
             keep_pending,
-            move |()| collector.collect(),
+            move || {
+                let mut collector = SystemCollector::new(processor_count);
+                move |()| collector.collect()
+            },
         )?);
         Ok(())
     }
@@ -131,7 +133,6 @@ impl SystemSampler {
             .ok_or(ERROR_BROKEN_PIPE)?
             .drain(notify_hwnd);
         if let Some(error) = drained.error {
-            self.worker = None;
             return Err(error);
         }
         Ok(drained.completions)
