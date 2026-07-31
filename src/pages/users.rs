@@ -408,7 +408,6 @@ impl UserPageState {
             });
         }
         if let Some(error) = drained.error {
-            self.worker = None;
             self.set_refresh_error(error);
         }
     }

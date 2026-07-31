@@ -107,7 +107,7 @@ pub fn process_is_elevated() -> Result<bool, u32> {
         Ok(elevation.TokenIsElevated != 0)
     }
 }
-pub fn is_32_bit_process_handle(handle: HANDLE) -> Result<bool, u32> {
+pub fn process_needs_32_bit_suffix_handle(handle: HANDLE) -> Result<bool, u32> {
     if handle.is_null() {
         return Err(ERROR_INVALID_HANDLE);
     }
@@ -119,56 +119,74 @@ pub fn is_32_bit_process_handle(handle: HANDLE) -> Result<bool, u32> {
         let error = unsafe { GetLastError() };
         Err(if error == 0 { ERROR_GEN_FAILURE } else { error })
     } else {
-        process_machine_is_32_bit(process_machine, native_machine).ok_or(ERROR_INVALID_DATA)
+        process_machine_needs_32_bit_suffix(process_machine, native_machine)
+            .ok_or(ERROR_INVALID_DATA)
     }
 }
 
-fn process_machine_is_32_bit(process_machine: u16, native_machine: u16) -> Option<bool> {
+fn process_machine_needs_32_bit_suffix(process_machine: u16, native_machine: u16) -> Option<bool> {
     let effective_machine = if process_machine == IMAGE_FILE_MACHINE_UNKNOWN {
         native_machine
     } else {
         process_machine
     };
-    match effective_machine {
+    let process_is_32_bit = match effective_machine {
         IMAGE_FILE_MACHINE_I386
         | IMAGE_FILE_MACHINE_ARM
         | IMAGE_FILE_MACHINE_ARMNT
-        | IMAGE_FILE_MACHINE_THUMB => Some(true),
-        IMAGE_FILE_MACHINE_AMD64 | IMAGE_FILE_MACHINE_ARM64 | IMAGE_FILE_MACHINE_IA64 => {
-            Some(false)
-        }
-        _ => None,
-    }
+        | IMAGE_FILE_MACHINE_THUMB => true,
+        IMAGE_FILE_MACHINE_AMD64 | IMAGE_FILE_MACHINE_ARM64 | IMAGE_FILE_MACHINE_IA64 => false,
+        _ => return None,
+    };
+    let native_is_64_bit = match native_machine {
+        IMAGE_FILE_MACHINE_AMD64 | IMAGE_FILE_MACHINE_ARM64 | IMAGE_FILE_MACHINE_IA64 => true,
+        IMAGE_FILE_MACHINE_I386
+        | IMAGE_FILE_MACHINE_ARM
+        | IMAGE_FILE_MACHINE_ARMNT
+        | IMAGE_FILE_MACHINE_THUMB => false,
+        _ => return None,
+    };
+    Some(process_is_32_bit && native_is_64_bit)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::process_machine_is_32_bit;
+    use super::process_machine_needs_32_bit_suffix;
     use windows_sys::Win32::System::SystemInformation::{
         IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_ARMNT,
         IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_UNKNOWN,
     };
 
     #[test]
-    fn process_machine_width_distinguishes_emulation_from_bitness() {
+    fn suffix_is_only_needed_for_a_32_bit_process_on_a_64_bit_machine() {
         assert_eq!(
-            process_machine_is_32_bit(IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_AMD64),
+            process_machine_needs_32_bit_suffix(IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_AMD64),
             Some(true)
         );
         assert_eq!(
-            process_machine_is_32_bit(IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64),
+            process_machine_needs_32_bit_suffix(IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64),
             Some(false)
         );
         assert_eq!(
-            process_machine_is_32_bit(IMAGE_FILE_MACHINE_UNKNOWN, IMAGE_FILE_MACHINE_ARM64),
+            process_machine_needs_32_bit_suffix(
+                IMAGE_FILE_MACHINE_UNKNOWN,
+                IMAGE_FILE_MACHINE_ARM64
+            ),
             Some(false)
         );
         assert_eq!(
-            process_machine_is_32_bit(IMAGE_FILE_MACHINE_ARMNT, IMAGE_FILE_MACHINE_ARM64),
+            process_machine_needs_32_bit_suffix(IMAGE_FILE_MACHINE_ARMNT, IMAGE_FILE_MACHINE_ARM64),
             Some(true)
         );
         assert_eq!(
-            process_machine_is_32_bit(0xffff, IMAGE_FILE_MACHINE_ARM64),
+            process_machine_needs_32_bit_suffix(
+                IMAGE_FILE_MACHINE_UNKNOWN,
+                IMAGE_FILE_MACHINE_I386
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            process_machine_needs_32_bit_suffix(0xffff, IMAGE_FILE_MACHINE_ARM64),
             None
         );
     }

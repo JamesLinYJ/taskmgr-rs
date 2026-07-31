@@ -22,6 +22,7 @@ pub(crate) mod model;
 #[cfg(test)]
 mod source_tests;
 
+use serde_json::{Value, json};
 use std::array;
 use std::collections::{HashMap, HashSet};
 use std::mem::{size_of, zeroed};
@@ -45,7 +46,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_GETFONT, WM_SETFONT, WM_SETREDRAW,
 };
 
-use self::counters::GpuCollector;
+use self::counters::{GpuCollector, probe_counter_capabilities};
+use self::inventory::GpuTopology;
 use self::layout::{
     DETAIL_ROW_COUNT, ENGINE_SLOT_COUNT, GpuLayoutMetrics, GpuLayoutPlan, compute_gpu_layout,
 };
@@ -53,7 +55,7 @@ use self::metadata::GpuMetadataCollector;
 use self::model::{
     GpuAdapterId, GpuAdapterInfo, GpuAdapterMetadata, GpuAdapterSample, GpuCollectOutcome,
     GpuDynamicSnapshot, GpuEngineId, GpuEngineKind, GpuInventorySnapshot, GpuMetadataRequest,
-    GpuMetadataSnapshot, GpuSampleError,
+    GpuMetadataSnapshot, GpuSampleError, GpuSampleIssue, GpuSampleSource,
 };
 use crate::config::options::Options;
 use crate::infrastructure::native::{
@@ -106,6 +108,148 @@ const GPU_DETAIL_ROWS: [(i32, i32); DETAIL_ROW_COUNT] = [
 type GpuWorkerCompletion = Result<GpuCollectOutcome, GpuSampleError>;
 type GpuMetadataCompletion = Result<GpuMetadataSnapshot, GpuSampleError>;
 
+pub(crate) fn diagnostic_capability_report() -> Value {
+    let performance_counters = match probe_counter_capabilities() {
+        Ok(capabilities) => capabilities
+            .into_iter()
+            .map(|capability| {
+                json!({
+                    "source": capability.source.name(),
+                    "counter_path": capability.source.counter_path(),
+                    "result": capability.error.as_ref().map_or_else(
+                        supported_capability,
+                        gpu_error_capability,
+                    ),
+                })
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => vec![json!({
+            "source": "pdh_query",
+            "counter_path": Value::Null,
+            "result": gpu_error_capability(&error),
+        })],
+    };
+
+    let topology = match GpuTopology::query() {
+        Ok(topology) => topology,
+        Err(error) => {
+            return json!({
+                "inventory": gpu_error_capability(&error),
+                "performance_counters": performance_counters,
+                "adapters": [],
+            });
+        }
+    };
+    let temperatures = topology.query_temperatures();
+    let infos = topology.infos.clone();
+    let mut metadata_collector = GpuMetadataCollector::new();
+    let metadata = metadata_collector.collect(GpuMetadataRequest {
+        generation: 1,
+        adapters: infos.clone(),
+    });
+
+    let adapters = infos
+        .iter()
+        .map(|info| {
+            let adapter_metadata = metadata
+                .as_ref()
+                .ok()
+                .and_then(|snapshot| snapshot.adapters.iter().find(|item| item.id == info.id));
+            let metadata_errors = match (&metadata, adapter_metadata) {
+                (Err(error), _) => vec![gpu_error_capability(error)],
+                (Ok(_), Some(adapter_metadata)) => adapter_metadata
+                    .metadata_errors
+                    .iter()
+                    .map(gpu_error_capability)
+                    .collect(),
+                (Ok(_), None) => vec![gpu_error_capability(&GpuSampleError::InvalidData {
+                    context: "missing adapter in GPU metadata capability snapshot",
+                })],
+            };
+            let driver_version = adapter_metadata
+                .and_then(|item| item.driver.version.as_deref())
+                .map_or_else(
+                    || json!({ "status": "unsupported", "value": Value::Null }),
+                    |version| json!({ "status": "supported", "value": version }),
+                );
+            let temperature = temperatures.get(&info.id).map_or_else(
+                || {
+                    gpu_error_capability(&GpuSampleError::InvalidData {
+                        context: "missing adapter in GPU temperature capability snapshot",
+                    })
+                },
+                |result| match result {
+                    Ok(Some(_)) => supported_capability(),
+                    Ok(None) => json!({ "status": "unsupported" }),
+                    Err(error) => gpu_error_capability(error),
+                },
+            );
+            json!({
+                "adapter_id": {
+                    "luid_high": info.id.luid.high_part,
+                    "luid_low": info.id.luid.low_part,
+                    "physical_index": info.id.physical_index,
+                },
+                "enumeration_index": info.enumeration_index,
+                "name": info.name,
+                "vendor": {
+                    "id": format!("0x{:04X}", info.vendor_id),
+                    "name": gpu_vendor_name(info.vendor_id),
+                },
+                "device_id": format!("0x{:04X}", info.device_id),
+                "subsystem_id": format!("0x{:08X}", info.subsystem_id),
+                "revision": info.revision,
+                "memory_limits": {
+                    "dedicated_bytes": info.dedicated_limit_bytes,
+                    "shared_bytes": info.shared_limit_bytes,
+                },
+                "driver_version": driver_version,
+                "driver_date": adapter_metadata.and_then(|item| item.driver.date.as_deref()),
+                "directx_feature_level": adapter_metadata
+                    .and_then(|item| item.directx_feature_level.as_deref()),
+                "temperature_query": temperature,
+                "metadata_errors": metadata_errors,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "inventory": {
+            "status": "supported",
+            "adapter_count": adapters.len(),
+        },
+        "performance_counters": performance_counters,
+        "adapters": adapters,
+    })
+}
+
+fn supported_capability() -> Value {
+    json!({ "status": "supported" })
+}
+
+fn gpu_error_capability(error: &GpuSampleError) -> Value {
+    json!({
+        "status": if error.is_unsupported() { "unsupported" } else { "error" },
+        "error": {
+            "domain": error.error_domain(),
+            "code": error.error_code(),
+            "code_hex": format!("0x{:08X}", error.error_code()),
+            "context": error.context(),
+        },
+    })
+}
+
+const fn gpu_vendor_name(vendor_id: u32) -> &'static str {
+    match vendor_id {
+        0x10DE => "NVIDIA",
+        0x1002 => "AMD",
+        0x8086 => "Intel",
+        0x1414 => "Microsoft",
+        0x17CB => "Qualcomm",
+        _ => "Unknown",
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum GpuPageStatus {
     #[default]
@@ -144,7 +288,11 @@ impl AdapterHistory {
             .map(|engine| (engine.id, engine.utilization_percent))
             .collect();
         for (engine_id, history) in &mut self.engine_histories {
-            history.push(current.get(engine_id).copied().unwrap_or(0));
+            if let Some(value) = current.get(engine_id).copied() {
+                history.push(value);
+            } else if sample.overall_utilization_percent.is_some() {
+                history.push(0);
+            }
         }
         for engine in &sample.engines {
             self.engine_kinds.insert(engine.id, engine.kind.clone());
@@ -160,14 +308,14 @@ impl AdapterHistory {
                 .all(|engine_id| self.engine_histories.contains_key(engine_id))
         );
 
-        self.dedicated_history.push(memory_percentage(
-            sample.dedicated_usage_bytes,
-            sample.info.dedicated_limit_bytes,
-        ));
-        self.shared_history.push(memory_percentage(
-            sample.shared_usage_bytes,
-            sample.info.shared_limit_bytes,
-        ));
+        if let Some(usage) = sample.dedicated_usage_bytes {
+            self.dedicated_history
+                .push(memory_percentage(usage, sample.info.dedicated_limit_bytes));
+        }
+        if let Some(usage) = sample.shared_usage_bytes {
+            self.shared_history
+                .push(memory_percentage(usage, sample.info.shared_limit_bytes));
+        }
     }
 
     fn engine_options(&self) -> Vec<(GpuEngineId, GpuEngineKind)> {
@@ -201,7 +349,7 @@ pub(crate) struct GpuPageState {
     status: GpuPageStatus,
     last_dynamic_error: Option<GpuSampleError>,
     last_metadata_error: Option<GpuSampleError>,
-    last_dynamic_aux_errors: Vec<GpuSampleError>,
+    last_dynamic_aux_errors: Vec<GpuSampleIssue>,
     last_metadata_aux_errors: Vec<GpuSampleError>,
     selected_adapter: Option<GpuAdapterId>,
     adapter_signature: Vec<(GpuAdapterId, String)>,
@@ -386,7 +534,6 @@ impl GpuPageState {
         };
         let mut request_follow_up = false;
         if let Some(error) = drained.error {
-            self.sample_worker = None;
             self.handle_dynamic_error(GpuSampleError::Win32 {
                 context: "GPU worker completion channel",
                 code: error,
@@ -432,7 +579,6 @@ impl GpuPageState {
             None => return,
         };
         if let Some(error) = drained.error {
-            self.metadata_worker = None;
             self.handle_metadata_error(GpuSampleError::Win32 {
                 context: "GPU metadata worker completion channel",
                 code: error,
@@ -799,6 +945,25 @@ impl GpuPageState {
         } else {
             "--"
         };
+        let source_failed = |source| {
+            sample
+                .is_some_and(|sample| sample.row_errors.iter().any(|issue| issue.source == source))
+        };
+        let engine_placeholder = if source_failed(GpuSampleSource::Engine) {
+            unavailable
+        } else {
+            dynamic_placeholder
+        };
+        let dedicated_placeholder = if source_failed(GpuSampleSource::DedicatedMemory) {
+            unavailable
+        } else {
+            dynamic_placeholder
+        };
+        let shared_placeholder = if source_failed(GpuSampleSource::SharedMemory) {
+            unavailable
+        } else {
+            dynamic_placeholder
+        };
         let usage_by_engine: HashMap<_, _> = sample
             .map(|sample| {
                 sample
@@ -814,25 +979,22 @@ impl GpuPageState {
             .copied()
             .unwrap_or([None; ENGINE_SLOT_COUNT]);
         for (slot, selected) in selections.into_iter().enumerate() {
-            let value = sample.map_or_else(
-                || dynamic_placeholder.to_string(),
-                |_| {
-                    format!(
-                        "{}%",
-                        selected
-                            .and_then(|id| usage_by_engine.get(&id).copied())
-                            .unwrap_or(0)
-                    )
+            let value = match sample {
+                None => dynamic_placeholder.to_string(),
+                Some(_) => match selected.and_then(|id| usage_by_engine.get(&id).copied()) {
+                    Some(value) => format!("{value}%"),
+                    None if source_failed(GpuSampleSource::Engine) => unavailable.to_string(),
+                    None => "0%".to_string(),
                 },
-            );
+            };
             set_control_text(
                 self.control(IDC_GPU_ENGINE_PERCENT_FIRST + slot as i32),
                 &value,
             );
         }
 
-        let dedicated_usage = sample.map(|sample| sample.dedicated_usage_bytes);
-        let shared_usage = sample.map(|sample| sample.shared_usage_bytes);
+        let dedicated_usage = sample.and_then(|sample| sample.dedicated_usage_bytes);
+        let shared_usage = sample.and_then(|sample| sample.shared_usage_bytes);
         set_control_text(
             self.control(IDC_GPU_DEDICATED_CAPTION),
             &format!(
@@ -841,7 +1003,7 @@ impl GpuPageState {
                 format_optional_usage_limit(
                     dedicated_usage,
                     info.dedicated_limit_bytes,
-                    dynamic_placeholder,
+                    dedicated_placeholder,
                 )
             ),
         );
@@ -853,7 +1015,7 @@ impl GpuPageState {
                 format_optional_usage_limit(
                     shared_usage,
                     info.shared_limit_bytes,
-                    dynamic_placeholder,
+                    shared_placeholder,
                 )
             ),
         );
@@ -868,28 +1030,35 @@ impl GpuPageState {
         set_control_text(
             self.control(IDC_GPU_UTILIZATION_VALUE),
             &sample
-                .map(|sample| format!("{}%", sample.overall_utilization_percent))
-                .unwrap_or_else(|| dynamic_placeholder.to_string()),
+                .and_then(|sample| sample.overall_utilization_percent)
+                .map(|value| format!("{value}%"))
+                .unwrap_or_else(|| engine_placeholder.to_string()),
         );
         set_control_text(
             self.control(IDC_GPU_TOTAL_MEMORY_VALUE),
-            &format_optional_usage_limit(total_usage, total_limit, dynamic_placeholder),
+            &format_optional_usage_limit(
+                total_usage,
+                total_limit,
+                if source_failed(GpuSampleSource::DedicatedMemory)
+                    || source_failed(GpuSampleSource::SharedMemory)
+                {
+                    unavailable
+                } else {
+                    dynamic_placeholder
+                },
+            ),
         );
         set_control_text(
             self.control(IDC_GPU_DEDICATED_MEMORY_VALUE),
             &format_optional_usage_limit(
                 dedicated_usage,
                 info.dedicated_limit_bytes,
-                dynamic_placeholder,
+                dedicated_placeholder,
             ),
         );
         set_control_text(
             self.control(IDC_GPU_SHARED_MEMORY_VALUE),
-            &format_optional_usage_limit(
-                shared_usage,
-                info.shared_limit_bytes,
-                dynamic_placeholder,
-            ),
+            &format_optional_usage_limit(shared_usage, info.shared_limit_bytes, shared_placeholder),
         );
         set_control_text(
             self.control(IDC_GPU_TEMPERATURE_VALUE),
@@ -1732,10 +1901,10 @@ mod tests {
             timestamp_ms: 1,
             adapters: vec![GpuAdapterSample {
                 info: Arc::clone(&info),
-                overall_utilization_percent: 5,
+                overall_utilization_percent: Some(5),
                 engines: Vec::new(),
-                dedicated_usage_bytes: 10,
-                shared_usage_bytes: 20,
+                dedicated_usage_bytes: Some(10),
+                shared_usage_bytes: Some(20),
                 temperature_deci_c: Some(420),
                 row_errors: Vec::new(),
             }],

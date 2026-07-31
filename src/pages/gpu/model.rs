@@ -20,7 +20,8 @@ use windows_sys::Win32::System::Performance::{
 
 use crate::infrastructure::diagnostics::{self, Field, Level};
 use crate::infrastructure::native::{
-    record_hresult_error, record_ntstatus_error_with_fields, record_pdh_error, record_win32_error,
+    record_hresult_error_with_fields, record_ntstatus_error_with_fields,
+    record_pdh_error_with_fields, record_win32_error_with_fields,
 };
 
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -86,33 +87,48 @@ pub(crate) enum GpuSampleError {
 
 impl GpuSampleError {
     pub(crate) fn record(&self) {
+        self.record_with_fields(&[]);
+    }
+
+    fn record_with_fields(&self, extra_fields: &[Field]) {
         if self.is_kmt_capability_unavailable() {
             let Self::NtStatus { status, .. } = *self else {
                 unreachable!("capability predicate only matches NTSTATUS errors");
             };
+            let mut fields = vec![
+                Field::text("capability", "physical_adapter_count"),
+                Field::text("error_domain", "ntstatus"),
+                Field::unsigned("error_code", u64::from(status as u32)),
+            ];
+            fields.extend_from_slice(extra_fields);
             diagnostics::event(
                 Level::Warn,
                 "gpu.kmt_capability_unavailable",
                 "gpu",
                 "D3DKMT physical-adapter enumeration is unavailable",
-                &[
-                    Field::text("capability", "physical_adapter_count"),
-                    Field::text("error_domain", "ntstatus"),
-                    Field::unsigned("error_code", u64::from(status as u32)),
-                ],
+                &fields,
             );
             return;
         }
         match *self {
-            Self::Pdh { context, status } => record_pdh_error(context, status),
-            Self::HResult { context, code } => record_hresult_error(context, code),
-            Self::NtStatus { context, status } => record_ntstatus_error_with_fields(
-                context,
-                status,
-                &[Field::text("operation", context)],
-            ),
-            Self::Win32 { context, code } => record_win32_error(context, code),
-            Self::InvalidData { context } => record_win32_error(context, ERROR_INVALID_DATA),
+            Self::Pdh { context, status } => {
+                record_pdh_error_with_fields(context, status, extra_fields)
+            }
+            Self::HResult { context, code } => {
+                record_hresult_error_with_fields(context, code, extra_fields)
+            }
+            Self::NtStatus { context, status } => {
+                let mut fields = Vec::with_capacity(extra_fields.len() + 1);
+                fields.push(Field::text("operation", context));
+                fields.extend_from_slice(extra_fields);
+                record_ntstatus_error_with_fields(context, status, &fields);
+            }
+            Self::Win32 { context, code } => {
+                record_win32_error_with_fields(context, code, extra_fields)
+            }
+            Self::InvalidData { context } => {
+                record_win32_error_with_fields(context, ERROR_INVALID_DATA, extra_fields)
+            }
         }
     }
 
@@ -125,6 +141,34 @@ impl GpuSampleError {
                     ..
                 }
             )
+    }
+
+    pub(crate) const fn context(&self) -> &'static str {
+        match self {
+            Self::Pdh { context, .. }
+            | Self::HResult { context, .. }
+            | Self::NtStatus { context, .. }
+            | Self::Win32 { context, .. }
+            | Self::InvalidData { context } => context,
+        }
+    }
+
+    pub(crate) const fn error_domain(&self) -> &'static str {
+        match self {
+            Self::Pdh { .. } => "pdh",
+            Self::HResult { .. } => "hresult",
+            Self::NtStatus { .. } => "ntstatus",
+            Self::Win32 { .. } | Self::InvalidData { .. } => "win32",
+        }
+    }
+
+    pub(crate) const fn error_code(&self) -> u32 {
+        match self {
+            Self::Pdh { status, .. } | Self::Win32 { code: status, .. } => *status,
+            Self::HResult { code, .. } => *code as u32,
+            Self::NtStatus { status, .. } => *status as u32,
+            Self::InvalidData { .. } => ERROR_INVALID_DATA,
+        }
     }
 
     fn is_kmt_capability_unavailable(&self) -> bool {
@@ -145,6 +189,81 @@ impl GpuSampleError {
                 ..
             }
         )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum GpuSampleSource {
+    Engine,
+    DedicatedMemory,
+    SharedMemory,
+    Temperature,
+}
+
+impl GpuSampleSource {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Engine => "engine_utilization",
+            Self::DedicatedMemory => "dedicated_memory",
+            Self::SharedMemory => "shared_memory",
+            Self::Temperature => "temperature",
+        }
+    }
+
+    pub(crate) const fn counter_path(self) -> Option<&'static str> {
+        match self {
+            Self::Engine => Some(r"\GPU Engine(*)\Utilization Percentage"),
+            Self::DedicatedMemory => Some(r"\GPU Adapter Memory(*)\Dedicated Usage"),
+            Self::SharedMemory => Some(r"\GPU Adapter Memory(*)\Shared Usage"),
+            Self::Temperature => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GpuSampleIssue {
+    pub(crate) adapter_id: Option<GpuAdapterId>,
+    pub(crate) source: GpuSampleSource,
+    pub(crate) instance_name: Option<String>,
+    pub(crate) error: GpuSampleError,
+}
+
+impl GpuSampleIssue {
+    pub(crate) fn new(
+        adapter_id: Option<GpuAdapterId>,
+        source: GpuSampleSource,
+        instance_name: Option<String>,
+        error: GpuSampleError,
+    ) -> Self {
+        Self {
+            adapter_id,
+            source,
+            instance_name,
+            error,
+        }
+    }
+
+    pub(crate) fn record(&self) {
+        let mut fields = vec![Field::text("gpu_source", self.source.name())];
+        if let Some(counter_path) = self.source.counter_path() {
+            fields.push(Field::text("counter_path", counter_path));
+        }
+        if let Some(adapter_id) = self.adapter_id {
+            fields.extend([
+                Field::signed("adapter_luid_high", i64::from(adapter_id.luid.high_part)),
+                Field::unsigned("adapter_luid_low", u64::from(adapter_id.luid.low_part)),
+                Field::unsigned(
+                    "adapter_physical_index",
+                    u64::from(adapter_id.physical_index),
+                ),
+            ]);
+        } else {
+            fields.push(Field::text("adapter_identity", "unresolved"));
+        }
+        if let Some(instance_name) = self.instance_name.as_deref() {
+            fields.push(Field::sensitive_text("counter_instance", instance_name));
+        }
+        self.error.record_with_fields(&fields);
     }
 }
 
@@ -188,12 +307,12 @@ pub(crate) struct GpuEngineSample {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GpuAdapterSample {
     pub(crate) info: Arc<GpuAdapterInfo>,
-    pub(crate) overall_utilization_percent: u8,
+    pub(crate) overall_utilization_percent: Option<u8>,
     pub(crate) engines: Vec<GpuEngineSample>,
-    pub(crate) dedicated_usage_bytes: u64,
-    pub(crate) shared_usage_bytes: u64,
+    pub(crate) dedicated_usage_bytes: Option<u64>,
+    pub(crate) shared_usage_bytes: Option<u64>,
     pub(crate) temperature_deci_c: Option<u32>,
-    pub(crate) row_errors: Vec<GpuSampleError>,
+    pub(crate) row_errors: Vec<GpuSampleIssue>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -343,8 +343,8 @@ pub fn redraw_window_tree(hwnd: HWND) {
     }
 }
 
-pub fn append_32_bit_suffix(label: &str, is_32_bit: bool) -> Cow<'_, str> {
-    if !is_32_bit {
+pub fn append_32_bit_suffix(label: &str, show_suffix: bool) -> Cow<'_, str> {
+    if !show_suffix {
         return Cow::Borrowed(label);
     }
 

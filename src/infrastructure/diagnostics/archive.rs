@@ -16,7 +16,6 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::path::Path;
 
 use crc32fast::Hasher;
 
@@ -39,29 +38,28 @@ struct CentralEntry {
     local_header_offset: u32,
 }
 
-pub(super) struct StoredZipWriter {
-    file: File,
+pub(super) struct StoredZipWriter<'file> {
+    file: &'file mut File,
     position: u64,
     entries: Vec<CentralEntry>,
 }
 
-impl StoredZipWriter {
-    pub(super) fn create(path: &Path) -> io::Result<Self> {
-        Ok(Self {
-            file: File::create(path)?,
+impl<'file> StoredZipWriter<'file> {
+    pub(super) fn from_file(file: &'file mut File) -> Self {
+        Self {
+            file,
             position: 0,
             entries: Vec::new(),
-        })
+        }
     }
 
-    pub(super) fn add_file_prefix(
+    pub(super) fn add_open_file_prefix(
         &mut self,
         archive_name: &str,
-        path: &Path,
+        source: &mut File,
         length: u64,
     ) -> io::Result<()> {
-        let mut source = File::open(path)?;
-        let mut prefix = (&mut source).take(length);
+        let mut prefix = source.take(length);
         self.add_reader(archive_name, &mut prefix)?;
         if prefix.limit() != 0 {
             return Err(io::Error::new(
@@ -242,7 +240,8 @@ fn zip32_size_error() -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary_archive_path() -> std::path::PathBuf {
@@ -256,10 +255,19 @@ mod tests {
         ))
     }
 
+    fn create_archive_file(path: &Path) -> File {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("archive file should be created exclusively")
+    }
+
     #[test]
     fn writes_streaming_zip_with_central_directory() {
         let path = temporary_archive_path();
-        let mut archive = StoredZipWriter::create(&path).expect("archive should be created");
+        let mut file = create_archive_file(&path);
+        let mut archive = StoredZipWriter::from_file(&mut file);
         archive
             .add_bytes("manifest.json", br#"{"schema":1}"#)
             .expect("entry should be written");
@@ -291,7 +299,8 @@ mod tests {
     #[test]
     fn rejects_parent_and_backslash_entry_names() {
         let path = temporary_archive_path();
-        let mut archive = StoredZipWriter::create(&path).expect("archive should be created");
+        let mut file = create_archive_file(&path);
+        let mut archive = StoredZipWriter::from_file(&mut file);
         assert!(archive.add_bytes("../secret", b"x").is_err());
         assert!(archive.add_bytes("folder\\secret", b"x").is_err());
         drop(archive);
@@ -303,10 +312,11 @@ mod tests {
         let source = temporary_archive_path().with_extension("jsonl");
         let archive_path = temporary_archive_path();
         fs::write(&source, b"complete line\nlater line\n").expect("source should be written");
-        let mut archive =
-            StoredZipWriter::create(&archive_path).expect("archive should be created");
+        let mut source_file = File::open(&source).expect("source should open");
+        let mut archive_file = create_archive_file(&archive_path);
+        let mut archive = StoredZipWriter::from_file(&mut archive_file);
         archive
-            .add_file_prefix("session/log.jsonl", &source, 14)
+            .add_open_file_prefix("session/log.jsonl", &mut source_file, 14)
             .expect("flushed prefix should be archived");
         archive.finish().expect("archive should finish");
 

@@ -961,11 +961,10 @@ fn build_affinity_dialog() -> DialogSpec<'static> {
         let (column, row) = (cpu_index / 16, cpu_index % 16);
         let x = match column {
             0 => 13,
-            1 => 65,
-            2 => 119,
-            _ => 178,
+            1 => 84,
+            2 => 155,
+            _ => 226,
         };
-        let cx = if cpu_index >= 10 { 41 } else { 37 };
         controls.push(ControlSpec {
             class_name: "Button",
             text: CPU_LABELS[cpu_index as usize],
@@ -973,8 +972,8 @@ fn build_affinity_dialog() -> DialogSpec<'static> {
             style: WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX_STYLE,
             ex_style: 0,
             x,
-            y: 35 + (row as i16 * 12),
-            cx,
+            y: 49 + (row as i16 * 12),
+            cx: 67,
             cy: 10,
         });
     }
@@ -985,28 +984,38 @@ fn build_affinity_dialog() -> DialogSpec<'static> {
         style: WS_CHILD | WS_VISIBLE | BS_GROUPBOX_STYLE,
         ex_style: 0,
         x: 7,
-        y: 25,
-        cx: 217,
+        y: 39,
+        cx: 290,
         cy: 204,
     });
-    controls.push(button("OK", 1, BS_DEFPUSHBUTTON_STYLE, 121, 234, 50, 14));
-    controls.push(button("Cancel", 2, 0, 175, 234, 50, 14));
+    controls.push(button("OK", 1, BS_DEFPUSHBUTTON_STYLE, 190, 249, 50, 14));
+    controls.push(button("Cancel", 2, 0, 244, 249, 50, 14));
     controls.push(static_text(
-        "Controls which CPUs in the process's current processor group it may execute on.",
-        IDC_AFFINITY_DESC,
+        "Groups:",
+        IDC_AFFINITY_GROUP_LABEL,
         0,
         7,
-        6,
-        218,
-        19,
+        7,
+        39,
+        10,
+    ));
+    controls.push(combo_box(IDC_AFFINITY_GROUP_SELECTOR, 49, 5, 94, 90));
+    controls.push(static_text(
+        "Controls which CPUs in the selected processor group the process may execute on.",
+        IDC_AFFINITY_DESC,
+        0,
+        150,
+        5,
+        147,
+        28,
     ));
     DialogSpec {
         style: DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU,
         ex_style: 0,
         x: 20,
         y: 20,
-        cx: 232,
-        cy: 253,
+        cx: 304,
+        cy: 269,
         title: "Processor Affinity",
         font_name: DIALOG_FONT_NAME,
         font_size: DIALOG_FONT_SIZE,
@@ -1304,9 +1313,9 @@ pub fn dialog_box(
 mod tests {
     use super::{DialogTemplateBuilder, dialog_spec};
     use crate::ui::resource_ids::{
-        IDC_NICTOTALS, IDC_PROCLIST, IDC_TASKLIST, IDD_AFFINITY, IDD_CPUPAGE, IDD_DIAGNOSTICS,
-        IDD_GPUPAGE, IDD_MAINWND, IDD_MESSAGE, IDD_NETPAGE, IDD_PERFPAGE, IDD_PROCPAGE,
-        IDD_SELECTPROCCOLS, IDD_TASKPAGE, IDD_USERSPAGE,
+        IDC_AFFINITY_GROUP_SELECTOR, IDC_NICTOTALS, IDC_PROCLIST, IDC_TASKLIST, IDD_AFFINITY,
+        IDD_CPUPAGE, IDD_DIAGNOSTICS, IDD_GPUPAGE, IDD_MAINWND, IDD_MESSAGE, IDD_NETPAGE,
+        IDD_PERFPAGE, IDD_PROCPAGE, IDD_SELECTPROCCOLS, IDD_TASKPAGE, IDD_USERSPAGE,
     };
     use windows_sys::Win32::UI::Controls::LVS_OWNERDATA;
 
@@ -1352,5 +1361,15 @@ mod tests {
                 .unwrap();
             assert_eq!((control.style & LVS_OWNERDATA) != 0, expected);
         }
+    }
+
+    #[test]
+    fn affinity_dialog_exposes_a_processor_group_selector() {
+        let spec = dialog_spec(IDD_AFFINITY).unwrap();
+        assert!(
+            spec.controls
+                .iter()
+                .any(|control| control.id == IDC_AFFINITY_GROUP_SELECTOR as u16)
+        );
     }
 }

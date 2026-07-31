@@ -846,7 +846,6 @@ impl ProcessPageState {
             );
         }
         if let Some(error) = drain.error {
-            self.worker = None;
             self.set_refresh_error(error);
         }
     }
@@ -1354,8 +1353,9 @@ fn column_id_from_i32(value: i32) -> Option<ColumnId> {
 #[cfg(test)]
 mod tests {
     use super::actions::{
-        affinity_cpu_mask, extract_first_command_token, is_valid_process_tree_edge,
-        normalize_debugger_command_with, validate_snapshot_root_identity,
+        affinity_cpu_mask, affinity_is_within_selection, affinity_target_for_thread,
+        extract_first_command_token, is_valid_process_tree_edge, normalize_debugger_command_with,
+        validate_snapshot_root_identity,
     };
     use super::model::{DirtyColumns, ProcEntry};
     use super::sampler::{
@@ -1377,7 +1377,7 @@ mod tests {
             pid: 1234,
             image_name: image_name.to_string(),
             image_name_lower: image_name.to_lowercase(),
-            is_32_bit: None,
+            show_32_bit_suffix: None,
             user_name: String::new(),
             user_name_lower: String::new(),
             session_id: None,
@@ -1521,10 +1521,28 @@ mod tests {
     }
 
     #[test]
-    fn affinity_mask_supports_the_full_64_bit_processor_group() {
+    fn affinity_mask_supports_the_full_native_kaffinity_width() {
+        let highest_processor = i32::try_from(usize::BITS - 1).unwrap();
         assert_eq!(affinity_cpu_mask(0), 1);
-        assert_eq!(affinity_cpu_mask(63), 1usize << 63);
-        assert_eq!(affinity_cpu_mask(64), 0);
+        assert_eq!(
+            affinity_cpu_mask(highest_processor),
+            1usize << (usize::BITS - 1)
+        );
+        assert_eq!(affinity_cpu_mask(highest_processor + 1), 0);
+    }
+
+    #[test]
+    fn multigroup_affinity_plan_keeps_group_and_mask_together() {
+        let groups = [(0, 0b0011), (1, 0b1100)];
+        assert_eq!(affinity_target_for_thread(0, &groups), Some((0, 0b0011)));
+        assert_eq!(affinity_target_for_thread(1, &groups), Some((1, 0b1100)));
+        assert_eq!(affinity_target_for_thread(2, &groups), Some((0, 0b0011)));
+        assert_eq!(affinity_target_for_thread(0, &[]), None);
+        assert!(affinity_is_within_selection(0, 0b0010, &groups));
+        assert!(affinity_is_within_selection(1, 0b1000, &groups));
+        assert!(!affinity_is_within_selection(0, 0b0100, &groups));
+        assert!(!affinity_is_within_selection(2, 0b0001, &groups));
+        assert!(!affinity_is_within_selection(0, 0, &groups));
     }
 
     #[test]

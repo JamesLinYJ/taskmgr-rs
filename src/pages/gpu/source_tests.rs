@@ -203,29 +203,54 @@ fn aggregates_process_instances_per_engine_and_uses_busiest_engine() {
     .unwrap();
     assert_eq!(result[0].engines[0].utilization_percent, 66);
     assert_eq!(result[0].engines[1].utilization_percent, 80);
-    assert_eq!(result[0].overall_utilization_percent, 80);
-    assert_eq!(result[0].dedicated_usage_bytes, 1024);
-    assert_eq!(result[0].shared_usage_bytes, 2048);
+    assert_eq!(result[0].overall_utilization_percent, Some(80));
+    assert_eq!(result[0].dedicated_usage_bytes, Some(1024));
+    assert_eq!(result[0].shared_usage_bytes, Some(2048));
     assert_eq!(result[0].temperature_deci_c, Some(0));
 
-    let known_kinds = validated_engine_kinds(&HashMap::new(), &result).unwrap();
+    let mut validated = result.clone();
+    let known_kinds = validated_engine_kinds(&HashMap::new(), &mut validated);
     let mut changed = result.clone();
     changed[0].engines[0].kind = GpuEngineKind::Copy;
+    validated_engine_kinds(&known_kinds, &mut changed);
+    assert_eq!(changed[0].overall_utilization_percent, None);
     assert_eq!(
-        validated_engine_kinds(&known_kinds, &changed).unwrap_err(),
+        changed[0].row_errors.last().map(|issue| &issue.error),
+        Some(&GpuSampleError::InvalidData {
+            context: "GPU engine type changed without a topology generation"
+        })
+    );
+    assert_eq!(
+        changed[0].row_errors.last().map(|issue| issue.source),
+        Some(GpuSampleSource::Engine)
+    );
+    assert_eq!(
+        changed[0]
+            .row_errors
+            .last()
+            .and_then(|issue| issue.adapter_id),
+        Some(id)
+    );
+    assert_eq!(
+        changed[0].engines.len(),
+        1,
+        "only the conflicting engine is rejected"
+    );
+    assert_eq!(
         GpuSampleError::InvalidData {
             context: "GPU engine type changed without a topology generation"
-        }
+        },
+        changed[0].row_errors.last().unwrap().error
     );
 }
 
 #[test]
-fn missing_memory_counter_instances_are_not_reported_as_zero() {
+fn missing_memory_counter_instances_are_row_errors_instead_of_zero_or_global_failure() {
     let id = GpuAdapterId {
         luid: AdapterLuid::from_parts(0, 1),
         physical_index: 0,
     };
-    let error = assemble_samples(
+    let samples = assemble_samples(
         &[adapter_info(id)],
         &HashSet::from([id.luid]),
         Vec::new(),
@@ -233,11 +258,126 @@ fn missing_memory_counter_instances_are_not_reported_as_zero() {
         Vec::new(),
         HashMap::from([(id, Ok(None))]),
     )
-    .unwrap_err();
+    .unwrap();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].dedicated_usage_bytes, None);
+    assert_eq!(samples[0].shared_usage_bytes, None);
+    assert_eq!(samples[0].row_errors.len(), 2);
     assert_eq!(
-        error,
+        samples[0]
+            .row_errors
+            .iter()
+            .map(|issue| (issue.adapter_id, issue.source, &issue.error))
+            .collect::<Vec<_>>(),
+        [
+            (
+                Some(id),
+                GpuSampleSource::DedicatedMemory,
+                &GpuSampleError::InvalidData {
+                    context: "missing dedicated GPU memory instance"
+                }
+            ),
+            (
+                Some(id),
+                GpuSampleSource::SharedMemory,
+                &GpuSampleError::InvalidData {
+                    context: "missing shared GPU memory instance"
+                }
+            )
+        ]
+    );
+}
+
+#[test]
+fn one_adapter_missing_memory_does_not_hide_a_healthy_adapter() {
+    let healthy = GpuAdapterId {
+        luid: AdapterLuid::from_parts(0, 0x31),
+        physical_index: 0,
+    };
+    let broken = GpuAdapterId {
+        luid: AdapterLuid::from_parts(0, 0x32),
+        physical_index: 0,
+    };
+    let samples = assemble_samples(
+        &[adapter_info(healthy), adapter_info(broken)],
+        &HashSet::from([healthy.luid, broken.luid]),
+        Vec::new(),
+        vec![MemoryReading {
+            instance_name: "luid_0x0_0x31_phys_0".to_string(),
+            bytes: 100,
+        }],
+        vec![MemoryReading {
+            instance_name: "luid_0x0_0x31_phys_0".to_string(),
+            bytes: 200,
+        }],
+        HashMap::from([(healthy, Ok(None)), (broken, Ok(None))]),
+    )
+    .unwrap();
+
+    assert_eq!(samples.len(), 2);
+    assert_eq!(samples[0].info.id, healthy);
+    assert_eq!(samples[0].dedicated_usage_bytes, Some(100));
+    assert_eq!(samples[0].shared_usage_bytes, Some(200));
+    assert!(samples[0].row_errors.is_empty());
+    assert_eq!(samples[1].info.id, broken);
+    assert_eq!(samples[1].dedicated_usage_bytes, None);
+    assert_eq!(samples[1].shared_usage_bytes, None);
+    assert_eq!(samples[1].row_errors.len(), 2);
+}
+
+#[test]
+fn malformed_secondary_engine_value_keeps_the_primary_adapter_advancing() {
+    let healthy = GpuAdapterId {
+        luid: AdapterLuid::from_parts(0, 0x51),
+        physical_index: 0,
+    };
+    let broken = GpuAdapterId {
+        luid: AdapterLuid::from_parts(0, 0x52),
+        physical_index: 0,
+    };
+    let memory = |id: GpuAdapterId, bytes| MemoryReading {
+        instance_name: format!(
+            "luid_0x{:x}_0x{:x}_phys_{}",
+            id.luid.high_part, id.luid.low_part, id.physical_index
+        ),
+        bytes,
+    };
+    let samples = assemble_samples(
+        &[adapter_info(healthy), adapter_info(broken)],
+        &HashSet::from([healthy.luid, broken.luid]),
+        vec![
+            EngineReading {
+                instance_name: "pid_1_luid_0x0_0x51_phys_0_eng_0_engtype_3d".to_string(),
+                utilization: 61.0,
+            },
+            EngineReading {
+                instance_name: "pid_2_luid_0x0_0x52_phys_0_eng_0_engtype_3d".to_string(),
+                utilization: f64::NAN,
+            },
+        ],
+        vec![memory(healthy, 100), memory(broken, 200)],
+        vec![memory(healthy, 300), memory(broken, 400)],
+        HashMap::from([(healthy, Ok(None)), (broken, Ok(None))]),
+    )
+    .unwrap();
+
+    assert_eq!(samples[0].overall_utilization_percent, Some(61));
+    assert!(samples[0].row_errors.is_empty());
+    assert_eq!(samples[1].overall_utilization_percent, None);
+    let issue = samples[1]
+        .row_errors
+        .iter()
+        .find(|issue| issue.source == GpuSampleSource::Engine)
+        .unwrap();
+    assert_eq!(issue.adapter_id, Some(broken));
+    assert_eq!(
+        issue.source.counter_path(),
+        Some(r"\GPU Engine(*)\Utilization Percentage")
+    );
+    assert_eq!(
+        issue.error,
         GpuSampleError::InvalidData {
-            context: "missing dedicated GPU memory instance"
+            context: "GPU engine utilization value"
         }
     );
 }
@@ -292,13 +432,13 @@ fn physical_indices_under_one_luid_remain_distinct() {
 
     assert_eq!(samples.len(), 2);
     assert_eq!(samples[0].info.id, first);
-    assert_eq!(samples[0].overall_utilization_percent, 10);
-    assert_eq!(samples[0].dedicated_usage_bytes, 100);
-    assert_eq!(samples[0].shared_usage_bytes, 300);
+    assert_eq!(samples[0].overall_utilization_percent, Some(10));
+    assert_eq!(samples[0].dedicated_usage_bytes, Some(100));
+    assert_eq!(samples[0].shared_usage_bytes, Some(300));
     assert_eq!(samples[1].info.id, second);
-    assert_eq!(samples[1].overall_utilization_percent, 20);
-    assert_eq!(samples[1].dedicated_usage_bytes, 200);
-    assert_eq!(samples[1].shared_usage_bytes, 400);
+    assert_eq!(samples[1].overall_utilization_percent, Some(20));
+    assert_eq!(samples[1].dedicated_usage_bytes, Some(200));
+    assert_eq!(samples[1].shared_usage_bytes, Some(400));
 }
 
 #[test]
@@ -332,17 +472,26 @@ fn known_non_displayed_adapter_instances_are_ignored_without_weakening_identity_
         instance_name: "pid_1_luid_0x0_0x30_phys_0_eng_0_engtype_3d".to_string(),
         utilization: 1.0,
     };
-    assert!(
-        assemble_samples(
-            &[adapter_info(displayed)],
-            &HashSet::from([displayed.luid, non_displayed_luid]),
-            vec![unknown],
-            Vec::new(),
-            Vec::new(),
-            HashMap::from([(displayed, Ok(None))]),
-        )
-        .is_err()
+    let partial = assemble_samples(
+        &[adapter_info(displayed)],
+        &HashSet::from([displayed.luid, non_displayed_luid]),
+        vec![unknown],
+        Vec::new(),
+        Vec::new(),
+        HashMap::from([(displayed, Ok(None))]),
     );
+    let partial = partial.unwrap();
+    assert_eq!(partial.len(), 1);
+    assert_eq!(partial[0].overall_utilization_percent, None);
+    assert!(partial[0].row_errors.iter().any(|issue| {
+        issue.source == GpuSampleSource::Engine
+            && issue.adapter_id
+                == Some(GpuAdapterId {
+                    luid: AdapterLuid::from_parts(0, 0x30),
+                    physical_index: 0,
+                })
+            && issue.source.counter_path() == Some(r"\GPU Engine(*)\Utilization Percentage")
+    }));
 }
 
 #[test]
@@ -352,7 +501,7 @@ fn clamps_only_the_final_engine_display_value() {
 }
 
 #[test]
-fn rejects_duplicate_process_engine_instances() {
+fn duplicate_process_engine_instances_only_stale_the_affected_adapter() {
     let id = GpuAdapterId {
         luid: AdapterLuid::from_parts(0, 7),
         physical_index: 0,
@@ -362,17 +511,24 @@ fn rejects_duplicate_process_engine_instances() {
         instance_name: "pid_1_luid_0x0_0x7_phys_0_eng_0_engtype_3d".to_string(),
         utilization: 1.0,
     };
-    assert!(
-        assemble_samples(
-            &[info],
-            &HashSet::from([id.luid]),
-            vec![reading.clone(), reading],
-            Vec::new(),
-            Vec::new(),
-            HashMap::new(),
-        )
-        .is_err()
-    );
+    let samples = assemble_samples(
+        &[info],
+        &HashSet::from([id.luid]),
+        vec![reading.clone(), reading],
+        Vec::new(),
+        Vec::new(),
+        HashMap::from([(id, Ok(None))]),
+    )
+    .unwrap();
+    assert_eq!(samples[0].overall_utilization_percent, None);
+    assert!(samples[0].row_errors.iter().any(|issue| {
+        issue.adapter_id == Some(id)
+            && issue.source == GpuSampleSource::Engine
+            && issue.error
+                == GpuSampleError::InvalidData {
+                    context: "duplicate GPU engine process instance",
+                }
+    }));
 }
 
 #[test]

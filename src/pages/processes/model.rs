@@ -62,7 +62,7 @@ pub struct ProcEntry {
     pub(super) pid: u32,
     pub(super) image_name: String,
     pub(super) image_name_lower: String,
-    pub(super) is_32_bit: Option<bool>,
+    pub(super) show_32_bit_suffix: Option<bool>,
     pub(super) user_name: String,
     pub(super) user_name_lower: String,
     pub(super) session_id: Option<u32>,
@@ -86,7 +86,7 @@ pub struct ProcEntry {
 
 #[derive(Clone)]
 pub(super) struct ProcStaticMetadata {
-    pub(super) is_32_bit: Option<bool>,
+    pub(super) show_32_bit_suffix: Option<bool>,
     pub(super) user_name: String,
     pub(super) user_name_lower: String,
     pub(super) session_id: Option<u32>,
@@ -195,7 +195,8 @@ impl ProcEntry {
     fn rebuild_display_column(&mut self, column_id: ColumnId) {
         let text = match column_id {
             ColumnId::ImageName => {
-                append_32_bit_suffix(&self.image_name, self.is_32_bit == Some(true)).into_owned()
+                append_32_bit_suffix(&self.image_name, self.show_32_bit_suffix == Some(true))
+                    .into_owned()
             }
             ColumnId::Pid => self.pid.to_string(),
             ColumnId::Username => self.user_name.clone(),
@@ -220,7 +221,7 @@ impl ProcEntry {
     }
 
     pub(super) fn apply_static_metadata(&mut self, metadata: &ProcStaticMetadata) {
-        self.is_32_bit = metadata.is_32_bit;
+        self.show_32_bit_suffix = metadata.show_32_bit_suffix;
         self.user_name.clone_from(&metadata.user_name);
         self.user_name_lower.clone_from(&metadata.user_name_lower);
         self.session_id = metadata.session_id;
@@ -251,13 +252,13 @@ pub(super) fn update_process_entry(
     let mut changed = DirtyColumns::default();
 
     let image_name_changed = entry.image_name != snapshot.image_name;
-    let bitness_changed = entry.is_32_bit != snapshot.is_32_bit;
+    let bitness_changed = entry.show_32_bit_suffix != snapshot.show_32_bit_suffix;
     if image_name_changed {
         entry.image_name.clone_from(&snapshot.image_name);
         entry.image_name_lower = snapshot.image_name_lower.clone();
     }
     if bitness_changed {
-        entry.is_32_bit = snapshot.is_32_bit;
+        entry.show_32_bit_suffix = snapshot.show_32_bit_suffix;
     }
     if image_name_changed || bitness_changed {
         mark_process_column_changed(entry, &mut changed, ColumnId::ImageName, visible_columns);

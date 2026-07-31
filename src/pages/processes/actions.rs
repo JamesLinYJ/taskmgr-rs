@@ -17,12 +17,14 @@ use std::path::Path;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_INVALID_HANDLE,
-    ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND,
-    FILETIME, GetLastError, HWND, LPARAM, WPARAM,
+    ERROR_BUSY, ERROR_FILE_NOT_FOUND, ERROR_GEN_FAILURE, ERROR_INSUFFICIENT_BUFFER,
+    ERROR_INVALID_DATA, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES,
+    ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND, FILETIME, GetLastError, HANDLE, HWND, LPARAM,
+    WPARAM,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+    TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows_sys::Win32::System::Registry::{
@@ -30,29 +32,33 @@ use windows_sys::Win32::System::Registry::{
     RegQueryValueExW,
 };
 use windows_sys::Win32::System::SystemInformation::{
-    GetSystemTimeAsFileTime, GetWindowsDirectoryW,
+    GROUP_AFFINITY, GetSystemTimeAsFileTime, GetWindowsDirectoryW,
 };
 use windows_sys::Win32::System::Threading::{
     ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, CreateProcessW,
-    GetProcessAffinityMask, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
+    GetProcessAffinityMask, GetProcessGroupAffinity, GetProcessIdOfThread, GetThreadGroupAffinity,
+    HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, OpenThread,
     PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SET_INFORMATION, PROCESS_TERMINATE, QueryFullProcessImageNameW,
-    REALTIME_PRIORITY_CLASS, STARTUPINFOW, SetPriorityClass, SetProcessAffinityMask,
-    TerminateProcess,
+    PROCESS_SET_INFORMATION, PROCESS_SET_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    QueryFullProcessImageNameW, REALTIME_PRIORITY_CLASS, STARTUPINFOW, SetPriorityClass,
+    SetProcessAffinityMask, SetProcessDefaultCpuSets, SetThreadGroupAffinity,
+    THREAD_QUERY_LIMITED_INFORMATION, THREAD_SET_INFORMATION, TerminateProcess,
 };
 use windows_sys::Win32::UI::Controls::{
     BST_CHECKED, BST_UNCHECKED, CheckDlgButton, IsDlgButtonChecked,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EndDialog, GetDlgItem, IDCANCEL, IDOK, IDYES, MB_ICONERROR, MB_ICONEXCLAMATION, MB_OK,
-    MB_YESNO, MessageBoxW, WM_COMMAND, WM_INITDIALOG,
+    CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, CBN_SELCHANGE, EndDialog,
+    GetDlgItem, IDCANCEL, IDOK, IDYES, MB_ICONERROR, MB_ICONEXCLAMATION, MB_OK, MB_YESNO,
+    MessageBoxW, SendMessageW, SetWindowTextW, WM_COMMAND, WM_INITDIALOG,
 };
 
 use super::{ProcPriority, ProcessPageState};
 use crate::infrastructure::native::{
-    OwnedHandle, get_window_userdata, loword, set_window_userdata, to_wide_null,
+    OwnedHandle, get_window_userdata, hiword, loword, set_window_userdata, to_wide_null,
 };
+use crate::system::cpu_sets::{CpuSetTopology, query_process_default_cpu_sets};
 use crate::system::process_identity::{
     ProcIdentity, open_process_for_identity, query_process_identity_for_pid,
 };
@@ -60,11 +66,13 @@ use crate::ui::dialogs::dialog_box;
 use crate::ui::localization::localize_dialog;
 use crate::ui::resource_ids::*;
 
-// “设置亲和性”对话框的上下文，包含当前进程掩码。
+// “设置亲和性”对话框的上下文。每个掩码都与 `topology.groups()[index]` 的组号绑定。
 struct AffinityDialogContext {
     page: *mut ProcessPageState,
-    process_mask: usize,
-    system_mask: usize,
+    topology: CpuSetTopology,
+    selected_masks: Vec<usize>,
+    selected_group_index: usize,
+    original_default_ids: Vec<u32>,
 }
 
 impl ProcessPageState {
@@ -422,12 +430,16 @@ impl ProcessPageState {
         }
     }
 
-    // 通过 SetProcessAffinityMask 设置进程 CPU 亲和性。用户通过对话框选择 CPU。
+    // Single-group processes retain the classic hard-affinity API. Multi-group systems use CPU
+    // Set IDs, whose group-qualified identities do not collapse at the 64-processor boundary.
     pub(super) unsafe fn set_affinity(&mut self, identity: ProcIdentity) -> bool {
         unsafe {
             let handle = match open_process_for_identity(
                 identity,
-                PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION,
+                PROCESS_QUERY_INFORMATION
+                    | PROCESS_QUERY_LIMITED_INFORMATION
+                    | PROCESS_SET_INFORMATION
+                    | PROCESS_SET_LIMITED_INFORMATION,
             ) {
                 Ok(handle) => handle,
                 Err(error) => {
@@ -436,57 +448,401 @@ impl ProcessPageState {
                 }
             };
 
-            let mut process_mask = 0usize;
-            let mut system_mask = 0usize;
-            let mut success = false;
-
-            if GetProcessAffinityMask(handle.as_raw(), &mut process_mask, &mut system_mask) != 0 {
-                process_mask &= system_mask;
-                if process_mask == 0 || system_mask == 0 {
-                    self.show_failure_message(&self.strings.cant_set_affinity, ERROR_NOT_SUPPORTED);
+            let topology = match CpuSetTopology::query(handle.as_raw()) {
+                Ok(topology) => topology,
+                Err(error) => {
+                    self.show_failure_message(&self.strings.cant_set_affinity, error.win32_code());
                     return false;
                 }
-                let mut context = AffinityDialogContext {
-                    page: self as *mut ProcessPageState,
-                    process_mask,
-                    system_mask,
-                };
-                match dialog_box(
-                    self.hinstance,
-                    IDD_AFFINITY,
-                    self.hwnd_page,
-                    Some(affinity_dialog_proc),
-                    &mut context as *mut AffinityDialogContext as LPARAM,
-                ) {
-                    Ok(result) if result == IDOK as isize => {
-                        if SetProcessAffinityMask(handle.as_raw(), context.process_mask) == 0 {
-                            self.show_failure_message(
-                                &self.strings.cant_set_affinity,
-                                windows_sys::Win32::Foundation::GetLastError(),
-                            );
-                        } else {
+            };
+            let original_default_ids = match query_process_default_cpu_sets(handle.as_raw()) {
+                Ok(ids) => ids,
+                Err(error) => {
+                    self.show_failure_message(&self.strings.cant_set_affinity, error.win32_code());
+                    return false;
+                }
+            };
+            let original_process_groups = match query_process_groups(handle.as_raw()) {
+                Ok(groups) => groups,
+                Err(error) => {
+                    self.show_failure_message(&self.strings.cant_set_affinity, error);
+                    return false;
+                }
+            };
+            let selected_masks = match initial_affinity_masks(
+                handle.as_raw(),
+                &topology,
+                &original_default_ids,
+                &original_process_groups,
+            ) {
+                Ok(masks) => masks,
+                Err(error) => {
+                    self.show_failure_message(&self.strings.cant_set_affinity, error);
+                    return false;
+                }
+            };
+            let selected_group_index = selected_masks
+                .iter()
+                .position(|mask| *mask != 0)
+                .unwrap_or(0);
+            let mut context = AffinityDialogContext {
+                page: self as *mut ProcessPageState,
+                topology,
+                selected_masks,
+                selected_group_index,
+                original_default_ids,
+            };
+
+            match dialog_box(
+                self.hinstance,
+                IDD_AFFINITY,
+                self.hwnd_page,
+                Some(affinity_dialog_proc),
+                &mut context as *mut AffinityDialogContext as LPARAM,
+            ) {
+                Ok(result) if result == IDOK as isize => {
+                    match apply_affinity_selection(handle.as_raw(), identity.pid, &context) {
+                        Ok(()) => {
                             self.refresh_processes();
-                            success = true;
+                            true
+                        }
+                        Err(error) => {
+                            self.show_failure_message(&self.strings.cant_set_affinity, error);
+                            false
                         }
                     }
-                    Ok(_) => {}
-                    Err(error) => {
-                        self.show_failure_message(&self.strings.cant_set_affinity, error);
-                    }
                 }
-            } else {
-                self.show_failure_message(
-                    &self.strings.cant_set_affinity,
-                    windows_sys::Win32::Foundation::GetLastError(),
-                );
+                Ok(_) => false,
+                Err(error) => {
+                    self.show_failure_message(&self.strings.cant_set_affinity, error);
+                    false
+                }
             }
-
-            success
         }
     }
 }
-// “设置亲和性”对话框过程。根据 processor_count 启用/禁用 CPU 勾选框，
-// 确认时检查至少选中一个 CPU，否则弹错误提示。
+
+unsafe fn initial_affinity_masks(
+    process: HANDLE,
+    topology: &CpuSetTopology,
+    default_ids: &[u32],
+    process_groups: &[u16],
+) -> Result<Vec<usize>, u32> {
+    if !default_ids.is_empty() {
+        return topology
+            .masks_for_ids(default_ids)
+            .map_err(|error| error.win32_code());
+    }
+
+    if topology.groups().len() > 1 && process_groups.len() > 1 {
+        return Ok(topology.unrestricted_masks());
+    }
+
+    let mut process_mask = 0usize;
+    let mut system_mask = 0usize;
+    if unsafe { GetProcessAffinityMask(process, &mut process_mask, &mut system_mask) } == 0 {
+        return Err(nonzero_last_error());
+    }
+    let group_number = process_groups
+        .first()
+        .copied()
+        .or_else(|| topology.groups().first().map(|group| group.number))
+        .ok_or(ERROR_NOT_SUPPORTED)?;
+    let group_index = topology
+        .groups()
+        .iter()
+        .position(|group| group.number == group_number)
+        .ok_or(ERROR_INVALID_DATA)?;
+    let group = &topology.groups()[group_index];
+    let selected = process_mask & system_mask & group.assignable_mask;
+    if selected == 0 {
+        return Err(ERROR_NOT_SUPPORTED);
+    }
+    let mut masks = vec![0usize; topology.groups().len()];
+    masks[group_index] = selected;
+    Ok(masks)
+}
+
+unsafe fn apply_affinity_selection(
+    process: HANDLE,
+    process_id: u32,
+    context: &AffinityDialogContext,
+) -> Result<(), u32> {
+    let selected_ids = context
+        .topology
+        .ids_for_masks(&context.selected_masks)
+        .map_err(|error| error.win32_code())?;
+    if selected_ids.is_empty() {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+
+    if context.topology.groups().len() == 1 {
+        unsafe {
+            set_process_default_cpu_sets(process, &[])?;
+            if SetProcessAffinityMask(process, context.selected_masks[0]) == 0 {
+                let error = nonzero_last_error();
+                let _ = set_process_default_cpu_sets(process, &context.original_default_ids);
+                return Err(error);
+            }
+        }
+        return Ok(());
+    }
+
+    unsafe { set_process_default_cpu_sets(process, &selected_ids)? };
+    let selected_groups = context
+        .topology
+        .groups()
+        .iter()
+        .zip(context.selected_masks.iter().copied())
+        .filter(|(_, mask)| *mask != 0)
+        .map(|(group, mask)| (group.number, mask))
+        .collect::<Vec<_>>();
+
+    // CPU Sets span groups, but a restrictive thread affinity mask takes precedence over a
+    // conflicting CPU Set assignment. Apply a group-qualified hard mask to every existing thread
+    // so an old per-thread affinity cannot keep using a CPU the user just deselected. The process
+    // default CPU Sets above cover threads created after the verified thread snapshot.
+    if let Err(error) = unsafe { apply_thread_group_affinities(process_id, &selected_groups) } {
+        let _ = unsafe { set_process_default_cpu_sets(process, &context.original_default_ids) };
+        return Err(error);
+    }
+    Ok(())
+}
+
+unsafe fn set_process_default_cpu_sets(process: HANDLE, ids: &[u32]) -> Result<(), u32> {
+    let (pointer, count) = if ids.is_empty() {
+        (null(), 0)
+    } else {
+        (
+            ids.as_ptr(),
+            u32::try_from(ids.len()).map_err(|_| ERROR_INVALID_PARAMETER)?,
+        )
+    };
+    if unsafe { SetProcessDefaultCpuSets(process, pointer, count) } == 0 {
+        Err(nonzero_last_error())
+    } else {
+        Ok(())
+    }
+}
+
+struct ChangedThreadAffinity {
+    handle: OwnedHandle,
+    previous: GROUP_AFFINITY,
+}
+
+unsafe fn apply_thread_group_affinities(
+    process_id: u32,
+    selected_groups: &[(u16, usize)],
+) -> Result<(), u32> {
+    if selected_groups.is_empty() {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+
+    let mut changed = Vec::<ChangedThreadAffinity>::new();
+    let mut seen = HashSet::<u32>::new();
+    let mut assignment_index = 0usize;
+    let result = (|| -> Result<(), u32> {
+        let thread_ids = unsafe { enumerate_process_threads(process_id)? };
+        for thread_id in thread_ids {
+            let raw_thread = unsafe {
+                OpenThread(
+                    THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_INFORMATION,
+                    0,
+                    thread_id,
+                )
+            };
+            let Some(thread) = OwnedHandle::new(raw_thread) else {
+                let error = nonzero_last_error();
+                if matches!(error, ERROR_INVALID_HANDLE | ERROR_INVALID_PARAMETER) {
+                    continue;
+                }
+                return Err(error);
+            };
+            if unsafe { GetProcessIdOfThread(thread.as_raw()) } != process_id {
+                return Err(ERROR_INVALID_DATA);
+            }
+
+            let (group, mask) = affinity_target_for_thread(assignment_index, selected_groups)
+                .ok_or(ERROR_INVALID_PARAMETER)?;
+            assignment_index += 1;
+            let target = GROUP_AFFINITY {
+                Mask: mask,
+                Group: group,
+                Reserved: [0; 3],
+            };
+            let mut previous = unsafe { zeroed::<GROUP_AFFINITY>() };
+            if unsafe { SetThreadGroupAffinity(thread.as_raw(), &target, &mut previous) } == 0 {
+                let error = nonzero_last_error();
+                if error == ERROR_INVALID_HANDLE {
+                    continue;
+                }
+                return Err(error);
+            }
+            seen.insert(thread_id);
+            changed.push(ChangedThreadAffinity {
+                handle: thread,
+                previous,
+            });
+        }
+        if changed.is_empty() {
+            return Err(ERROR_NOT_SUPPORTED);
+        }
+        unsafe {
+            verify_racing_thread_affinities(process_id, &seen, selected_groups)?;
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        for changed_thread in changed.iter().rev() {
+            unsafe {
+                SetThreadGroupAffinity(
+                    changed_thread.handle.as_raw(),
+                    &changed_thread.previous,
+                    null_mut(),
+                );
+            }
+        }
+    }
+    result
+}
+
+unsafe fn verify_racing_thread_affinities(
+    process_id: u32,
+    changed_thread_ids: &HashSet<u32>,
+    selected_groups: &[(u16, usize)],
+) -> Result<(), u32> {
+    for thread_id in unsafe { enumerate_process_threads(process_id)? } {
+        if changed_thread_ids.contains(&thread_id) {
+            continue;
+        }
+        let raw_thread = unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, thread_id) };
+        let Some(thread) = OwnedHandle::new(raw_thread) else {
+            let error = nonzero_last_error();
+            if matches!(error, ERROR_INVALID_HANDLE | ERROR_INVALID_PARAMETER) {
+                continue;
+            }
+            return Err(error);
+        };
+        if unsafe { GetProcessIdOfThread(thread.as_raw()) } != process_id {
+            return Err(ERROR_INVALID_DATA);
+        }
+        let mut affinity = unsafe { zeroed::<GROUP_AFFINITY>() };
+        if unsafe { GetThreadGroupAffinity(thread.as_raw(), &mut affinity) } == 0 {
+            return Err(nonzero_last_error());
+        }
+        if !affinity_is_within_selection(affinity.Group, affinity.Mask, selected_groups) {
+            return Err(ERROR_BUSY);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn affinity_is_within_selection(
+    group: u16,
+    mask: usize,
+    selected_groups: &[(u16, usize)],
+) -> bool {
+    mask != 0
+        && selected_groups
+            .iter()
+            .find_map(|(selected_group, selected_mask)| {
+                (*selected_group == group).then_some(*selected_mask)
+            })
+            .is_some_and(|selected_mask| mask & !selected_mask == 0)
+}
+
+pub(super) fn affinity_target_for_thread(
+    thread_index: usize,
+    selected_groups: &[(u16, usize)],
+) -> Option<(u16, usize)> {
+    selected_groups
+        .get(thread_index.checked_rem(selected_groups.len())?)
+        .copied()
+}
+
+unsafe fn enumerate_process_threads(process_id: u32) -> Result<Vec<u32>, u32> {
+    let raw_snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    let Some(snapshot) = OwnedHandle::new(raw_snapshot) else {
+        return Err(nonzero_last_error());
+    };
+    let mut entry = unsafe { zeroed::<THREADENTRY32>() };
+    entry.dwSize = size_of::<THREADENTRY32>() as u32;
+    if unsafe { Thread32First(snapshot.as_raw(), &mut entry) } == 0 {
+        let error = nonzero_last_error();
+        return if error == ERROR_NO_MORE_FILES {
+            Ok(Vec::new())
+        } else {
+            Err(error)
+        };
+    }
+
+    let mut thread_ids = Vec::new();
+    loop {
+        if entry.th32OwnerProcessID == process_id {
+            thread_ids.push(entry.th32ThreadID);
+        }
+        entry.dwSize = size_of::<THREADENTRY32>() as u32;
+        if unsafe { Thread32Next(snapshot.as_raw(), &mut entry) } == 0 {
+            let error = unsafe { GetLastError() };
+            if error != ERROR_NO_MORE_FILES {
+                return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+            }
+            break;
+        }
+    }
+    thread_ids.sort_unstable();
+    thread_ids.dedup();
+    Ok(thread_ids)
+}
+
+unsafe fn query_process_groups(process: HANDLE) -> Result<Vec<u16>, u32> {
+    let mut required = 0u16;
+    if unsafe { GetProcessGroupAffinity(process, &mut required, null_mut()) } != 0 {
+        return Err(ERROR_INVALID_DATA);
+    }
+    let error = unsafe { GetLastError() };
+    if error != ERROR_INSUFFICIENT_BUFFER || required == 0 {
+        return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+    }
+
+    for _ in 0..3 {
+        // `GetProcessGroupAffinity` requires DWORD-aligned storage even though the public element
+        // type is `USHORT`, so back the array with `u32` words and expose only the required u16s.
+        let mut storage = vec![0u32; usize::from(required).div_ceil(2)];
+        let capacity = storage.len() * 2;
+        let mut returned = u16::try_from(capacity).unwrap_or(u16::MAX);
+        if unsafe {
+            GetProcessGroupAffinity(process, &mut returned, storage.as_mut_ptr().cast::<u16>())
+        } != 0
+        {
+            if returned == 0 || usize::from(returned) > capacity {
+                return Err(ERROR_INVALID_DATA);
+            }
+            let mut groups = Vec::with_capacity(usize::from(returned));
+            for index in 0..usize::from(returned) {
+                groups.push(unsafe { *storage.as_ptr().cast::<u16>().add(index) });
+            }
+            groups.sort_unstable();
+            groups.dedup();
+            return Ok(groups);
+        }
+        let error = unsafe { GetLastError() };
+        if error != ERROR_INSUFFICIENT_BUFFER || returned <= required {
+            return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+        }
+        required = returned;
+    }
+    Err(ERROR_INSUFFICIENT_BUFFER)
+}
+
+fn nonzero_last_error() -> u32 {
+    let error = unsafe { GetLastError() };
+    if error == 0 { ERROR_GEN_FAILURE } else { error }
+}
+
+// The dialog shows one processor group at a time, preserving the familiar 64-checkbox layout
+// while retaining independent selections for every group.
 unsafe extern "system" fn affinity_dialog_proc(
     hwnd: HWND,
     msg: u32,
@@ -498,60 +854,132 @@ unsafe extern "system" fn affinity_dialog_proc(
             WM_INITDIALOG => {
                 set_window_userdata(hwnd, lparam);
                 localize_dialog(hwnd, IDD_AFFINITY);
-                let context = &*(lparam as *const AffinityDialogContext);
-
-                for cpu_index in 0..=MAX_AFFINITY_CPU {
-                    let control_id = IDC_CPU0 + cpu_index;
-                    let mask = affinity_cpu_mask(cpu_index);
-                    let enabled = mask != 0 && (context.system_mask & mask) != 0;
-                    EnableWindow(GetDlgItem(hwnd, control_id), i32::from(enabled));
-                    CheckDlgButton(
-                        hwnd,
-                        control_id,
-                        if enabled && (context.process_mask & mask) != 0 {
-                            BST_CHECKED
-                        } else {
-                            BST_UNCHECKED
-                        },
-                    );
-                }
+                let context = &mut *(lparam as *mut AffinityDialogContext);
+                initialize_affinity_group_selector(hwnd, context);
+                render_affinity_group(hwnd, context);
                 1
             }
-            WM_COMMAND => match i32::from(loword(wparam)) {
-                IDCANCEL => {
-                    EndDialog(hwnd, IDCANCEL as isize);
-                    1
-                }
-                IDOK => {
+            WM_COMMAND => {
+                let command = i32::from(loword(wparam));
+                if command == IDC_AFFINITY_GROUP_SELECTOR && hiword(wparam) == CBN_SELCHANGE as u16
+                {
                     let context = &mut *(get_window_userdata(hwnd) as *mut AffinityDialogContext);
-                    let page = &*context.page;
-
-                    context.process_mask = 0;
-                    for cpu_index in 0..=MAX_AFFINITY_CPU {
-                        let mask = affinity_cpu_mask(cpu_index);
-                        if mask == 0 || (context.system_mask & mask) == 0 {
-                            continue;
-                        }
-                        if IsDlgButtonChecked(hwnd, IDC_CPU0 + cpu_index) == BST_CHECKED {
-                            context.process_mask |= mask;
+                    save_affinity_group(hwnd, context);
+                    let selection = SendMessageW(
+                        GetDlgItem(hwnd, IDC_AFFINITY_GROUP_SELECTOR),
+                        CB_GETCURSEL,
+                        0,
+                        0,
+                    );
+                    if selection >= 0 {
+                        let selection = selection as usize;
+                        if selection < context.topology.groups().len() {
+                            context.selected_group_index = selection;
+                            render_affinity_group(hwnd, context);
                         }
                     }
-
-                    if context.process_mask == 0 {
-                        let title_wide = to_wide_null(&page.strings.invalid_option);
-                        let body_wide = to_wide_null(&page.strings.no_affinity_mask);
-                        MessageBoxW(hwnd, body_wide.as_ptr(), title_wide.as_ptr(), MB_ICONERROR);
-                        1
-                    } else {
-                        EndDialog(hwnd, IDOK as isize);
-                        1
-                    }
+                    return 1;
                 }
-                _ => 0,
-            },
+
+                match command {
+                    IDCANCEL => {
+                        EndDialog(hwnd, IDCANCEL as isize);
+                        1
+                    }
+                    IDOK => {
+                        let context =
+                            &mut *(get_window_userdata(hwnd) as *mut AffinityDialogContext);
+                        let page = &*context.page;
+                        save_affinity_group(hwnd, context);
+                        if context.selected_masks.iter().all(|mask| *mask == 0) {
+                            let title_wide = to_wide_null(&page.strings.invalid_option);
+                            let body_wide = to_wide_null(&page.strings.no_affinity_mask);
+                            MessageBoxW(
+                                hwnd,
+                                body_wide.as_ptr(),
+                                title_wide.as_ptr(),
+                                MB_ICONERROR,
+                            );
+                            1
+                        } else {
+                            EndDialog(hwnd, IDOK as isize);
+                            1
+                        }
+                    }
+                    _ => 0,
+                }
+            }
             _ => 0,
         }
     }
+}
+
+unsafe fn initialize_affinity_group_selector(hwnd: HWND, context: &mut AffinityDialogContext) {
+    let selector = unsafe { GetDlgItem(hwnd, IDC_AFFINITY_GROUP_SELECTOR) };
+    unsafe { SendMessageW(selector, CB_RESETCONTENT, 0, 0) };
+    for group in context.topology.groups() {
+        let label = if context.topology.groups().len() > 1 {
+            format!("G{} ({})", group.number, group.processor_mask.count_ones())
+        } else {
+            format!("G{}", group.number)
+        };
+        let wide = to_wide_null(&label);
+        unsafe {
+            SendMessageW(selector, CB_ADDSTRING, 0, wide.as_ptr() as isize);
+        }
+    }
+    if context.selected_group_index >= context.topology.groups().len() {
+        context.selected_group_index = 0;
+    }
+    unsafe {
+        SendMessageW(selector, CB_SETCURSEL, context.selected_group_index, 0);
+        EnableWindow(selector, i32::from(context.topology.groups().len() > 1));
+    }
+}
+
+unsafe fn render_affinity_group(hwnd: HWND, context: &AffinityDialogContext) {
+    let group = &context.topology.groups()[context.selected_group_index];
+    let selected_mask = context.selected_masks[context.selected_group_index];
+    let multiple_groups = context.topology.groups().len() > 1;
+    for cpu_index in 0..=MAX_AFFINITY_CPU {
+        let control_id = IDC_CPU0 + cpu_index;
+        let mask = affinity_cpu_mask(cpu_index);
+        let enabled = mask != 0 && group.assignable_mask & mask != 0;
+        let label = if multiple_groups {
+            format!("G{}:CPU {cpu_index}", group.number)
+        } else {
+            format!("CPU {cpu_index}")
+        };
+        let wide = to_wide_null(&label);
+        unsafe {
+            SetWindowTextW(GetDlgItem(hwnd, control_id), wide.as_ptr());
+            EnableWindow(GetDlgItem(hwnd, control_id), i32::from(enabled));
+            CheckDlgButton(
+                hwnd,
+                control_id,
+                if enabled && selected_mask & mask != 0 {
+                    BST_CHECKED
+                } else {
+                    BST_UNCHECKED
+                },
+            );
+        }
+    }
+}
+
+unsafe fn save_affinity_group(hwnd: HWND, context: &mut AffinityDialogContext) {
+    let group = &context.topology.groups()[context.selected_group_index];
+    let mut selected_mask = 0usize;
+    for cpu_index in 0..=MAX_AFFINITY_CPU {
+        let mask = affinity_cpu_mask(cpu_index);
+        if mask != 0
+            && group.assignable_mask & mask != 0
+            && unsafe { IsDlgButtonChecked(hwnd, IDC_CPU0 + cpu_index) } == BST_CHECKED
+        {
+            selected_mask |= mask;
+        }
+    }
+    context.selected_masks[context.selected_group_index] = selected_mask;
 }
 
 pub(super) fn affinity_cpu_mask(cpu_index: i32) -> usize {

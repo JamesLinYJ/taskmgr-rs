@@ -28,7 +28,9 @@
 
 ## 运行环境
 
-项目主要在 Windows 11 x86_64 上开发和实测。代码使用 Windows 10/11 上的 Win32、PDH、DXGI、WMI 和 WDDM 接口，但现在还没有覆盖所有系统版本和硬件组合的测试矩阵。
+项目主要在 Windows 11 x86_64 上开发和实测。[兼容性矩阵](docs/compatibility-matrix.md)
+分别记录 Windows/架构与 GPU 的可复核证据，不会把交叉编译或未留下环境记录的开发机当成
+硬件实测。
 
 GPU 页面依赖系统和显卡驱动公开的 `GPU Engine` 与 `GPU Adapter Memory` 性能计数器。计数器不存在或驱动没有返回数据时，页面会说明具体状态，不会把查询失败画成 0%。
 
@@ -41,6 +43,17 @@ ARM64 版本已经通过交叉编译、全目标检查和 PE 架构检查，但�
 ```powershell
 cargo build --release
 ```
+
+编译 32 位 x86 可执行文件：
+
+```powershell
+rustup target add i686-pc-windows-msvc
+cargo build --release --target i686-pc-windows-msvc
+# 也可以运行：.\scripts\release-clean.ps1 -Target i686-pc-windows-msvc
+```
+
+x86 构建仍会同时查询进程机器类型和系统原生机器类型：在 64 位 Windows 的 WOW64 下
+继续标注“(32位)”，只有在原生 32 位 Windows 上才省略该后缀。
 
 需要路径重映射的发布构建时运行：
 
@@ -74,10 +87,16 @@ rustup target add aarch64-pc-windows-msvc
 --diagnostic-sensitive
 --diagnostic-minidump
 --diagnostic-dir=<绝对路径>
+--diagnostic-capabilities=<新的 JSON 文件绝对路径>
 ```
 
 日志采用带版本的 JSON Lines 格式，单文件达到 10 MiB 后轮转，最多保留 10 个会话和
 200 MiB。常规目录不可用时会回退到 `%TEMP%`；两个目录都失败时仍保留原生调试器输出。
+
+能力导出命令会查询 processor group、CPU Set、DXGI/驱动元数据以及程序实际使用的 GPU
+PDH 计数器路径，写出可直接附在 Issue 中的 JSON，随后退出而不打开主界面。不支持的能力和
+原生错误码都会明确保留。目标必须是尚不存在的绝对路径；用法、隐私说明和完整验证步骤见
+[兼容性矩阵与检查清单](docs/compatibility-matrix.md)。
 
 在 Linux 上用 MinGW GNU 工具链生成优化后的 EXE、分离 DWARF 符号和匹配的 SHA-256：
 
@@ -143,7 +162,7 @@ git diff --check
 
 ## 反馈问题
 
-可以直接开 [Issue](https://github.com/JamesLinYJ/taskmgr-rs/issues)。如果是采样或布局问题，请附上 Windows 版本、CPU/GPU 型号、出问题的页面、复现步骤和截图。需要精确追踪 API 与源码行时，可以先查看隐私提示，再附上诊断包。这几项通常比一句“显示不对”更容易把问题查清楚。
+可以直接开 [Issue](https://github.com/JamesLinYJ/taskmgr-rs/issues)。如果是采样或布局问题，请附上 Windows 版本、CPU/GPU 型号、出问题的页面、复现步骤和截图；兼容性问题可附上能力 JSON。需要精确追踪 API 与源码行时，可以先查看隐私提示，再附上诊断包。这几项通常比一句“显示不对”更容易把问题查清楚。
 
 ## 许可证
 

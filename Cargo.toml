@@ -2,7 +2,7 @@
 # 这里定义包名、版本、发布构建策略，以及 Win32 API 绑定所需的功能开关。
 [package]
 name = "taskmgr-rs"
-version = "0.2.3"
+version = "0.2.4"
 authors = ["taskmgr-rs contributors"]
 description = "A classic Windows Task Manager built in Rust with native Win32 APIs."
 license = "MIT"
@@ -30,7 +30,7 @@ path = "src/main.rs"
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = true
 debug = 0
 debug-assertions = false
@@ -51,6 +51,8 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
 windows-sys = { version = "0.61.2", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Wdk_Graphics_Direct3D",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_Properties",
@@ -61,6 +63,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",

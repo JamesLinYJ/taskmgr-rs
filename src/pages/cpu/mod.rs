@@ -409,7 +409,6 @@ impl CpuPageState {
             None => return,
         };
         if let Some(error) = drained.error {
-            self.native_worker = None;
             self.handle_native_worker_error(CpuDetailError::Win32 {
                 context: "CPU native worker completion channel",
                 code: error,
@@ -438,7 +437,6 @@ impl CpuPageState {
             None => return,
         };
         if let Some(error) = drained.error {
-            self.firmware_worker = None;
             self.handle_firmware_worker_error(CpuDetailError::Win32 {
                 context: "CPU firmware worker completion channel",
                 code: error,

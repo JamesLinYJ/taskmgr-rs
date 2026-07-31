@@ -14,6 +14,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod capabilities;
 mod config;
 mod infrastructure;
 mod pages;
@@ -23,6 +24,10 @@ mod ui;
 fn main() {
     // 诊断必须先于权限申请和 Win32 UI 初始化，才能覆盖完整启动链路。
     infrastructure::diagnostics::initialize_from_env();
+    if let Some(exit_code) = capabilities::run_from_environment() {
+        infrastructure::diagnostics::shutdown();
+        std::process::exit(exit_code);
+    }
     let exit_code = app::run();
     infrastructure::diagnostics::shutdown();
     std::process::exit(exit_code);

@@ -28,7 +28,7 @@ use super::inventory::GpuTopology;
 use super::model::{
     AdapterLuid, GpuAdapterId, GpuAdapterInfo, GpuAdapterSample, GpuCollectOutcome,
     GpuDynamicSnapshot, GpuEngineId, GpuEngineKind, GpuEngineSample, GpuInventorySnapshot,
-    GpuSampleError,
+    GpuSampleError, GpuSampleIssue, GpuSampleSource,
 };
 use crate::infrastructure::native::{record_pdh_error, record_startup_timing, to_wide_null};
 
@@ -47,6 +47,38 @@ pub(super) struct EngineReading {
 pub(super) struct MemoryReading {
     pub(super) instance_name: String,
     pub(super) bytes: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CounterItemIssue {
+    instance_name: Option<String>,
+    error: GpuSampleError,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CounterRead<T> {
+    values: Vec<T>,
+    issues: Vec<CounterItemIssue>,
+}
+
+impl<T> CounterRead<T> {
+    #[cfg(test)]
+    fn values(values: Vec<T>) -> Self {
+        Self {
+            values,
+            issues: Vec::new(),
+        }
+    }
+
+    fn source_error(error: GpuSampleError) -> Self {
+        Self {
+            values: Vec::new(),
+            issues: vec![CounterItemIssue {
+                instance_name: None,
+                error,
+            }],
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -125,19 +157,22 @@ impl GpuCollector {
             });
         }
 
-        let engine_readings = match pdh.read_engine_values() {
-            Ok(values) => values,
-            Err(error) if !self.dynamic_ready && error.is_baseline_pending() => {
-                return Ok(GpuCollectOutcome::AwaitingBaseline {
-                    generation: self.generation,
-                });
-            }
-            Err(error) => return Err(error),
-        };
-        let dedicated_readings = pdh.read_dedicated_memory_values()?;
-        let shared_readings = pdh.read_shared_memory_values()?;
+        let engine_readings = pdh.read_engine_values();
+        if !self.dynamic_ready
+            && engine_readings.values.is_empty()
+            && engine_readings
+                .issues
+                .iter()
+                .any(|issue| issue.error.is_baseline_pending())
+        {
+            return Ok(GpuCollectOutcome::AwaitingBaseline {
+                generation: self.generation,
+            });
+        }
+        let dedicated_readings = pdh.read_dedicated_memory_values();
+        let shared_readings = pdh.read_shared_memory_values();
         let temperatures = topology.query_temperatures();
-        let adapters = assemble_samples(
+        let mut adapters = assemble_counter_samples(
             &topology.infos,
             &topology.known_luids,
             engine_readings,
@@ -145,7 +180,7 @@ impl GpuCollector {
             shared_readings,
             temperatures,
         )?;
-        self.engine_kinds = validated_engine_kinds(&self.engine_kinds, &adapters)?;
+        self.engine_kinds = validated_engine_kinds(&self.engine_kinds, &mut adapters);
         if !self.dynamic_ready {
             record_startup_timing(
                 "GPU first dynamic sample",
@@ -203,12 +238,38 @@ impl Default for GpuCollector {
 struct PdhQuery {
     query: PDH_HQUERY,
     engine_counter: PDH_HCOUNTER,
+    engine_error: Option<GpuSampleError>,
     dedicated_counter: PDH_HCOUNTER,
+    dedicated_error: Option<GpuSampleError>,
     shared_counter: PDH_HCOUNTER,
+    shared_error: Option<GpuSampleError>,
     primed: bool,
     engine_storage: Vec<usize>,
     dedicated_storage: Vec<usize>,
     shared_storage: Vec<usize>,
+}
+
+pub(super) struct GpuCounterCapability {
+    pub(super) source: GpuSampleSource,
+    pub(super) error: Option<GpuSampleError>,
+}
+
+pub(super) fn probe_counter_capabilities() -> Result<[GpuCounterCapability; 3], GpuSampleError> {
+    let query = PdhQuery::new()?;
+    Ok([
+        GpuCounterCapability {
+            source: GpuSampleSource::Engine,
+            error: query.engine_error.clone(),
+        },
+        GpuCounterCapability {
+            source: GpuSampleSource::DedicatedMemory,
+            error: query.dedicated_error.clone(),
+        },
+        GpuCounterCapability {
+            source: GpuSampleSource::SharedMemory,
+            error: query.shared_error.clone(),
+        },
+    ])
 }
 
 impl PdhQuery {
@@ -226,36 +287,55 @@ impl PdhQuery {
             let mut candidate = Self {
                 query,
                 engine_counter: null_mut(),
+                engine_error: None,
                 dedicated_counter: null_mut(),
+                dedicated_error: None,
                 shared_counter: null_mut(),
+                shared_error: None,
                 primed: false,
                 engine_storage: Vec::new(),
                 dedicated_storage: Vec::new(),
                 shared_storage: Vec::new(),
             };
-            candidate.engine_counter = candidate.add_counter(ENGINE_COUNTER_PATH)?;
-            candidate.dedicated_counter = candidate.add_counter(DEDICATED_MEMORY_COUNTER_PATH)?;
-            candidate.shared_counter = candidate.add_counter(SHARED_MEMORY_COUNTER_PATH)?;
+            (candidate.engine_counter, candidate.engine_error) =
+                candidate.add_optional_counter(ENGINE_COUNTER_PATH);
+            (candidate.dedicated_counter, candidate.dedicated_error) =
+                candidate.add_optional_counter(DEDICATED_MEMORY_COUNTER_PATH);
+            (candidate.shared_counter, candidate.shared_error) =
+                candidate.add_optional_counter(SHARED_MEMORY_COUNTER_PATH);
             Ok(candidate)
         }
     }
 
-    unsafe fn add_counter(&self, path: &'static str) -> Result<PDH_HCOUNTER, GpuSampleError> {
+    unsafe fn add_optional_counter(
+        &self,
+        path: &'static str,
+    ) -> (PDH_HCOUNTER, Option<GpuSampleError>) {
         let wide_path = to_wide_null(path);
         let mut counter = null_mut();
         let status =
             unsafe { PdhAddEnglishCounterW(self.query, wide_path.as_ptr(), 0, &mut counter) };
         if status != ERROR_SUCCESS {
-            Err(GpuSampleError::Pdh {
-                context: path,
-                status,
-            })
+            (
+                null_mut(),
+                Some(GpuSampleError::Pdh {
+                    context: path,
+                    status,
+                }),
+            )
         } else {
-            Ok(counter)
+            (counter, None)
         }
     }
 
     fn collect(&mut self) -> Result<bool, GpuSampleError> {
+        if self.engine_counter.is_null()
+            && self.dedicated_counter.is_null()
+            && self.shared_counter.is_null()
+        {
+            self.primed = true;
+            return Ok(true);
+        }
         let status = unsafe { PdhCollectQueryData(self.query) };
         if status != ERROR_SUCCESS {
             return Err(GpuSampleError::Pdh {
@@ -270,57 +350,86 @@ impl PdhQuery {
         Ok(true)
     }
 
-    fn read_engine_values(&mut self) -> Result<Vec<EngineReading>, GpuSampleError> {
-        let items = query_counter_array(
+    fn read_engine_values(&mut self) -> CounterRead<EngineReading> {
+        if let Some(error) = self.engine_error.clone() {
+            return CounterRead::source_error(error);
+        }
+        let items = match query_counter_array(
             self.engine_counter,
             PDH_FMT_DOUBLE,
             &mut self.engine_storage,
-        )?;
-        items
-            .into_iter()
-            .map(|item| {
-                let utilization = unsafe { item.value.Anonymous.doubleValue };
-                if !utilization.is_finite() || utilization < 0.0 {
-                    return Err(GpuSampleError::InvalidData {
+        ) {
+            Ok(items) => items,
+            Err(error) => return CounterRead::source_error(error),
+        };
+        let mut values = Vec::with_capacity(items.values.len());
+        let mut issues = items.issues;
+        for item in items.values {
+            let utilization = unsafe { item.value.Anonymous.doubleValue };
+            if !utilization.is_finite() || utilization < 0.0 {
+                issues.push(CounterItemIssue {
+                    instance_name: Some(item.name),
+                    error: GpuSampleError::InvalidData {
                         context: "GPU engine utilization value",
-                    });
-                }
-                Ok(EngineReading {
+                    },
+                });
+            } else {
+                values.push(EngineReading {
                     instance_name: item.name,
                     utilization,
-                })
-            })
-            .collect()
+                });
+            }
+        }
+        CounterRead { values, issues }
     }
 
-    fn read_dedicated_memory_values(&mut self) -> Result<Vec<MemoryReading>, GpuSampleError> {
-        Self::read_memory_values(self.dedicated_counter, &mut self.dedicated_storage)
+    fn read_dedicated_memory_values(&mut self) -> CounterRead<MemoryReading> {
+        Self::read_memory_values(
+            self.dedicated_counter,
+            self.dedicated_error.clone(),
+            &mut self.dedicated_storage,
+        )
     }
 
-    fn read_shared_memory_values(&mut self) -> Result<Vec<MemoryReading>, GpuSampleError> {
-        Self::read_memory_values(self.shared_counter, &mut self.shared_storage)
+    fn read_shared_memory_values(&mut self) -> CounterRead<MemoryReading> {
+        Self::read_memory_values(
+            self.shared_counter,
+            self.shared_error.clone(),
+            &mut self.shared_storage,
+        )
     }
 
     fn read_memory_values(
         counter: PDH_HCOUNTER,
+        source_error: Option<GpuSampleError>,
         storage: &mut Vec<usize>,
-    ) -> Result<Vec<MemoryReading>, GpuSampleError> {
-        let items = query_counter_array(counter, PDH_FMT_LARGE, storage)?;
-        items
-            .into_iter()
-            .map(|item| {
-                let bytes = unsafe { item.value.Anonymous.largeValue };
-                if bytes < 0 {
-                    return Err(GpuSampleError::InvalidData {
+    ) -> CounterRead<MemoryReading> {
+        if let Some(error) = source_error {
+            return CounterRead::source_error(error);
+        }
+        let items = match query_counter_array(counter, PDH_FMT_LARGE, storage) {
+            Ok(items) => items,
+            Err(error) => return CounterRead::source_error(error),
+        };
+        let mut values = Vec::with_capacity(items.values.len());
+        let mut issues = items.issues;
+        for item in items.values {
+            let bytes = unsafe { item.value.Anonymous.largeValue };
+            if bytes < 0 {
+                issues.push(CounterItemIssue {
+                    instance_name: Some(item.name),
+                    error: GpuSampleError::InvalidData {
                         context: "GPU memory usage value",
-                    });
-                }
-                Ok(MemoryReading {
+                    },
+                });
+            } else {
+                values.push(MemoryReading {
                     instance_name: item.name,
                     bytes,
-                })
-            })
-            .collect()
+                });
+            }
+        }
+        CounterRead { values, issues }
     }
 }
 
@@ -341,11 +450,16 @@ struct CounterArrayItem {
     value: windows_sys::Win32::System::Performance::PDH_FMT_COUNTERVALUE,
 }
 
+struct CounterArrayRead {
+    values: Vec<CounterArrayItem>,
+    issues: Vec<CounterItemIssue>,
+}
+
 fn query_counter_array(
     counter: PDH_HCOUNTER,
     format: u32,
     storage: &mut Vec<usize>,
-) -> Result<Vec<CounterArrayItem>, GpuSampleError> {
+) -> Result<CounterArrayRead, GpuSampleError> {
     unsafe {
         let mut byte_count = 0u32;
         let mut item_count = 0u32;
@@ -357,7 +471,10 @@ fn query_counter_array(
             null_mut(),
         );
         if status == ERROR_SUCCESS && item_count == 0 {
-            return Ok(Vec::new());
+            return Ok(CounterArrayRead {
+                values: Vec::new(),
+                issues: Vec::new(),
+            });
         }
         if status != PDH_MORE_DATA {
             return Err(GpuSampleError::Pdh {
@@ -407,24 +524,38 @@ fn query_counter_array(
             storage.as_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>(),
             item_count as usize,
         );
-        let mut result = Vec::with_capacity(items.len());
+        let mut values = Vec::with_capacity(items.len());
+        let mut issues = Vec::new();
         for item in items {
+            let name = match read_bounded_wide_string(item.szName, base, end) {
+                Ok(name) => name,
+                Err(error) => {
+                    issues.push(CounterItemIssue {
+                        instance_name: None,
+                        error,
+                    });
+                    continue;
+                }
+            };
             if !matches!(
                 item.FmtValue.CStatus,
                 PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA
             ) {
-                return Err(GpuSampleError::Pdh {
-                    context: "GPU PDH counter value status",
-                    status: item.FmtValue.CStatus,
+                issues.push(CounterItemIssue {
+                    instance_name: Some(name),
+                    error: GpuSampleError::Pdh {
+                        context: "GPU PDH counter value status",
+                        status: item.FmtValue.CStatus,
+                    },
                 });
+                continue;
             }
-            let name = read_bounded_wide_string(item.szName, base, end)?;
-            result.push(CounterArrayItem {
+            values.push(CounterArrayItem {
                 name,
                 value: item.FmtValue,
             });
         }
-        Ok(result)
+        Ok(CounterArrayRead { values, issues })
     }
 }
 
@@ -456,45 +587,137 @@ unsafe fn read_bounded_wide_string(
     })
 }
 
+#[cfg(test)]
 pub(super) fn assemble_samples(
     infos: &[Arc<GpuAdapterInfo>],
     known_luids: &HashSet<AdapterLuid>,
     engine_readings: Vec<EngineReading>,
     dedicated_readings: Vec<MemoryReading>,
     shared_readings: Vec<MemoryReading>,
+    temperatures: HashMap<GpuAdapterId, Result<Option<u32>, GpuSampleError>>,
+) -> Result<Vec<GpuAdapterSample>, GpuSampleError> {
+    assemble_counter_samples(
+        infos,
+        known_luids,
+        CounterRead::values(engine_readings),
+        CounterRead::values(dedicated_readings),
+        CounterRead::values(shared_readings),
+        temperatures,
+    )
+}
+
+fn assemble_counter_samples(
+    infos: &[Arc<GpuAdapterInfo>],
+    known_luids: &HashSet<AdapterLuid>,
+    engine_readings: CounterRead<EngineReading>,
+    dedicated_readings: CounterRead<MemoryReading>,
+    shared_readings: CounterRead<MemoryReading>,
     mut temperatures: HashMap<GpuAdapterId, Result<Option<u32>, GpuSampleError>>,
 ) -> Result<Vec<GpuAdapterSample>, GpuSampleError> {
     let displayed_ids: HashSet<_> = infos.iter().map(|info| info.id).collect();
+    let mut row_issues = HashMap::<GpuAdapterId, Vec<GpuSampleIssue>>::new();
+    let mut global_issues = Vec::<GpuSampleIssue>::new();
+    collect_counter_issues(
+        GpuSampleSource::Engine,
+        engine_readings.issues,
+        &displayed_ids,
+        &mut row_issues,
+        &mut global_issues,
+    );
+
     let mut engine_instances = HashSet::new();
     let mut engines: HashMap<GpuEngineId, (GpuEngineKind, f64)> = HashMap::new();
-    for reading in engine_readings {
-        let parsed = parse_engine_instance(&reading.instance_name)?;
+    for reading in engine_readings.values {
+        let parsed = match parse_engine_instance(&reading.instance_name) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                global_issues.push(GpuSampleIssue::new(
+                    None,
+                    GpuSampleSource::Engine,
+                    Some(reading.instance_name),
+                    error,
+                ));
+                continue;
+            }
+        };
         if !known_luids.contains(&parsed.id.adapter.luid) {
-            return Err(GpuSampleError::InvalidData {
-                context: "GPU engine references unknown LUID",
-            });
+            global_issues.push(GpuSampleIssue::new(
+                Some(parsed.id.adapter),
+                GpuSampleSource::Engine,
+                Some(reading.instance_name),
+                GpuSampleError::InvalidData {
+                    context: "GPU engine references unknown LUID",
+                },
+            ));
+            continue;
         }
         if !displayed_ids.contains(&parsed.id.adapter) {
             continue;
         }
         if !engine_instances.insert(parsed.clone()) {
-            return Err(GpuSampleError::InvalidData {
-                context: "duplicate GPU engine process instance",
-            });
+            row_issues
+                .entry(parsed.id.adapter)
+                .or_default()
+                .push(GpuSampleIssue::new(
+                    Some(parsed.id.adapter),
+                    GpuSampleSource::Engine,
+                    Some(reading.instance_name),
+                    GpuSampleError::InvalidData {
+                        context: "duplicate GPU engine process instance",
+                    },
+                ));
+            continue;
+        }
+        if !reading.utilization.is_finite() || reading.utilization < 0.0 {
+            row_issues
+                .entry(parsed.id.adapter)
+                .or_default()
+                .push(GpuSampleIssue::new(
+                    Some(parsed.id.adapter),
+                    GpuSampleSource::Engine,
+                    Some(reading.instance_name),
+                    GpuSampleError::InvalidData {
+                        context: "GPU engine utilization value",
+                    },
+                ));
+            continue;
+        }
+        if engines
+            .get(&parsed.id)
+            .is_some_and(|(kind, _)| kind != &parsed.kind)
+        {
+            row_issues
+                .entry(parsed.id.adapter)
+                .or_default()
+                .push(GpuSampleIssue::new(
+                    Some(parsed.id.adapter),
+                    GpuSampleSource::Engine,
+                    Some(reading.instance_name),
+                    GpuSampleError::InvalidData {
+                        context: "GPU engine type changed within one snapshot",
+                    },
+                ));
+            continue;
         }
         let entry = engines
             .entry(parsed.id)
             .or_insert_with(|| (parsed.kind.clone(), 0.0));
-        if entry.0 != parsed.kind {
-            return Err(GpuSampleError::InvalidData {
-                context: "GPU engine type changed within one snapshot",
-            });
-        }
-        entry.1 += reading.utilization;
-        if !entry.1.is_finite() {
-            return Err(GpuSampleError::InvalidData {
-                context: "GPU engine utilization aggregate",
-            });
+        let aggregate = entry.1 + reading.utilization;
+        if aggregate.is_finite() {
+            entry.1 = aggregate;
+        } else {
+            engines.remove(&parsed.id);
+            row_issues
+                .entry(parsed.id.adapter)
+                .or_default()
+                .push(GpuSampleIssue::new(
+                    Some(parsed.id.adapter),
+                    GpuSampleSource::Engine,
+                    Some(reading.instance_name),
+                    GpuSampleError::InvalidData {
+                        context: "GPU engine utilization aggregate",
+                    },
+                ));
         }
     }
 
@@ -502,14 +725,20 @@ pub(super) fn assemble_samples(
         known_luids,
         &displayed_ids,
         dedicated_readings,
+        GpuSampleSource::DedicatedMemory,
         "duplicate dedicated GPU memory instance",
-    )?;
+        &mut row_issues,
+        &mut global_issues,
+    );
     let shared = collect_memory_readings(
         known_luids,
         &displayed_ids,
         shared_readings,
+        GpuSampleSource::SharedMemory,
         "duplicate shared GPU memory instance",
-    )?;
+        &mut row_issues,
+        &mut global_issues,
+    );
 
     let mut engines_by_adapter: HashMap<GpuAdapterId, Vec<GpuEngineSample>> = HashMap::new();
     for (id, (kind, value)) in engines {
@@ -529,39 +758,63 @@ pub(super) fn assemble_samples(
     let mut samples = Vec::with_capacity(infos.len());
     for info in infos {
         let adapter_engines = engines_by_adapter.remove(&info.id).unwrap_or_default();
-        let overall_utilization_percent = adapter_engines
-            .iter()
-            .map(|engine| engine.utilization_percent)
-            .max()
-            .unwrap_or(0);
-        let mut row_errors = Vec::new();
+        let mut row_errors = global_issues.clone();
+        row_errors.extend(row_issues.remove(&info.id).unwrap_or_default());
         let temperature_deci_c = match temperatures.remove(&info.id) {
             Some(Ok(value)) => value,
             Some(Err(error)) => {
-                row_errors.push(error);
+                row_errors.push(GpuSampleIssue::new(
+                    Some(info.id),
+                    GpuSampleSource::Temperature,
+                    None,
+                    error,
+                ));
                 None
             }
             None => {
-                row_errors.push(GpuSampleError::InvalidData {
-                    context: "missing GPU temperature query result",
-                });
+                row_errors.push(GpuSampleIssue::new(
+                    Some(info.id),
+                    GpuSampleSource::Temperature,
+                    None,
+                    GpuSampleError::InvalidData {
+                        context: "missing GPU temperature query result",
+                    },
+                ));
                 None
             }
         };
-        let dedicated_usage_bytes =
-            dedicated
-                .get(&info.id)
-                .copied()
-                .ok_or(GpuSampleError::InvalidData {
+        let dedicated_usage_bytes = dedicated.get(&info.id).copied();
+        if dedicated_usage_bytes.is_none() {
+            row_errors.push(GpuSampleIssue::new(
+                Some(info.id),
+                GpuSampleSource::DedicatedMemory,
+                None,
+                GpuSampleError::InvalidData {
                     context: "missing dedicated GPU memory instance",
-                })?;
-        let shared_usage_bytes =
-            shared
-                .get(&info.id)
-                .copied()
-                .ok_or(GpuSampleError::InvalidData {
+                },
+            ));
+        }
+        let shared_usage_bytes = shared.get(&info.id).copied();
+        if shared_usage_bytes.is_none() {
+            row_errors.push(GpuSampleIssue::new(
+                Some(info.id),
+                GpuSampleSource::SharedMemory,
+                None,
+                GpuSampleError::InvalidData {
                     context: "missing shared GPU memory instance",
-                })?;
+                },
+            ));
+        }
+        let engine_complete = !row_errors
+            .iter()
+            .any(|issue| issue.source == GpuSampleSource::Engine);
+        let overall_utilization_percent = engine_complete.then(|| {
+            adapter_engines
+                .iter()
+                .map(|engine| engine.utilization_percent)
+                .max()
+                .unwrap_or(0)
+        });
         samples.push(GpuAdapterSample {
             info: Arc::clone(info),
             overall_utilization_percent,
@@ -577,52 +830,144 @@ pub(super) fn assemble_samples(
 
 pub(super) fn validated_engine_kinds(
     existing: &HashMap<GpuEngineId, GpuEngineKind>,
-    samples: &[GpuAdapterSample],
-) -> Result<HashMap<GpuEngineId, GpuEngineKind>, GpuSampleError> {
+    samples: &mut [GpuAdapterSample],
+) -> HashMap<GpuEngineId, GpuEngineKind> {
     let mut candidate = existing.clone();
-    for engine in samples.iter().flat_map(|sample| &sample.engines) {
-        match candidate.get(&engine.id) {
-            Some(kind) if kind != &engine.kind => {
-                return Err(GpuSampleError::InvalidData {
-                    context: "GPU engine type changed without a topology generation",
-                });
-            }
-            Some(_) => {}
-            None => {
-                candidate.insert(engine.id, engine.kind.clone());
+    for sample in samples {
+        let mut valid_engines = Vec::with_capacity(sample.engines.len());
+        for engine in sample.engines.drain(..) {
+            match candidate.get(&engine.id) {
+                Some(kind) if kind != &engine.kind => {
+                    sample.row_errors.push(GpuSampleIssue::new(
+                        Some(sample.info.id),
+                        GpuSampleSource::Engine,
+                        None,
+                        GpuSampleError::InvalidData {
+                            context: "GPU engine type changed without a topology generation",
+                        },
+                    ));
+                    sample.overall_utilization_percent = None;
+                }
+                Some(_) => valid_engines.push(engine),
+                None => {
+                    candidate.insert(engine.id, engine.kind.clone());
+                    valid_engines.push(engine);
+                }
             }
         }
+        sample.engines = valid_engines;
     }
-    Ok(candidate)
+    candidate
 }
 
 fn collect_memory_readings(
     known_luids: &HashSet<AdapterLuid>,
     displayed_ids: &HashSet<GpuAdapterId>,
-    readings: Vec<MemoryReading>,
+    readings: CounterRead<MemoryReading>,
+    source: GpuSampleSource,
     duplicate_context: &'static str,
-) -> Result<HashMap<GpuAdapterId, u64>, GpuSampleError> {
+    row_issues: &mut HashMap<GpuAdapterId, Vec<GpuSampleIssue>>,
+    global_issues: &mut Vec<GpuSampleIssue>,
+) -> HashMap<GpuAdapterId, u64> {
+    collect_counter_issues(
+        source,
+        readings.issues,
+        displayed_ids,
+        row_issues,
+        global_issues,
+    );
     let mut values = HashMap::new();
-    for reading in readings {
-        let id = parse_memory_instance(&reading.instance_name)?;
+    let mut invalid_ids = HashSet::new();
+    for reading in readings.values {
+        let id = match parse_memory_instance(&reading.instance_name) {
+            Ok(id) => id,
+            Err(error) => {
+                global_issues.push(GpuSampleIssue::new(
+                    None,
+                    source,
+                    Some(reading.instance_name),
+                    error,
+                ));
+                continue;
+            }
+        };
         if !known_luids.contains(&id.luid) {
-            return Err(GpuSampleError::InvalidData {
-                context: "GPU memory references unknown LUID",
-            });
+            global_issues.push(GpuSampleIssue::new(
+                Some(id),
+                source,
+                Some(reading.instance_name),
+                GpuSampleError::InvalidData {
+                    context: "GPU memory references unknown LUID",
+                },
+            ));
+            continue;
         }
         if !displayed_ids.contains(&id) {
             continue;
         }
-        let bytes = u64::try_from(reading.bytes).map_err(|_| GpuSampleError::InvalidData {
-            context: "GPU memory usage conversion",
-        })?;
-        if values.insert(id, bytes).is_some() {
-            return Err(GpuSampleError::InvalidData {
-                context: duplicate_context,
-            });
+        let bytes = match u64::try_from(reading.bytes) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                invalid_ids.insert(id);
+                values.remove(&id);
+                row_issues.entry(id).or_default().push(GpuSampleIssue::new(
+                    Some(id),
+                    source,
+                    Some(reading.instance_name),
+                    GpuSampleError::InvalidData {
+                        context: "GPU memory usage conversion",
+                    },
+                ));
+                continue;
+            }
+        };
+        if invalid_ids.contains(&id) || values.insert(id, bytes).is_some() {
+            invalid_ids.insert(id);
+            values.remove(&id);
+            row_issues.entry(id).or_default().push(GpuSampleIssue::new(
+                Some(id),
+                source,
+                Some(reading.instance_name),
+                GpuSampleError::InvalidData {
+                    context: duplicate_context,
+                },
+            ));
         }
     }
-    Ok(values)
+    values
+}
+
+fn collect_counter_issues(
+    source: GpuSampleSource,
+    issues: Vec<CounterItemIssue>,
+    displayed_ids: &HashSet<GpuAdapterId>,
+    row_issues: &mut HashMap<GpuAdapterId, Vec<GpuSampleIssue>>,
+    global_issues: &mut Vec<GpuSampleIssue>,
+) {
+    for issue in issues {
+        let adapter_id = issue
+            .instance_name
+            .as_deref()
+            .and_then(|name| adapter_id_from_instance(source, name));
+        let issue = GpuSampleIssue::new(adapter_id, source, issue.instance_name, issue.error);
+        if let Some(adapter_id) = adapter_id.filter(|id| displayed_ids.contains(id)) {
+            row_issues.entry(adapter_id).or_default().push(issue);
+        } else {
+            global_issues.push(issue);
+        }
+    }
+}
+
+fn adapter_id_from_instance(source: GpuSampleSource, instance_name: &str) -> Option<GpuAdapterId> {
+    match source {
+        GpuSampleSource::Engine => parse_engine_instance(instance_name)
+            .ok()
+            .map(|parsed| parsed.id.adapter),
+        GpuSampleSource::DedicatedMemory | GpuSampleSource::SharedMemory => {
+            parse_memory_instance(instance_name).ok()
+        }
+        GpuSampleSource::Temperature => None,
+    }
 }
 
 pub(super) fn percentage_to_u8(value: f64) -> u8 {
@@ -707,4 +1052,64 @@ fn parse_hex(value: &str, context: &'static str) -> Result<u32, GpuSampleError> 
         return Err(GpuSampleError::InvalidData { context });
     }
     u32::from_str_radix(digits, 16).map_err(|_| GpuSampleError::InvalidData { context })
+}
+
+#[cfg(test)]
+mod partial_failure_tests {
+    use super::*;
+    use windows_sys::Win32::System::Performance::PDH_CSTATUS_NO_COUNTER;
+
+    fn adapter(id: GpuAdapterId) -> Arc<GpuAdapterInfo> {
+        Arc::new(GpuAdapterInfo {
+            id,
+            enumeration_index: 0,
+            name: "Partial GPU".to_string(),
+            vendor_id: 0,
+            device_id: 0,
+            subsystem_id: 0,
+            revision: 0,
+            dedicated_limit_bytes: Some(1024),
+            shared_limit_bytes: Some(1024),
+        })
+    }
+
+    #[test]
+    fn unsupported_memory_counter_keeps_independent_engine_and_shared_data() {
+        let id = GpuAdapterId {
+            luid: AdapterLuid::from_parts(0, 0x71),
+            physical_index: 0,
+        };
+        let samples = assemble_counter_samples(
+            &[adapter(id)],
+            &HashSet::from([id.luid]),
+            CounterRead::values(vec![EngineReading {
+                instance_name: "pid_1_luid_0x0_0x71_phys_0_eng_0_engtype_3d".to_string(),
+                utilization: 42.0,
+            }]),
+            CounterRead::source_error(GpuSampleError::Pdh {
+                context: DEDICATED_MEMORY_COUNTER_PATH,
+                status: PDH_CSTATUS_NO_COUNTER,
+            }),
+            CounterRead::values(vec![MemoryReading {
+                instance_name: "luid_0x0_0x71_phys_0".to_string(),
+                bytes: 256,
+            }]),
+            HashMap::from([(id, Ok(None))]),
+        )
+        .unwrap();
+
+        assert_eq!(samples[0].overall_utilization_percent, Some(42));
+        assert_eq!(samples[0].dedicated_usage_bytes, None);
+        assert_eq!(samples[0].shared_usage_bytes, Some(256));
+        let issue = samples[0]
+            .row_errors
+            .iter()
+            .find(|issue| issue.source == GpuSampleSource::DedicatedMemory)
+            .unwrap();
+        assert_eq!(
+            issue.source.counter_path(),
+            Some(DEDICATED_MEMORY_COUNTER_PATH)
+        );
+        assert!(issue.error.is_unsupported());
+    }
 }

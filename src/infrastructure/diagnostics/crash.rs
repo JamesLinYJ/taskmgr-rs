@@ -26,7 +26,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::GENERIC_WRITE;
 use windows_sys::Win32::Foundation::{CloseHandle, HMODULE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FlushFileBuffers, WriteFile,
+    CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    FlushFileBuffers, WriteFile,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{
     EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS, MINIDUMP_EXCEPTION_INFORMATION, MiniDumpNormal,
@@ -259,8 +260,8 @@ fn write_crash_record(
             GENERIC_WRITE,
             FILE_SHARE_READ,
             null(),
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
             null_mut(),
         )
     };
@@ -307,8 +308,8 @@ fn write_minidump(path: *const u16, pid: u32, tid: u32, exception_info: *const E
             GENERIC_WRITE,
             FILE_SHARE_READ,
             null(),
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
             null_mut(),
         )
     };

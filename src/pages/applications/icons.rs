@@ -25,9 +25,13 @@ use windows_sys::Win32::Foundation::{ERROR_INVALID_DATA, HWND};
 use windows_sys::Win32::UI::Controls::{
     HIMAGELIST, ImageList_Create, ImageList_Destroy, ImageList_Remove, ImageList_ReplaceIcon,
 };
+#[cfg(target_pointer_width = "64")]
+use windows_sys::Win32::UI::WindowsAndMessaging::GetClassLongPtrW;
+#[cfg(target_pointer_width = "32")]
+use windows_sys::Win32::UI::WindowsAndMessaging::GetClassLongW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CopyIcon, GCL_HICON, GCL_HICONSM, GetClassLongPtrW, HICON, SMTO_ABORTIFHUNG, SMTO_NORMAL,
-    SendMessageTimeoutW, WM_GETICON,
+    CopyIcon, GCL_HICON, GCL_HICONSM, HICON, SMTO_ABORTIFHUNG, SMTO_NORMAL, SendMessageTimeoutW,
+    WM_GETICON,
 };
 
 use super::{TaskIdentity, last_error_or_gen_failure, window_matches_identity};
@@ -593,10 +597,18 @@ fn query_window_icon_source(hwnd: HWND, icon_type: usize) -> HICON {
     }
 }
 
-// 通过 GetClassLongPtrW 查询窗口类默认图标。
+// 通过 Windows 指针宽度对应的 class-long API 查询窗口类默认图标。
 fn query_class_icon_source(hwnd: HWND, class_index: i32) -> HICON {
-    // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
-    unsafe { GetClassLongPtrW(hwnd, class_index) as HICON }
+    // 安全性: HWND is a borrowed live window identity and the selected API returns a borrowed
+    // class icon value whose width matches the target ABI.
+    #[cfg(target_pointer_width = "32")]
+    unsafe {
+        GetClassLongW(hwnd, class_index) as usize as HICON
+    }
+    #[cfg(target_pointer_width = "64")]
+    unsafe {
+        GetClassLongPtrW(hwnd, class_index) as HICON
+    }
 }
 
 fn replace_owned_icon(
