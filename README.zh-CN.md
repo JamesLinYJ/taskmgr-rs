@@ -2,6 +2,8 @@
 
 [English](README.md) | 简体中文
 
+[![CI](https://github.com/JamesLinYJ/taskmgr-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/JamesLinYJ/taskmgr-rs/actions/workflows/ci.yml)
+
 用 Rust 和原生 Win32 API 写的 Windows 任务管理器。界面沿用经典任务管理器的布局，系统采样和后台刷新则按现在的 Windows 接口重新实现。
 
 它不是现代任务管理器的复刻，也不靠 CPU 或 GPU 型号表猜数据。系统没有返回某项信息时，页面会直接显示不可用；刷新失败时，上一份有效结果仍会留在界面上。
@@ -20,9 +22,10 @@
 最新版本在 [Releases](https://github.com/JamesLinYJ/taskmgr-rs/releases/latest)：
 
 - [Windows x86_64](https://github.com/JamesLinYJ/taskmgr-rs/releases/latest/download/taskmgr-windows-x86_64.exe)，适合常见的 Intel 和 AMD Windows 电脑。
+- [Windows x86](https://github.com/JamesLinYJ/taskmgr-rs/releases/latest/download/taskmgr-windows-x86.exe)，用于 32 位 Windows。
 - [Windows ARM64](https://github.com/JamesLinYJ/taskmgr-rs/releases/latest/download/taskmgr-windows-arm64.exe)，用于 Windows on Arm 设备。
 
-两个版本都是单文件 EXE，不需要安装。程序会申请管理员权限，因为部分进程和会话操作需要它。
+三个版本都是单文件 EXE，不需要安装。程序会申请管理员权限，因为部分进程和会话操作需要它。
 
 目前发布文件没有代码签名，Windows 可能会显示 SmartScreen 提示。每个版本的发布说明都列出了 SHA-256，可以下载后自行核对。
 
@@ -69,6 +72,20 @@ rustup target add aarch64-pc-windows-msvc
 ```
 
 生成的文件位于 `target/<target>/release/taskmgr.exe`。
+
+## 自动化
+
+Pull Request 和推送到 `main` 的提交会在 GitHub 的 Windows Server 2025 / Visual Studio 2026
+runner 上执行格式检查、全目标 check、严格 Clippy、完整测试和 x86_64 release 构建。独立任务
+同时验证 i686 与 ARM64，i686 测试会在 WOW64 下实际执行。
+
+发布版本时，先同步修改 `Cargo.toml` 与 `Cargo.lock` 并合入主线，再推送与版本完全一致的 tag，
+例如 `v0.2.5`。Release 工作流会拒绝与 Cargo 包版本不一致的 tag，并行构建三种架构，核对 PE
+机器类型和 Windows 版本资源，生成 `SHA256SUMS.txt` 与 GitHub 构建来源证明。只有 GitHub
+服务器上的资产大小和摘要都与本地一致时才公开 Release。发布阶段失败时只保留草稿，构建
+阶段失败时不会创建 Release，因此都不会暴露不完整发布。
+
+工作流依赖全部固定到不可变的完整提交 SHA，并由 Dependabot 每周检查更新。
 
 ## 诊断日志
 

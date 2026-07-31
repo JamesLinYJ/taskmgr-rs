@@ -1,0 +1,179 @@
+# +-------------------------------------------------------------------------
+#
+#   taskmgr-rs - GitHub Actions 持续集成
+#
+#   文件:       .github/workflows/ci.yml
+#
+#   日期:       2026年07月31日
+#   环境:       Windows 10 Pro Dev（Build 29634.1000）x86_64；Rust 1.97.0；MSVC 14.50.35729.0
+#   作者:       OpenAI Codex
+# --------------------------------------------------------------------------
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  quality:
+    name: Quality (x86_64)
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        id: toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install stable `
+            --component rustfmt `
+            --component clippy `
+            --target x86_64-pc-windows-msvc
+          rustup show active-toolchain
+          $commit = @(
+              rustc -Vv |
+                  Select-String '^commit-hash:' |
+                  ForEach-Object { $_.Line.Split(':', 2)[1].Trim() }
+          )[0]
+          if ([string]::IsNullOrWhiteSpace($commit)) {
+              throw 'rustc did not report its commit hash'
+          }
+          "commit=$commit" | Out-File `
+              -FilePath $env:GITHUB_OUTPUT `
+              -Encoding utf8 `
+              -Append
+
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-rust-quality-${{ steps.toolchain.outputs.commit }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-quality-${{ steps.toolchain.outputs.commit }}-
+            ${{ runner.os }}-rust-quality-
+
+      - name: Check changed-line whitespace
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:BASE_SHA) -or $env:BASE_SHA -match '^0+$') {
+              git show --check --format= HEAD
+          } else {
+              git diff --check $env:BASE_SHA $env:GITHUB_SHA
+          }
+          if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+          }
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check all targets
+        run: cargo check --all-targets --locked
+
+      - name: Run strict Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run all tests
+        run: cargo test --all-targets --locked
+
+      - name: Build release executable
+        run: cargo build --release --locked
+
+  architecture:
+    name: Architecture (${{ matrix.target }})
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: i686-pc-windows-msvc
+            run_tests: true
+          - target: aarch64-pc-windows-msvc
+            run_tests: false
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        id: toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install stable `
+            --component clippy `
+            --target '${{ matrix.target }}'
+          rustup show active-toolchain
+          $commit = @(
+              rustc -Vv |
+                  Select-String '^commit-hash:' |
+                  ForEach-Object { $_.Line.Split(':', 2)[1].Trim() }
+          )[0]
+          if ([string]::IsNullOrWhiteSpace($commit)) {
+              throw 'rustc did not report its commit hash'
+          }
+          "commit=$commit" | Out-File `
+              -FilePath $env:GITHUB_OUTPUT `
+              -Encoding utf8 `
+              -Append
+
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-rust-${{ matrix.target }}-${{ steps.toolchain.outputs.commit }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-${{ matrix.target }}-${{ steps.toolchain.outputs.commit }}-
+            ${{ runner.os }}-rust-${{ matrix.target }}-
+
+      - name: Check all targets
+        run: cargo check --all-targets --target '${{ matrix.target }}' --locked
+
+      - name: Run strict Clippy
+        run: cargo clippy --all-targets --target '${{ matrix.target }}' --locked -- -D warnings
+
+      - name: Run executable tests
+        if: matrix.run_tests
+        run: cargo test --all-targets --target '${{ matrix.target }}' --locked
+
+      - name: Build release executable
+        run: cargo build --release --target '${{ matrix.target }}' --locked

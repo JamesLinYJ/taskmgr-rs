@@ -9,6 +9,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$previousRustFlags = $env:RUSTFLAGS
 
 function Add-RemapPrefix {
     param(
@@ -30,7 +31,6 @@ function Add-RemapPrefix {
 }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$toolchain = if ($UseNightlyBuildStd) { "nightly" } else { "" }
 $rustflags = New-Object 'System.Collections.Generic.List[string]'
 
 Add-RemapPrefix $rustflags $repoRoot "."
@@ -76,10 +76,19 @@ try {
         cargo +nightly build `
             -Z build-std=std,panic_abort `
             --target $Target `
-            --release
+            --release `
+            --locked
     } else {
-        cargo build --target $Target --release
+        cargo build --target $Target --release --locked
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo release build failed with exit code $LASTEXITCODE"
     }
 } finally {
     Pop-Location
+    if ($null -eq $previousRustFlags) {
+        Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
+    } else {
+        $env:RUSTFLAGS = $previousRustFlags
+    }
 }
