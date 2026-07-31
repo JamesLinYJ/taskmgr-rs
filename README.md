@@ -2,6 +2,8 @@
 
 English | [简体中文](README.zh-CN.md)
 
+[![CI](https://github.com/JamesLinYJ/taskmgr-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/JamesLinYJ/taskmgr-rs/actions/workflows/ci.yml)
+
 A Windows task manager written in Rust with native Win32 APIs. The UI follows the older Task Manager layout, while sampling and background refresh use current Windows interfaces.
 
 This is not a copy of the modern Task Manager. CPU and GPU details come from system APIs rather than model lookup tables. If Windows does not return a value, the UI says it is unavailable. A failed refresh also leaves the last valid result on screen instead of replacing it with zeros.
@@ -20,9 +22,10 @@ This is not a copy of the modern Task Manager. CPU and GPU details come from sys
 The current build is on the [Releases page](https://github.com/JamesLinYJ/taskmgr-rs/releases/latest):
 
 - [Windows x86_64](https://github.com/JamesLinYJ/taskmgr-rs/releases/latest/download/taskmgr-windows-x86_64.exe) for most Intel and AMD Windows PCs.
+- [Windows x86](https://github.com/JamesLinYJ/taskmgr-rs/releases/latest/download/taskmgr-windows-x86.exe) for 32-bit Windows.
 - [Windows ARM64](https://github.com/JamesLinYJ/taskmgr-rs/releases/latest/download/taskmgr-windows-arm64.exe) for Windows on Arm devices.
 
-Both downloads are single EXE files. The program asks for administrator access because some process and session actions require it.
+All three downloads are single EXE files. The program asks for administrator access because some process and session actions require it.
 
 The release files are not code-signed at the moment, so Windows may show a SmartScreen warning. Each release includes SHA-256 hashes for manual verification.
 
@@ -69,6 +72,21 @@ rustup target add aarch64-pc-windows-msvc
 ```
 
 The executable is written to `target/<target>/release/taskmgr.exe`.
+
+## Automation
+
+Pull requests and pushes to `main` run formatting, all-target checks, strict Clippy, tests, and an
+x86_64 release build on GitHub's Windows Server 2025 / Visual Studio 2026 runner. Separate jobs
+compile i686 and ARM64; i686 tests also run under WOW64.
+
+To publish a version, first update `Cargo.toml` and `Cargo.lock`, merge the change, then push the
+matching tag such as `v0.2.5`. The Release workflow rejects a tag that does not exactly match the
+Cargo package version. It builds all three architectures in parallel, verifies the PE machine and
+Windows version resources, writes `SHA256SUMS.txt`, creates GitHub build-provenance attestations,
+and publishes only after the uploaded sizes and digests match. A publishing failure leaves only a
+draft; a build failure creates no release, so neither path exposes a partial release.
+
+Workflow dependencies are pinned to immutable commit SHAs. Dependabot checks those pins weekly.
 
 ## Diagnostic logs
 
