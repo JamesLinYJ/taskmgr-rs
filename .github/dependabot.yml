@@ -1,0 +1,8 @@
+# GitHub Actions are pinned to immutable commit SHAs. Dependabot keeps those pins current.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
