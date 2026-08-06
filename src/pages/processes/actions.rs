@@ -20,8 +20,9 @@ use windows_sys::Win32::Foundation::{
     ERROR_BUSY, ERROR_FILE_NOT_FOUND, ERROR_GEN_FAILURE, ERROR_INSUFFICIENT_BUFFER,
     ERROR_INVALID_DATA, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES,
     ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND, FILETIME, GetLastError, HANDLE, HWND, LPARAM,
-    WPARAM,
+    WAIT_OBJECT_0, WPARAM,
 };
+use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
     TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -43,6 +44,7 @@ use windows_sys::Win32::System::Threading::{
     QueryFullProcessImageNameW, REALTIME_PRIORITY_CLASS, STARTUPINFOW, SetPriorityClass,
     SetProcessAffinityMask, SetProcessDefaultCpuSets, SetThreadGroupAffinity,
     THREAD_QUERY_LIMITED_INFORMATION, THREAD_SET_INFORMATION, TerminateProcess,
+    WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Controls::{
     BST_CHECKED, BST_UNCHECKED, CheckDlgButton, IsDlgButtonChecked,
@@ -73,6 +75,86 @@ struct AffinityDialogContext {
     selected_masks: Vec<usize>,
     selected_group_index: usize,
     original_default_ids: Vec<u32>,
+}
+
+const PROCESS_TREE_ACCESS: u32 =
+    PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum DescendantProcessOutcome<T> {
+    Verified(T),
+    GoneOrReused,
+    Fatal(u32),
+}
+
+pub(super) fn classify_descendant_process_result<T, F>(
+    result: Result<T, u32>,
+    is_verified: F,
+) -> DescendantProcessOutcome<T>
+where
+    F: FnOnce(&T) -> bool,
+{
+    match result {
+        Ok(value) => {
+            if is_verified(&value) {
+                DescendantProcessOutcome::Verified(value)
+            } else {
+                DescendantProcessOutcome::GoneOrReused
+            }
+        }
+        Err(ERROR_INVALID_PARAMETER) => DescendantProcessOutcome::GoneOrReused,
+        Err(error) => DescendantProcessOutcome::Fatal(error),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FailedTerminationOutcome {
+    AlreadyTerminated,
+    Failed(u32),
+}
+
+pub(super) const fn classify_failed_termination(
+    error: u32,
+    wait_result: u32,
+) -> FailedTerminationOutcome {
+    if wait_result == WAIT_OBJECT_0 {
+        FailedTerminationOutcome::AlreadyTerminated
+    } else {
+        FailedTerminationOutcome::Failed(error)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ProcessTreePrepareError {
+    Root(u32),
+    Tree(u32),
+}
+
+pub(super) struct PreparedProcessTree {
+    root_pid: u32,
+    targets: Vec<(ProcIdentity, OwnedHandle)>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ProcessTreeTerminationOutcome {
+    any_success: bool,
+    any_completed: bool,
+    any_failure: bool,
+    root_error: u32,
+}
+
+impl ProcessTreeTerminationOutcome {
+    pub(super) const fn any_success(self) -> bool {
+        self.any_success
+    }
+
+    pub(super) const fn any_failure(self) -> bool {
+        self.any_failure
+    }
+
+    const fn completed_without_failure(self) -> bool {
+        self.any_completed && !self.any_failure
+    }
 }
 
 impl ProcessPageState {
@@ -152,95 +234,30 @@ impl ProcessPageState {
                 return false;
             }
 
-            let mut root_handle = match open_process_for_identity(
-                identity,
-                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-            ) {
-                Ok(handle) => Some(handle),
-                Err(error) => {
+            let prepared = match prepare_process_tree_termination(identity) {
+                Ok(prepared) => prepared,
+                Err(ProcessTreePrepareError::Root(error)) => {
                     self.show_failure_message(&self.strings.cant_kill, error);
                     return false;
                 }
-            };
-
-            let pid = identity.pid;
-            let termination_order = match collect_process_tree_termination_order(identity) {
-                Ok(order) if !order.is_empty() => order,
-                Ok(_) => {
-                    self.show_failure_message(
-                        &self.strings.kill_tree_fail_body,
-                        windows_sys::Win32::Foundation::ERROR_GEN_FAILURE,
-                    );
-                    return false;
-                }
-                Err(error) => {
+                Err(ProcessTreePrepareError::Tree(error)) => {
                     self.show_failure_message(&self.strings.kill_tree_fail_body, error);
                     return false;
                 }
             };
+            let outcome = terminate_prepared_process_tree(prepared);
 
-            // 先验证并打开整棵树，再开始终止，避免权限/身份错误造成可预见的半完成状态。
-            let mut targets = Vec::with_capacity(termination_order.len());
-            for target_identity in termination_order {
-                if target_identity == identity {
-                    let Some(handle) = root_handle.take() else {
-                        self.show_failure_message(
-                            &self.strings.kill_tree_fail_body,
-                            ERROR_INVALID_DATA,
-                        );
-                        return false;
-                    };
-                    targets.push((target_identity, handle));
-                    continue;
-                }
-
-                match open_process_for_identity(
-                    target_identity,
-                    PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-                ) {
-                    Ok(handle) => targets.push((target_identity, handle)),
-                    Err(error) => {
-                        self.show_failure_message(&self.strings.kill_tree_fail_body, error);
-                        return false;
-                    }
-                }
-            }
-
-            if root_handle.is_some() {
-                self.show_failure_message(
-                    &self.strings.kill_tree_fail_body,
-                    windows_sys::Win32::Foundation::ERROR_GEN_FAILURE,
-                );
-                return false;
-            }
-
-            let mut any_success = false;
-            let mut any_failure = false;
-            let mut root_error = 0u32;
-
-            for (target_identity, handle) in targets {
-                let target_pid = target_identity.pid;
-                if TerminateProcess(handle.as_raw(), 1) == 0 {
-                    any_failure = true;
-                    if target_pid == pid {
-                        root_error = windows_sys::Win32::Foundation::GetLastError();
-                    }
-                } else {
-                    any_success = true;
-                }
-            }
-
-            if any_success {
+            if outcome.any_completed {
                 self.paused = false;
                 self.refresh_processes();
             }
 
-            if root_error != 0 && !any_success {
-                self.show_failure_message(&self.strings.cant_kill, root_error);
+            if outcome.root_error != 0 && !outcome.any_success() {
+                self.show_failure_message(&self.strings.cant_kill, outcome.root_error);
                 return false;
             }
 
-            if any_failure {
+            if outcome.any_failure() {
                 let body_wide = to_wide_null(&self.strings.kill_tree_fail_body);
                 let title_wide = to_wide_null(&self.strings.kill_tree_fail);
                 MessageBoxW(
@@ -252,7 +269,7 @@ impl ProcessPageState {
                 return false;
             }
 
-            any_success
+            outcome.completed_without_failure()
         }
     }
 
@@ -1176,7 +1193,86 @@ fn expand_environment_variables(command_line: &str) -> Result<String, u32> {
     Ok(String::from_utf16_lossy(&buffer[..len]))
 }
 
-// 检查 SID 是否为已知服务帐户（SYSTEM、LOCAL SERVICE、NETWORK SERVICE），返回对应名称。
+// 先构建完整的已验证句柄集合，再把不可逆的终止阶段与 UI 结果呈现分离。
+pub(super) fn prepare_process_tree_termination(
+    root_identity: ProcIdentity,
+) -> Result<PreparedProcessTree, ProcessTreePrepareError> {
+    let mut root_handle = Some(
+        open_process_for_identity(root_identity, PROCESS_TREE_ACCESS)
+            .map_err(ProcessTreePrepareError::Root)?,
+    );
+    let termination_order = collect_process_tree_termination_order(root_identity)
+        .map_err(ProcessTreePrepareError::Tree)?;
+    if termination_order.is_empty() {
+        return Err(ProcessTreePrepareError::Tree(ERROR_GEN_FAILURE));
+    }
+
+    // Validate and own every available handle before terminating anything. A descendant that
+    // disappeared or changed identity is no longer an actionable target, while permission and
+    // system errors still abort preparation before the root can be partially terminated.
+    let mut targets = Vec::with_capacity(termination_order.len());
+    for target_identity in termination_order {
+        if target_identity == root_identity {
+            let handle = root_handle
+                .take()
+                .ok_or(ProcessTreePrepareError::Tree(ERROR_INVALID_DATA))?;
+            targets.push((target_identity, handle));
+            continue;
+        }
+
+        match classify_descendant_process_result(
+            open_process_for_identity(target_identity, PROCESS_TREE_ACCESS),
+            |_| true,
+        ) {
+            DescendantProcessOutcome::Verified(handle) => {
+                targets.push((target_identity, handle));
+            }
+            DescendantProcessOutcome::GoneOrReused => {}
+            DescendantProcessOutcome::Fatal(error) => {
+                return Err(ProcessTreePrepareError::Tree(error));
+            }
+        }
+    }
+
+    if root_handle.is_some() {
+        return Err(ProcessTreePrepareError::Tree(ERROR_GEN_FAILURE));
+    }
+
+    Ok(PreparedProcessTree {
+        root_pid: root_identity.pid,
+        targets,
+    })
+}
+
+pub(super) fn terminate_prepared_process_tree(
+    prepared: PreparedProcessTree,
+) -> ProcessTreeTerminationOutcome {
+    let mut outcome = ProcessTreeTerminationOutcome::default();
+    for (target_identity, handle) in prepared.targets {
+        if unsafe { TerminateProcess(handle.as_raw(), 1) } != 0 {
+            outcome.any_success = true;
+            outcome.any_completed = true;
+            continue;
+        }
+
+        // Capture TerminateProcess's error before WaitForSingleObject can change last-error.
+        let error = nonzero_last_error();
+        let wait_result = unsafe { WaitForSingleObject(handle.as_raw(), 0) };
+        match classify_failed_termination(error, wait_result) {
+            FailedTerminationOutcome::AlreadyTerminated => {
+                outcome.any_completed = true;
+            }
+            FailedTerminationOutcome::Failed(error) => {
+                outcome.any_failure = true;
+                if target_identity.pid == prepared.root_pid {
+                    outcome.root_error = error;
+                }
+            }
+        }
+    }
+    outcome
+}
+
 fn collect_process_tree_termination_order(
     root_identity: ProcIdentity,
 ) -> Result<Vec<ProcIdentity>, u32> {
@@ -1265,10 +1361,14 @@ unsafe fn collect_verified_process_tree_children(
                 if visited.contains(&child_pid) {
                     continue;
                 }
-                let child = query_process_identity_for_pid(child_pid)?;
-                if !is_valid_process_tree_edge(parent, child, snapshot_time_100ns) {
-                    continue;
-                }
+                let child = match classify_descendant_process_result(
+                    query_process_identity_for_pid(child_pid),
+                    |child| is_valid_process_tree_edge(parent, *child, snapshot_time_100ns),
+                ) {
+                    DescendantProcessOutcome::Verified(child) => child,
+                    DescendantProcessOutcome::GoneOrReused => continue,
+                    DescendantProcessOutcome::Fatal(error) => return Err(error),
+                };
                 collect_verified_process_tree_children(
                     child,
                     snapshot_time_100ns,

@@ -1353,8 +1353,11 @@ fn column_id_from_i32(value: i32) -> Option<ColumnId> {
 #[cfg(test)]
 mod tests {
     use super::actions::{
-        affinity_cpu_mask, affinity_is_within_selection, affinity_target_for_thread,
+        DescendantProcessOutcome, FailedTerminationOutcome, affinity_cpu_mask,
+        affinity_is_within_selection, affinity_target_for_thread,
+        classify_descendant_process_result, classify_failed_termination,
         extract_first_command_token, is_valid_process_tree_edge, normalize_debugger_command_with,
+        prepare_process_tree_termination, terminate_prepared_process_tree,
         validate_snapshot_root_identity,
     };
     use super::model::{DirtyColumns, ProcEntry};
@@ -1367,9 +1370,41 @@ mod tests {
         reorder_process_columns, write_process_column_layout,
     };
     use crate::config::options::{ColumnId, Options};
+    use crate::system::process_identity::query_process_identity_for_pid;
     use std::collections::HashMap;
+    use std::env;
+    use std::fs;
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
+    use std::path::PathBuf;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
     use windows_sys::Win32::System::Registry::{REG_EXPAND_SZ, REG_SZ};
-    use windows_sys::Win32::System::Threading::NORMAL_PRIORITY_CLASS;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NO_WINDOW, NORMAL_PRIORITY_CLASS, WaitForSingleObject,
+    };
+
+    const PROCESS_TREE_CHURN_WORKER_ENV: &str = "TASKMGR_RS_PROCESS_TREE_CHURN_WORKER";
+    const PROCESS_TREE_CHURN_READY_ENV: &str = "TASKMGR_RS_PROCESS_TREE_CHURN_READY";
+
+    struct ChurnWorkerGuard {
+        child: Child,
+        ready_path: PathBuf,
+    }
+
+    impl Drop for ChurnWorkerGuard {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = fs::remove_file(&self.ready_path);
+        }
+    }
 
     fn empty_process_entry(image_name: &str) -> ProcEntry {
         ProcEntry {
@@ -1571,6 +1606,137 @@ mod tests {
         assert!(validate_snapshot_root_identity(expected, expected).is_ok());
         assert!(validate_snapshot_root_identity(ProcIdentity::pid_only(10), expected).is_err());
         assert!(validate_snapshot_root_identity(expected, ProcIdentity::new(10, 200)).is_err());
+    }
+
+    #[test]
+    fn descendant_process_outcomes_preserve_fatal_errors() {
+        assert_eq!(
+            classify_descendant_process_result(Ok(7), |_| true),
+            DescendantProcessOutcome::Verified(7)
+        );
+        assert_eq!(
+            classify_descendant_process_result(Ok(7), |_| false),
+            DescendantProcessOutcome::GoneOrReused
+        );
+        assert_eq!(
+            classify_descendant_process_result::<(), _>(Err(ERROR_INVALID_PARAMETER), |_| true),
+            DescendantProcessOutcome::GoneOrReused
+        );
+        assert_eq!(
+            classify_descendant_process_result::<(), _>(Err(ERROR_ACCESS_DENIED), |_| true),
+            DescendantProcessOutcome::Fatal(ERROR_ACCESS_DENIED)
+        );
+    }
+
+    #[test]
+    fn failed_termination_of_an_exited_process_is_benign() {
+        assert_eq!(
+            classify_failed_termination(ERROR_ACCESS_DENIED, WAIT_OBJECT_0),
+            FailedTerminationOutcome::AlreadyTerminated
+        );
+        assert_eq!(
+            classify_failed_termination(ERROR_ACCESS_DENIED, WAIT_TIMEOUT),
+            FailedTerminationOutcome::Failed(ERROR_ACCESS_DENIED)
+        );
+    }
+
+    #[test]
+    fn process_tree_churn_worker() {
+        if env::var_os(PROCESS_TREE_CHURN_WORKER_ENV).is_none() {
+            return;
+        }
+
+        let ready_path = PathBuf::from(
+            env::var_os(PROCESS_TREE_CHURN_READY_ENV)
+                .expect("the churn worker requires a readiness path"),
+        );
+        let completed_children = Arc::new(AtomicUsize::new(0));
+        for _ in 0..4 {
+            let completed_children = Arc::clone(&completed_children);
+            thread::spawn(move || {
+                loop {
+                    if Command::new("cmd.exe")
+                        .args(["/D", "/Q", "/C", "exit"])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .status()
+                        .is_ok()
+                    {
+                        completed_children.fetch_add(1, Ordering::Release);
+                    }
+                }
+            });
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while completed_children.load(Ordering::Acquire) < 16 {
+            assert!(
+                Instant::now() < deadline,
+                "the churn worker could not launch short-lived children"
+            );
+            thread::yield_now();
+        }
+        fs::write(&ready_path, b"ready").expect("the churn worker should signal readiness");
+
+        loop {
+            thread::park();
+        }
+    }
+
+    #[test]
+    fn process_tree_termination_survives_rapidly_exiting_descendants() {
+        let ready_path = env::temp_dir().join(format!(
+            "taskmgr-rs-process-tree-churn-{}.ready",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&ready_path);
+        let worker = Command::new(env::current_exe().expect("the test executable should exist"))
+            .args([
+                "--exact",
+                "pages::processes::tests::process_tree_churn_worker",
+            ])
+            .env(PROCESS_TREE_CHURN_WORKER_ENV, "1")
+            .env(PROCESS_TREE_CHURN_READY_ENV, &ready_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("the churn worker should start");
+        let mut worker = ChurnWorkerGuard {
+            child: worker,
+            ready_path,
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !worker.ready_path.exists() {
+            assert!(
+                worker
+                    .child
+                    .try_wait()
+                    .expect("the churn worker state should be readable")
+                    .is_none(),
+                "the churn worker exited before becoming ready"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the churn worker did not become ready"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let identity = query_process_identity_for_pid(worker.child.id())
+            .expect("the churn worker identity should be queryable");
+        let prepared = prepare_process_tree_termination(identity)
+            .expect("short-lived descendants must not abort tree preparation");
+        let outcome = terminate_prepared_process_tree(prepared);
+
+        assert!(outcome.any_success());
+        assert!(!outcome.any_failure());
+        let wait = unsafe { WaitForSingleObject(worker.child.as_raw_handle(), 5_000) };
+        assert_eq!(wait, WAIT_OBJECT_0, "the verified root must terminate");
     }
 
     #[test]
