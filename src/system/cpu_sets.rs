@@ -173,49 +173,52 @@ impl CpuSetTopology {
     }
 }
 
-pub(crate) unsafe fn query_process_default_cpu_sets(
+pub(crate) fn query_process_default_cpu_sets(
     process: HANDLE,
 ) -> Result<Vec<u32>, CpuSetError> {
-    unsafe {
-        let mut required = 0u32;
-        let size_result = GetProcessDefaultCpuSets(process, null_mut(), 0, &mut required);
-        if size_result != 0 {
-            return if required == 0 {
-                Ok(Vec::new())
-            } else {
-                Err(CpuSetError::DefaultSetSize(ERROR_INVALID_DATA))
-            };
-        }
-        let error = GetLastError();
-        if error != ERROR_INSUFFICIENT_BUFFER || required == 0 {
-            return Err(CpuSetError::DefaultSetSize(nonzero_error(error)));
-        }
+    let mut required = 0u32;
+    // SAFETY: the null buffer is paired with a zero capacity and `required` is a valid output.
+    let size_result = unsafe { GetProcessDefaultCpuSets(process, null_mut(), 0, &mut required) };
+    if size_result != 0 {
+        return if required == 0 {
+            Ok(Vec::new())
+        } else {
+            Err(CpuSetError::DefaultSetSize(ERROR_INVALID_DATA))
+        };
+    }
+    let error = unsafe { GetLastError() };
+    if error != ERROR_INSUFFICIENT_BUFFER || required == 0 {
+        return Err(CpuSetError::DefaultSetSize(nonzero_error(error)));
+    }
 
-        for _ in 0..MAX_QUERY_ATTEMPTS {
-            let mut ids = vec![0u32; required as usize];
-            let mut returned = required;
-            if GetProcessDefaultCpuSets(
+    for _ in 0..MAX_QUERY_ATTEMPTS {
+        let mut ids = vec![0u32; required as usize];
+        let mut returned = required;
+        // SAFETY: `ids` is writable for the supplied element count and `returned` is a valid
+        // output. Invalid or stale process handles are reported by the API as errors.
+        if unsafe {
+            GetProcessDefaultCpuSets(
                 process,
                 ids.as_mut_ptr(),
                 u32::try_from(ids.len()).unwrap_or(u32::MAX),
                 &mut returned,
-            ) != 0
-            {
-                if returned as usize > ids.len() {
-                    return Err(CpuSetError::DefaultSetData(ERROR_INVALID_DATA));
-                }
-                ids.truncate(returned as usize);
-                return Ok(ids);
+            )
+        } != 0
+        {
+            if returned as usize > ids.len() {
+                return Err(CpuSetError::DefaultSetData(ERROR_INVALID_DATA));
             }
-
-            let error = GetLastError();
-            if error != ERROR_INSUFFICIENT_BUFFER || returned <= required {
-                return Err(CpuSetError::DefaultSetData(nonzero_error(error)));
-            }
-            required = returned;
+            ids.truncate(returned as usize);
+            return Ok(ids);
         }
-        Err(CpuSetError::DefaultSetData(ERROR_INSUFFICIENT_BUFFER))
+
+        let error = unsafe { GetLastError() };
+        if error != ERROR_INSUFFICIENT_BUFFER || returned <= required {
+            return Err(CpuSetError::DefaultSetData(nonzero_error(error)));
+        }
+        required = returned;
     }
+    Err(CpuSetError::DefaultSetData(ERROR_INSUFFICIENT_BUFFER))
 }
 
 fn query_cpu_set_bytes(process: HANDLE) -> Result<Vec<u8>, CpuSetError> {

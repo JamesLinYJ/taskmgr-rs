@@ -45,7 +45,9 @@ pub fn enable_debug_privilege() -> Result<(), u32> {
         {
             return Err(GetLastError());
         }
-        let Some(token) = OwnedHandle::new(raw_token) else {
+        // 安全性: successful OpenProcessToken returns one owned token handle released by
+        // CloseHandle; ownership moves directly into this guard.
+        let Some(token) = OwnedHandle::from_raw(raw_token) else {
             return Err(ERROR_NOT_ALL_ASSIGNED);
         };
 
@@ -82,7 +84,9 @@ pub fn process_is_elevated() -> Result<bool, u32> {
                 error
             });
         }
-        let Some(token) = OwnedHandle::new(raw_token) else {
+        // 安全性: successful OpenProcessToken returns one owned token handle released by
+        // CloseHandle; ownership moves directly into this guard.
+        let Some(token) = OwnedHandle::from_raw(raw_token) else {
             return Err(ERROR_NOT_ALL_ASSIGNED);
         };
 

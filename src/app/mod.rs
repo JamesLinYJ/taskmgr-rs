@@ -29,7 +29,8 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Shell::{IShellDispatch, Shell};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, ERROR_GEN_FAILURE, ERROR_INVALID_PARAMETER, ERROR_TIMEOUT,
-    HANDLE, HINSTANCE, HWND, LPARAM, POINT, RECT, TRUE, WAIT_TIMEOUT, WPARAM,
+    GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, POINT, RECT, SetLastError, TRUE, WAIT_TIMEOUT,
+    WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     COLOR_3DFACE, CreateRectRgn, DCX_CACHE, DCX_CLIPSIBLINGS, DCX_INTERSECTRGN, DeleteObject,
@@ -55,14 +56,14 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, ReleaseCapture, SetCapture, VK_CONTROL,
 };
-use windows_sys::Win32::UI::Shell::{NIM_ADD, NIM_DELETE, ShellAboutW, ShellExecuteW, WinHelpW};
+use windows_sys::Win32::UI::Shell::{NIM_ADD, NIM_DELETE, ShellAboutW, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CheckMenuItem, CheckMenuRadioItem, CreateWindowExW, DefWindowProcW, DeleteMenu,
     DestroyAcceleratorTable, DestroyWindow, DispatchMessageW, DrawMenuBar, EnableMenuItem,
     GWL_STYLE, GetClassInfoW, GetClientRect, GetCursorPos, GetDlgItem, GetForegroundWindow,
     GetMenu, GetMenuItemInfoW, GetMessageW, GetShellWindow, GetWindowLongW, GetWindowPlacement,
-    GetWindowRect, HACCEL, HELP_FINDER, HICON, HMENU, HTCAPTION, HTCLIENT, HWND_NOTOPMOST,
-    HWND_TOP, HWND_TOPMOST, IDCANCEL, IsDialogMessageW, IsIconic, IsWindowVisible, IsZoomed,
+    GetWindowRect, HACCEL, HICON, HMENU, HTCAPTION, HTCLIENT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
+    IDCANCEL, IsDialogMessageW, IsIconic, IsWindowVisible, IsZoomed,
     KillTimer, LR_DEFAULTCOLOR, LR_DEFAULTSIZE, MB_ICONSTOP, MB_OK, MENUITEMINFOW, MF_BYCOMMAND,
     MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_SYSMENU, MF_UNCHECKED, MIIM_ID,
     MINMAXINFO, MSG, MessageBoxW, OpenIcon, PostMessageW, PostQuitMessage, RegisterClassW,
@@ -87,10 +88,10 @@ use self::page_registry::{MinimumSizePolicy, PageId};
 use crate::config::options::{Options, update_speed_timer_interval};
 use crate::infrastructure::diagnostics::{self, Field, Level};
 use crate::infrastructure::native::{
-    call_window_proc, destroy_icon_handle, enable_debug_privilege, format_resource_string, height,
-    hiword, loword, process_is_elevated, record_hresult_error, record_startup_timing,
-    record_win32_error, sanitize_task_manager_menu, set_dialog_msg_result, set_style,
-    set_window_userdata_ptr, to_wide_null, width, window_userdata_non_null,
+    OwnedIcon, call_window_proc, enable_debug_privilege, format_resource_string, height, hiword,
+    loword, process_is_elevated, record_hresult_error, record_startup_timing, record_win32_error,
+    sanitize_task_manager_menu, set_dialog_msg_result, set_style, set_window_userdata_ptr,
+    to_wide_null, width, window_userdata_non_null,
 };
 use crate::system::cpu_topology::CpuTopologyError;
 use crate::system::process_identity::ProcIdentity;
@@ -104,6 +105,10 @@ use crate::ui::runtime_menu::PopupMenu;
 
 const FINDME_TIMEOUT: u32 = 10_000;
 const STARTUP_MUTEX_WAIT_TIMEOUT: u32 = 500;
+const HELP_DOCUMENTATION_URL: &str = "https://github.com/JamesLinYJ/taskmgr-rs#readme";
+// CoInitializeEx reports this when the thread already belongs to a different apartment.
+// The thread is still COM-initialized, but this call acquired no reference to release.
+const RPC_E_CHANGED_MODE_HRESULT: i32 = 0x8001_0106_u32 as i32;
 static FRAME_BASE_WNDPROC: OnceLock<
     Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> isize>,
 > = OnceLock::new();
@@ -121,12 +126,22 @@ struct ComApartment;
 
 impl ComApartment {
     fn initialize() -> Result<Self, i32> {
-        // The main window thread owns this apartment for the duration of the system Run request.
+        // The returned guard owns exactly the successful CoInitializeEx call made here.
         let result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         if result.is_ok() {
             Ok(Self)
         } else {
             Err(result.0)
+        }
+    }
+
+    fn initialize_for_shell() -> Result<Option<Self>, i32> {
+        match Self::initialize() {
+            Ok(apartment) => Ok(Some(apartment)),
+            // A host may have initialized the UI thread with another apartment model. In that
+            // case COM is already available and there is no successful call for us to balance.
+            Err(RPC_E_CHANGED_MODE_HRESULT) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 }
@@ -166,7 +181,7 @@ pub struct App {
     startup_mutex: HANDLE,
     startup_mutex_owned: bool,
     accelerator_table: HACCEL,
-    main_icon: HICON,
+    main_icon: Option<OwnedIcon>,
     menu: MenuController,
     tray: TrayController,
     strings: GlobalStrings,
@@ -375,7 +390,7 @@ impl App {
             startup_mutex: null_mut(),
             startup_mutex_owned: false,
             accelerator_table: null_mut(),
-            main_icon: null_mut(),
+            main_icon: None,
             menu: MenuController::default(),
             tray: TrayController::default(),
             strings: GlobalStrings::default(),
@@ -644,9 +659,12 @@ impl App {
             page.destroy();
         }
         self.tray.clear_icons();
-        if !self.main_icon.is_null() {
-            destroy_icon_handle(self.main_icon);
-            self.main_icon = null_mut();
+        if self.main_icon.is_some() {
+            if !self.main_hwnd.is_null() {
+                // 安全性: detach the borrowed icon from the live window before its owner drops.
+                unsafe { SendMessageW(self.main_hwnd, WM_SETICON, 1, 0) };
+            }
+            self.main_icon = None;
         }
         if !self.accelerator_table.is_null() {
             unsafe { DestroyAcceleratorTable(self.accelerator_table) };
@@ -1854,9 +1872,61 @@ impl App {
     }
 
     fn show_help(&self, hwnd: HWND) {
-        let help_path = to_wide_null("taskmgr.hlp");
-        // 安全性: `help_path` is a NUL-terminated UTF-16 buffer valid for the duration of call.
-        unsafe { WinHelpW(hwnd, help_path.as_ptr(), HELP_FINDER, 0) };
+        let _apartment = match ComApartment::initialize_for_shell() {
+            Ok(apartment) => apartment,
+            Err(error) => {
+                record_hresult_error("initializing COM for online help", error);
+                self.show_hresult_failure(text(TextKey::HelpOpenFailed), error);
+                return;
+            }
+        };
+        let verb = to_wide_null("open");
+        let target = to_wide_null(help_documentation_url());
+        // Safety: the verb and fixed HTTPS target are NUL-terminated and live through the
+        // synchronous call. Clear and capture last-error around ShellExecuteW so failures keep
+        // their documented extended diagnostic without consulting any file search path.
+        let (result, last_error) = unsafe {
+            SetLastError(0);
+            let result = ShellExecuteW(
+                hwnd,
+                verb.as_ptr(),
+                target.as_ptr(),
+                null(),
+                null(),
+                SW_SHOWNORMAL,
+            ) as isize;
+            let last_error = if result <= 32 { GetLastError() } else { 0 };
+            (result, last_error)
+        };
+        if let Some(failure) = shell_execute_failure(result, last_error) {
+            let title = to_wide_null(text(TextKey::HelpOpenFailed));
+            let body = match failure {
+                ShellExecuteFailure::Win32(error) => {
+                    record_win32_error("opening online help", error);
+                    format!("{} 0x{error:08X}", text(TextKey::Win32ErrorPrefix))
+                }
+                ShellExecuteFailure::Shell(code) => {
+                    diagnostics::event(
+                        Level::Error,
+                        "help.open_failed",
+                        "app",
+                        "ShellExecuteW returned a documented failure code for online help",
+                        &[Field::signed("shell_execute_code", code as i64)],
+                    );
+                    format!("ShellExecuteW: {code}")
+                }
+            };
+            let body = to_wide_null(&body);
+            // Safety: the owner HWND is live and both UTF-16 buffers remain valid for the call.
+            unsafe {
+                MessageBoxW(
+                    hwnd,
+                    body.as_ptr(),
+                    title.as_ptr(),
+                    MB_OK | MB_ICONSTOP,
+                );
+            }
+        }
     }
 
     fn on_menu_select(&mut self, wparam: WPARAM, lparam: LPARAM) -> isize {
@@ -2140,15 +2210,16 @@ impl App {
                 }
                 IDM_ABOUT => {
                     let title = to_wide_null(&self.strings.app_title);
-                    let icon = load_icon_resource(
+                    match load_icon_resource(
                         APPLICATION_ICON_RESOURCE,
                         0,
                         0,
                         LR_DEFAULTCOLOR | LR_DEFAULTSIZE,
-                    );
-                    if !icon.is_null() {
-                        ShellAboutW(hwnd, title.as_ptr(), null(), icon);
-                        destroy_icon_handle(icon);
+                    ) {
+                        Ok(icon) => {
+                            ShellAboutW(hwnd, title.as_ptr(), null(), icon.as_raw());
+                        }
+                        Err(error) => record_win32_error("about dialog icon loading", error),
                     }
                 }
                 IDM_TASK_CASCADE
@@ -2274,12 +2345,23 @@ impl App {
         }
     }
 
-    fn on_notify(&mut self, lparam: LPARAM) -> isize {
-        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    /// Handles a notification sent to the main dialog.
+    ///
+    /// # Safety
+    ///
+    /// `lparam` must point to the live `WM_NOTIFY` payload supplied by Win32 for the duration of
+    /// this synchronous dispatch.
+    unsafe fn on_notify(&mut self, lparam: LPARAM) -> isize {
         unsafe {
-            let header = &*(lparam as *const NMHDR);
-            if header.idFrom as i32 == IDC_TABS && header.code == TCN_SELCHANGE {
-                let tabs_hwnd = GetDlgItem(self.main_hwnd, IDC_TABS);
+            let Some(header) = (lparam as *const NMHDR).as_ref() else {
+                return 0;
+            };
+            let tabs_hwnd = GetDlgItem(self.main_hwnd, IDC_TABS);
+            if !tabs_hwnd.is_null()
+                && header.idFrom == IDC_TABS as usize
+                && header.hwndFrom == tabs_hwnd
+                && header.code == TCN_SELCHANGE
+            {
                 let selected = SendMessageW(tabs_hwnd, TCM_GETCURSEL, 0, 0);
                 let Ok(selected) = usize::try_from(selected) else {
                     return 0;
@@ -2372,10 +2454,9 @@ impl App {
             }
 
             self.tray.clear_icons();
-            if !self.main_icon.is_null() {
+            if self.main_icon.is_some() {
                 SendMessageW(self.main_hwnd, WM_SETICON, 1, 0);
-                destroy_icon_handle(self.main_icon);
-                self.main_icon = null_mut();
+                self.main_icon = None;
             }
             if !self.accelerator_table.is_null() {
                 DestroyAcceleratorTable(self.accelerator_table);
@@ -2392,6 +2473,16 @@ impl App {
                 &[],
             );
             PostQuitMessage(0);
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        if self.main_icon.is_some() && !self.main_hwnd.is_null() {
+            // 安全性: App is confined to the window thread. Detaching the borrowed window icon
+            // synchronously ensures the following field drop cannot destroy an icon still in use.
+            unsafe { SendMessageW(self.main_hwnd, WM_SETICON, 1, 0) };
         }
     }
 }
@@ -2449,6 +2540,27 @@ fn clamped_window_size(
     min_height: i32,
 ) -> (i32, i32) {
     (width_px.max(min_width), height_px.max(min_height))
+}
+
+fn help_documentation_url() -> &'static str {
+    // The help target is application-owned build input, never a filename or environment lookup.
+    HELP_DOCUMENTATION_URL
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellExecuteFailure {
+    Win32(u32),
+    Shell(isize),
+}
+
+fn shell_execute_failure(result: isize, last_error: u32) -> Option<ShellExecuteFailure> {
+    if result > 32 {
+        return None;
+    }
+    if last_error != 0 {
+        return Some(ShellExecuteFailure::Win32(last_error));
+    }
+    Some(ShellExecuteFailure::Shell(result))
 }
 
 unsafe extern "system" fn main_window_proc(
@@ -2517,25 +2629,19 @@ unsafe extern "system" fn main_window_proc(
                     record_win32_error("tray icon loading", error);
                 }
                 // 安全性: main HWND is live; icon and tray setup after deferred icon loading.
-                let icon = load_icon_resource(
+                match load_icon_resource(
                     APPLICATION_ICON_RESOURCE,
                     0,
                     0,
                     LR_DEFAULTCOLOR | LR_DEFAULTSIZE,
-                );
-                if !icon.is_null() {
-                    let old_owned_icon = application.main_icon;
-                    SendMessageW(hwnd, WM_SETICON, 1, icon as LPARAM);
-                    if !old_owned_icon.is_null() {
-                        destroy_icon_handle(old_owned_icon);
+                ) {
+                    Ok(icon) => {
+                        SendMessageW(hwnd, WM_SETICON, 1, icon.as_raw() as LPARAM);
+                        // WM_SETICON synchronously replaces the window's borrowed icon, so
+                        // assigning the new owner may now safely drop the previous owner.
+                        application.main_icon = Some(icon);
                     }
-                    application.main_icon = icon;
-                } else {
-                    let error = windows_sys::Win32::Foundation::GetLastError();
-                    record_win32_error(
-                        "main window icon loading",
-                        if error == 0 { ERROR_GEN_FAILURE } else { error },
-                    );
+                    Err(error) => record_win32_error("main window icon loading", error),
                 }
                 if let Some(first_icon) = application.tray.first_icon() {
                     application.update_tray(NIM_ADD, first_icon, "");
@@ -2617,8 +2723,46 @@ mod tests {
     use super::page_registry::PageId;
     use super::{
         active_page_id, active_page_uses_normal_minimum, clamped_window_size, is_active_page,
-        page_uses_normal_minimum,
+        ShellExecuteFailure, help_documentation_url, page_uses_normal_minimum,
+        shell_execute_failure,
     };
+
+    #[test]
+    fn help_uses_fixed_https_project_documentation() {
+        let target = help_documentation_url();
+        assert_eq!(target, "https://github.com/JamesLinYJ/taskmgr-rs#readme");
+        assert!(target.starts_with("https://"));
+        assert!(!target.ends_with(".hlp"));
+    }
+
+    #[test]
+    fn shell_execute_help_result_ignores_stale_last_error_after_success() {
+        assert_eq!(shell_execute_failure(33, 5), None);
+    }
+
+    #[test]
+    fn shell_execute_help_failure_preserves_extended_error() {
+        assert_eq!(
+            shell_execute_failure(31, 5),
+            Some(ShellExecuteFailure::Win32(5))
+        );
+    }
+
+    #[test]
+    fn shell_execute_help_failure_preserves_shell_error_domain() {
+        assert_eq!(
+            shell_execute_failure(31, 0),
+            Some(ShellExecuteFailure::Shell(31))
+        );
+        assert_eq!(
+            shell_execute_failure(0, 0),
+            Some(ShellExecuteFailure::Shell(0))
+        );
+        assert_eq!(
+            shell_execute_failure(-1, 0),
+            Some(ShellExecuteFailure::Shell(-1))
+        );
+    }
 
     #[test]
     fn active_page_id_rejects_invalid_values() {

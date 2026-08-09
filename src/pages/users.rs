@@ -32,7 +32,7 @@ use windows_sys::Win32::UI::Controls::{
     LVIF_PARAM, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETECOLUMN,
     LVM_DELETEITEM, LVM_ENSUREVISIBLE, LVM_GETITEMCOUNT, LVM_GETITEMW, LVM_GETNEXTITEM,
     LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETITEMSTATE, LVM_SETITEMW, LVN_COLUMNCLICK,
-    LVN_ITEMCHANGED, LVNI_SELECTED, NMLISTVIEW,
+    LVN_ITEMCHANGED, LVNI_SELECTED, NMHDR, NMLISTVIEW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -259,18 +259,27 @@ impl UserPageState {
             EndDeferWindowPos(hdwp);
         }
     }
-    pub fn handle_notify(&mut self, lparam: isize) -> isize {
+    /// Handles a notification forwarded by the users page dialog procedure.
+    ///
+    /// # Safety
+    ///
+    /// `lparam` must be the live `WM_NOTIFY` payload for this page's ListView. An
+    /// `LVN_COLUMNCLICK` payload must point to a readable `NMLISTVIEW` for this synchronous call.
+    pub unsafe fn handle_notify(&mut self, lparam: LPARAM) -> isize {
         // 选择变化用于驱动按钮可用性，列点击则触发当前会话列表重新排序。
-        // 安全性: `lparam` is provided by WM_NOTIFY and points to an NMLISTVIEW for this handler.
+        // 安全性: the dialog host established the raw notification contract documented above.
         unsafe {
-            let notify = &*(lparam as *const NMLISTVIEW);
-            if notify.hdr.idFrom as i32 == IDC_USERLIST {
-                if notify.hdr.code == LVN_ITEMCHANGED {
+            let Some(header) = (lparam as *const NMHDR).as_ref() else {
+                return 0;
+            };
+            if header.idFrom == IDC_USERLIST as usize && header.hwndFrom == self.list_hwnd() {
+                if header.code == LVN_ITEMCHANGED {
                     self.selected_session_identity = self.current_selected_session_identity();
                     self.update_ui_state();
                     return 1;
                 }
-                if notify.hdr.code == LVN_COLUMNCLICK {
+                if header.code == LVN_COLUMNCLICK {
+                    let notify = &*(lparam as *const NMLISTVIEW);
                     let column = notify.iSubItem.max(0) as usize;
                     if self.sort_column == column {
                         self.sort_ascending = !self.sort_ascending;
@@ -1002,14 +1011,13 @@ fn collect_user_sessions() -> UserWorkerResult {
         ) != 0;
         let error = GetLastError();
         if !succeeded {
-            if let Some(memory) = OwnedWtsMemory::new(sessions_ptr) {
-                drop(memory);
-            }
             return Err(win32_error_or_gen_failure(error));
         }
 
         if session_count == 0 {
-            if let Some(memory) = OwnedWtsMemory::new(sessions_ptr) {
+            // 安全性: successful WTSEnumerateSessionsW transfers any returned buffer to the
+            // caller, including a non-null buffer for an empty result.
+            if let Some(memory) = OwnedWtsMemory::from_raw(sessions_ptr) {
                 drop(memory);
             }
             return Ok(UserSessionCollection {
@@ -1018,7 +1026,9 @@ fn collect_user_sessions() -> UserWorkerResult {
             });
         }
 
-        let Some(sessions_memory) = OwnedWtsMemory::new(sessions_ptr) else {
+        // 安全性: successful WTSEnumerateSessionsW returns a uniquely owned array whose required
+        // release function is WTSFreeMemory.
+        let Some(sessions_memory) = OwnedWtsMemory::from_raw(sessions_ptr) else {
             return Err(ERROR_INVALID_DATA);
         };
         let raw_sessions = slice::from_raw_parts(
@@ -1119,13 +1129,12 @@ fn query_session_info(session_id: u32) -> Result<WTSINFOW, u32> {
         ) != 0;
         let error = GetLastError();
         if !succeeded {
-            if let Some(memory) = OwnedWtsMemory::new(buffer) {
-                drop(memory);
-            }
             return Err(win32_error_or_gen_failure(error));
         }
 
-        let Some(memory) = OwnedWtsMemory::new(buffer) else {
+        // 安全性: successful WTSQuerySessionInformationW transfers one WTS allocation to the
+        // caller, and WTSFreeMemory is its documented release function.
+        let Some(memory) = OwnedWtsMemory::from_raw(buffer) else {
             return Err(ERROR_INVALID_DATA);
         };
         if bytes < size_of::<WTSINFOW>() as u32 {
@@ -1196,18 +1205,18 @@ fn query_session_string(session_id: u32, info_class: i32) -> Result<String, u32>
         ) != 0;
         let error = GetLastError();
         if !succeeded {
-            if let Some(buffer) = OwnedWtsMemory::new(buffer) {
-                drop(buffer);
-            }
             return Err(win32_error_or_gen_failure(error));
         }
         if bytes == 0 {
-            if let Some(buffer) = OwnedWtsMemory::new(buffer) {
+            // 安全性: the successful WTS query transfers any non-null empty-result allocation.
+            if let Some(buffer) = OwnedWtsMemory::from_raw(buffer) {
                 drop(buffer);
             }
             return Ok(String::new());
         }
-        let Some(buffer) = OwnedWtsMemory::new(buffer) else {
+        // 安全性: successful WTSQuerySessionInformationW returns a uniquely owned UTF-16 buffer
+        // whose documented release function is WTSFreeMemory.
+        let Some(buffer) = OwnedWtsMemory::from_raw(buffer) else {
             return Err(ERROR_INVALID_DATA);
         };
         if bytes < size_of::<u16>() as u32 || !bytes.is_multiple_of(size_of::<u16>() as u32) {

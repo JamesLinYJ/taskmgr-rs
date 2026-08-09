@@ -12,6 +12,7 @@
 
 use std::ptr::null;
 
+use windows_sys::Win32::Foundation::HMODULE;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     FORMAT_MESSAGE_FROM_HMODULE, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
     FormatMessageW,
@@ -165,7 +166,7 @@ fn error_identity(domain: ErrorDomain, raw: u32) -> ErrorIdentity {
 }
 
 fn format_system_message(code: u32) -> Option<String> {
-    format_message(code, null(), FORMAT_MESSAGE_FROM_SYSTEM)
+    format_message(code, None)
 }
 
 fn format_module_message(module_name: &str, code: u32) -> Option<String> {
@@ -178,16 +179,20 @@ fn format_module_message(module_name: &str, code: u32) -> Option<String> {
     if module.is_null() {
         return None;
     }
-    format_message(
-        code,
-        module.cast_const(),
-        FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_FROM_SYSTEM,
-    )
+    format_message(code, Some(module))
 }
 
-fn format_message(code: u32, source: *const core::ffi::c_void, flags: u32) -> Option<String> {
+fn format_message(code: u32, module: Option<HMODULE>) -> Option<String> {
+    let (source, flags) = match module {
+        Some(module) => (
+            module.cast_const(),
+            FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_FROM_SYSTEM,
+        ),
+        None => (null(), FORMAT_MESSAGE_FROM_SYSTEM),
+    };
     let mut buffer = [0u16; 1024];
-    // Safety: `buffer` is writable for the supplied length and no insert arguments are requested.
+    // Safety: a module source comes only from successful GetModuleHandleW and remains loaded for
+    // this synchronous query; the buffer is writable and no insert arguments are requested.
     let count = unsafe {
         FormatMessageW(
             flags | FORMAT_MESSAGE_IGNORE_INSERTS,

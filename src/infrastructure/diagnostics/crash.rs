@@ -17,6 +17,7 @@
 
 use std::env;
 use std::ffi::OsStr;
+use std::marker::PhantomData;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr::{null, null_mut};
@@ -48,6 +49,54 @@ const TEST_CRASH_ENVIRONMENT: &str = "TASKMGR_RS_DIAGNOSTIC_TEST_CRASH";
 
 static CRASH_DIRECTORY: OnceLock<Box<[u16]>> = OnceLock::new();
 static MINIDUMP_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy)]
+struct NulTerminatedWide<'a> {
+    units: &'a [u16],
+}
+
+impl<'a> NulTerminatedWide<'a> {
+    fn new(units: &'a [u16]) -> Option<Self> {
+        let (&terminator, body) = units.split_last()?;
+        (terminator == 0 && !body.contains(&0)).then_some(Self { units })
+    }
+
+    fn as_ptr(self) -> *const u16 {
+        self.units.as_ptr()
+    }
+
+    #[cfg(test)]
+    fn without_terminator(self) -> &'a [u16] {
+        &self.units[..self.units.len() - 1]
+    }
+}
+
+/// Borrowed exception state supplied for one invocation of the top-level Windows filter.
+struct ExceptionContext<'a> {
+    raw: *const EXCEPTION_POINTERS,
+    _callback_lifetime: PhantomData<&'a EXCEPTION_POINTERS>,
+}
+
+impl<'a> ExceptionContext<'a> {
+    /// Establishes the raw exception-pointer contract at the callback boundary.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be null or the live `EXCEPTION_POINTERS` value supplied by Windows to the
+    /// current unhandled-exception callback. Its nested exception/context records must remain
+    /// valid for all reads performed by this module and by `MiniDumpWriteDump`, and the returned
+    /// value must not outlive that callback.
+    unsafe fn from_callback(raw: *const EXCEPTION_POINTERS) -> Self {
+        Self {
+            raw,
+            _callback_lifetime: PhantomData,
+        }
+    }
+
+    fn as_raw(&self) -> *const EXCEPTION_POINTERS {
+        self.raw
+    }
+}
 
 pub(super) fn install(directory: &Path, minidump_enabled: bool) -> Result<(), String> {
     let mut wide = OsStr::new(directory.as_os_str())
@@ -114,16 +163,19 @@ pub(super) fn trigger_test_access_violation() -> ! {
 unsafe extern "system" fn unhandled_exception_filter(
     exception_info: *const EXCEPTION_POINTERS,
 ) -> i32 {
+    // Safety: Windows owns the raw exception graph for the complete synchronous filter callback.
+    // This is the sole conversion from that raw graph into the module's typed borrowed boundary.
+    let exception = unsafe { ExceptionContext::from_callback(exception_info) };
     let pid = unsafe { GetCurrentProcessId() };
     let tid = unsafe { GetCurrentThreadId() };
-    let (exception_code, exception_address) = exception_details(exception_info);
+    let (exception_code, exception_address) = exception_details(&exception);
     let module_base = module_base_for_address(exception_address);
     let module_offset = exception_address.saturating_sub(module_base);
 
     let mut path = [0u16; MAX_CRASH_PATH_UNITS];
-    if build_crash_path(&mut path, pid, tid, ".crash.json") {
+    if let Some(path) = build_crash_path(&mut path, pid, tid, ".crash.json") {
         write_crash_record(
-            path.as_ptr(),
+            path,
             pid,
             tid,
             exception_code,
@@ -133,19 +185,22 @@ unsafe extern "system" fn unhandled_exception_filter(
         );
     }
 
-    if MINIDUMP_ENABLED.load(Ordering::Acquire) && build_crash_path(&mut path, pid, tid, ".dmp") {
-        write_minidump(path.as_ptr(), pid, tid, exception_info);
+    if MINIDUMP_ENABLED.load(Ordering::Acquire)
+        && let Some(path) = build_crash_path(&mut path, pid, tid, ".dmp")
+    {
+        write_minidump(path, pid, tid, &exception);
     }
 
     EXCEPTION_CONTINUE_SEARCH
 }
 
-fn exception_details(exception_info: *const EXCEPTION_POINTERS) -> (u32, usize) {
-    if exception_info.is_null() {
+fn exception_details(exception: &ExceptionContext<'_>) -> (u32, usize) {
+    if exception.as_raw().is_null() {
         return (0, 0);
     }
-    // Safety: Windows supplies EXCEPTION_POINTERS and its record for the duration of the filter.
-    let record = unsafe { (*exception_info).ExceptionRecord };
+    // Safety: `ExceptionContext` establishes that the outer record and its nested pointers remain
+    // live for this callback.
+    let record = unsafe { (*exception.as_raw()).ExceptionRecord };
     if record.is_null() {
         return (0, 0);
     }
@@ -174,36 +229,39 @@ fn module_base_for_address(address: usize) -> usize {
     if found == 0 { 0 } else { module as usize }
 }
 
-fn build_crash_path(
-    output: &mut [u16; MAX_CRASH_PATH_UNITS],
+fn build_crash_path<'a>(
+    output: &'a mut [u16; MAX_CRASH_PATH_UNITS],
     pid: u32,
     tid: u32,
     extension: &str,
-) -> bool {
+) -> Option<NulTerminatedWide<'a>> {
     let Some(directory) = CRASH_DIRECTORY.get() else {
-        return false;
+        return None;
     };
     let mut offset = 0usize;
     if !push_wide(output, &mut offset, directory) {
-        return false;
+        return None;
     }
     for byte in b"crash-" {
         if !push_wide_unit(output, &mut offset, u16::from(*byte)) {
-            return false;
+            return None;
         }
     }
     if !push_decimal(output, &mut offset, pid)
         || !push_wide_unit(output, &mut offset, b'-' as u16)
         || !push_decimal(output, &mut offset, tid)
     {
-        return false;
+        return None;
     }
     for byte in extension.as_bytes() {
         if !push_wide_unit(output, &mut offset, u16::from(*byte)) {
-            return false;
+            return None;
         }
     }
-    push_wide_unit(output, &mut offset, 0)
+    if !push_wide_unit(output, &mut offset, 0) {
+        return None;
+    }
+    NulTerminatedWide::new(&output[..offset])
 }
 
 fn push_wide(output: &mut [u16], offset: &mut usize, value: &[u16]) -> bool {
@@ -245,7 +303,7 @@ fn push_decimal(output: &mut [u16], offset: &mut usize, value: u32) -> bool {
 }
 
 fn write_crash_record(
-    path: *const u16,
+    path: NulTerminatedWide<'_>,
     pid: u32,
     tid: u32,
     exception_code: u32,
@@ -253,10 +311,10 @@ fn write_crash_record(
     module_base: usize,
     module_offset: usize,
 ) {
-    // Safety: `path` points at the NUL-terminated stack buffer built above.
+    // Safety: `path` is a typed NUL-terminated borrow that remains live through CreateFileW.
     let file = unsafe {
         CreateFileW(
-            path,
+            path.as_ptr(),
             GENERIC_WRITE,
             FILE_SHARE_READ,
             null(),
@@ -300,11 +358,16 @@ fn write_crash_record(
     }
 }
 
-fn write_minidump(path: *const u16, pid: u32, tid: u32, exception_info: *const EXCEPTION_POINTERS) {
-    // Safety: `path` points at the NUL-terminated stack buffer built above.
+fn write_minidump(
+    path: NulTerminatedWide<'_>,
+    pid: u32,
+    tid: u32,
+    exception: &ExceptionContext<'_>,
+) {
+    // Safety: `path` is a typed NUL-terminated borrow that remains live through CreateFileW.
     let file = unsafe {
         CreateFileW(
-            path,
+            path.as_ptr(),
             GENERIC_WRITE,
             FILE_SHARE_READ,
             null(),
@@ -319,7 +382,7 @@ fn write_minidump(path: *const u16, pid: u32, tid: u32, exception_info: *const E
 
     let info = MINIDUMP_EXCEPTION_INFORMATION {
         ThreadId: tid,
-        ExceptionPointers: exception_info.cast_mut(),
+        ExceptionPointers: exception.as_raw().cast_mut(),
         ClientPointers: 0,
     };
     let dump_type = MiniDumpNormal | MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules;
@@ -422,12 +485,26 @@ mod tests {
     fn crash_file_name_is_process_and_thread_specific() {
         let _ = CRASH_DIRECTORY.set(vec![b'C' as u16, b':' as u16, b'\\' as u16].into());
         let mut path = [0u16; MAX_CRASH_PATH_UNITS];
-        assert!(build_crash_path(&mut path, 12, 34, ".dmp"));
-        let end = path.iter().position(|unit| *unit == 0).unwrap();
+        let path = build_crash_path(&mut path, 12, 34, ".dmp")
+            .expect("the configured crash directory should fit in the path buffer");
         assert_eq!(
-            String::from_utf16_lossy(&path[..end]),
+            String::from_utf16_lossy(path.without_terminator()),
             "C:\\crash-12-34.dmp"
         );
+    }
+
+    #[test]
+    fn nul_terminated_wide_rejects_missing_or_interior_terminators() {
+        assert!(NulTerminatedWide::new(&[b'C' as u16, 0]).is_some());
+        assert!(NulTerminatedWide::new(&[b'C' as u16]).is_none());
+        assert!(NulTerminatedWide::new(&[b'C' as u16, 0, b'x' as u16, 0]).is_none());
+    }
+
+    #[test]
+    fn null_exception_context_has_no_details() {
+        // Safety: null is explicitly accepted by the callback-boundary contract.
+        let exception = unsafe { ExceptionContext::from_callback(null()) };
+        assert_eq!(exception_details(&exception), (0, 0));
     }
 
     #[test]

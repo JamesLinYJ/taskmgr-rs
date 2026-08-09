@@ -927,7 +927,14 @@ impl CpuPageState {
         Ok(())
     }
 
-    pub(crate) fn handle_notify(&mut self, lparam: LPARAM) -> isize {
+    /// Handles a notification forwarded by the CPU page dialog procedure.
+    ///
+    /// # Safety
+    ///
+    /// `lparam` must point to a live `WM_NOTIFY` payload for the duration of this synchronous
+    /// call. A `TTN_GETDISPINFOW` payload from `tooltip_hwnd` must be a writable
+    /// `NMTTDISPINFOW`.
+    pub(crate) unsafe fn handle_notify(&mut self, lparam: LPARAM) -> isize {
         if lparam == 0 || self.tooltip_hwnd.is_null() {
             return 0;
         }

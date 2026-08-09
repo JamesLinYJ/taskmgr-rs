@@ -179,7 +179,7 @@ fn cpu_capability_report() -> Value {
     let process = unsafe { GetCurrentProcess() };
     let cpu_sets = match CpuSetTopology::query(process) {
         Ok(topology) => {
-            let default_sets = unsafe { query_process_default_cpu_sets(process) };
+            let default_sets = query_process_default_cpu_sets(process);
             json!({
                 "status": "supported",
                 "groups": topology.groups().iter().map(|group| json!({

@@ -273,7 +273,9 @@ unsafe fn query_process_account_name(
             let error = GetLastError();
             return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
         }
-        let token = OwnedHandle::new(raw_token).ok_or(ERROR_INVALID_DATA)?;
+        // 安全性: successful OpenProcessToken returns one owned token handle released by
+        // CloseHandle; no other owner is retained.
+        let token = OwnedHandle::from_raw(raw_token).ok_or(ERROR_INVALID_DATA)?;
 
         let mut required_bytes = 0u32;
         if GetTokenInformation(
@@ -367,10 +369,11 @@ unsafe fn collect_process_identity_map(
         );
         if enumeration_result == 0 {
             let error = windows_sys::Win32::Foundation::GetLastError();
-            let _unexpected_buffer = OwnedWtsMemory::new(process_info);
             return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
         }
-        let process_info = OwnedWtsMemory::new(process_info).ok_or(ERROR_INVALID_DATA)?;
+        // 安全性: successful WTSEnumerateProcessesW transfers a uniquely owned array whose
+        // documented release function is WTSFreeMemory.
+        let process_info = OwnedWtsMemory::from_raw(process_info).ok_or(ERROR_INVALID_DATA)?;
 
         let mut identities = HashMap::with_capacity(count as usize);
         let mut row_error = None;
@@ -471,7 +474,9 @@ unsafe fn collect_process_entries(
     unsafe {
         // 采样阶段只构造“当下这一轮”的快照，真正的增量计算依赖外部传入的历史样本。
         let raw_snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        let Some(snapshot) = OwnedHandle::new(raw_snapshot) else {
+        // 安全性: successful CreateToolhelp32Snapshot returns one owned snapshot handle released
+        // by CloseHandle; ownership is transferred immediately.
+        let Some(snapshot) = OwnedHandle::from_raw(raw_snapshot) else {
             let error = windows_sys::Win32::Foundation::GetLastError();
             return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
         };
@@ -539,14 +544,20 @@ unsafe fn collect_process_entries(
             let memory_handle = if pid == 0 {
                 None
             } else {
-                OwnedHandle::new(OpenProcess(
+                let raw_handle = OpenProcess(
                     PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
                     0,
                     pid,
-                ))
+                );
+                // 安全性: a successful OpenProcess call returns one owned kernel handle whose
+                // release function is CloseHandle.
+                OwnedHandle::from_raw(raw_handle)
             };
             let query_handle = if pid != 0 && memory_handle.is_none() {
-                OwnedHandle::new(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid))
+                let raw_handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                // 安全性: a successful OpenProcess call returns one owned kernel handle whose
+                // release function is CloseHandle.
+                OwnedHandle::from_raw(raw_handle)
             } else {
                 None
             };

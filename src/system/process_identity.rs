@@ -77,10 +77,11 @@ pub(crate) fn open_process_for_identity(
 }
 
 fn open_process(pid: u32, access: u32) -> Result<OwnedHandle, u32> {
-    // SAFETY: OpenProcess takes scalar values only. A successful raw handle is transferred into
-    // OwnedHandle immediately so every return path closes it exactly once.
+    // SAFETY: OpenProcess takes scalar values only.
     let raw_handle = unsafe { OpenProcess(access, 0, pid) };
-    OwnedHandle::new(raw_handle).ok_or_else(last_error_or_gen_failure)
+    // SAFETY: a successful OpenProcess call returns one owned kernel handle whose release function
+    // is CloseHandle; ownership is transferred immediately and never duplicated.
+    unsafe { OwnedHandle::from_raw(raw_handle) }.ok_or_else(last_error_or_gen_failure)
 }
 
 fn query_process_creation_time(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<u64, u32> {

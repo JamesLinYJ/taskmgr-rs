@@ -169,6 +169,7 @@ pub enum TextKey {
     Cascade,
     BringToFront,
     HelpTopics,
+    HelpOpenFailed,
     DiagnosticLogs,
     DiagnosticLogsTitle,
     DiagnosticStatusLabel,

@@ -23,11 +23,12 @@ pub(crate) use errors::{
     record_hresult_error_with_fields, record_ntstatus_error_with_fields,
     record_pdh_error_with_fields, record_win32_error_with_fields,
 };
-pub use handles::{OwnedHandle, OwnedWtsMemory, destroy_icon_handle};
+pub use handles::{OwnedHandle, OwnedIcon, OwnedWtsMemory};
 pub use safety::{enable_debug_privilege, process_is_elevated, process_needs_32_bit_suffix_handle};
 pub use ui::{
-    append_32_bit_suffix, call_window_proc, copy_text_to_callback_buffer, finish_list_view_update,
-    format_resource_string, get_window_userdata, height, hiword, loword,
+    append_32_bit_suffix, call_window_proc, copy_text_to_callback_buffer,
+    copy_text_to_utf16_buffer, finish_list_view_update, format_resource_string,
+    get_window_userdata, height, hiword, loword,
     pause_redraw_for_visible_windows, redraw_window_tree, resume_redraw_for_windows,
     sanitize_task_manager_menu, set_dialog_msg_result, set_style, set_window_userdata,
     set_window_userdata_ptr, subclass_list_view, to_wide_null, widestr_ptr_to_string, width,
