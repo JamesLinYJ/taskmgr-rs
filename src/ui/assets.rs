@@ -13,7 +13,9 @@
 
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::HINSTANCE;
+use windows_sys::Win32::Foundation::{
+    ERROR_GEN_FAILURE, ERROR_INVALID_PARAMETER, GetLastError, HINSTANCE,
+};
 use windows_sys::Win32::Graphics::Gdi::HBITMAP;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -21,9 +23,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ACCEL, CreateAcceleratorTableW, FCONTROL, FNOINVERT, FSHIFT, FVIRTKEY, HACCEL, HICON,
-    IMAGE_BITMAP, IMAGE_ICON, LoadImageW,
+    IMAGE_BITMAP, IMAGE_ICON, LR_SHARED, LoadImageW,
 };
 
+use crate::infrastructure::native::OwnedIcon;
 use crate::ui::resource_ids::{
     IDB_METER_LIT_GREEN, IDB_METER_LIT_RED, IDB_METER_UNLIT, IDC_ENDTASK, IDC_NEXTTAB, IDC_PREVTAB,
     IDC_SWITCHTO, IDI_APPLICATION, IDI_DEFAULT_PROCESS, IDM_HIDE, IDM_REFRESH, TRAY_ICON_IDS,
@@ -51,17 +54,40 @@ fn current_module() -> HINSTANCE {
     unsafe { GetModuleHandleW(null::<u16>()) as HINSTANCE }
 }
 
-pub fn load_icon_resource(resource_id: u16, width: i32, height: i32, flags: u32) -> HICON {
+pub fn load_icon_resource(
+    resource_id: u16,
+    width: i32,
+    height: i32,
+    flags: u32,
+) -> Result<OwnedIcon, u32> {
+    // Shared icons remain system-owned and must never enter the `OwnedIcon` destructor path.
+    if flags & LR_SHARED != 0 {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+
     let module = current_module();
     if module.is_null() {
-        return null_mut();
+        return Err(last_error_or_gen_failure());
     }
 
     // Win32 encodes integer resource IDs as pointer-sized values whose high word is zero.
     let resource = resource_id as usize as *const u16;
     // 安全性: `resource` is a valid MAKEINTRESOURCE-style value and `module` is the current
     // executable image containing the compiled icon table.
-    unsafe { LoadImageW(module, resource, IMAGE_ICON, width, height, flags) as HICON }
+    let icon = unsafe { LoadImageW(module, resource, IMAGE_ICON, width, height, flags) as HICON };
+    if icon.is_null() {
+        return Err(last_error_or_gen_failure());
+    }
+
+    // 安全性: LR_SHARED was rejected and successful `LoadImageW(IMAGE_ICON)` transfers one icon
+    // that Microsoft documents must be released with `DestroyIcon`.
+    unsafe { OwnedIcon::from_raw(icon) }.ok_or(ERROR_GEN_FAILURE)
+}
+
+fn last_error_or_gen_failure() -> u32 {
+    // 安全性: reading the calling thread's last-error slot has no caller-side preconditions.
+    let error = unsafe { GetLastError() };
+    if error == 0 { ERROR_GEN_FAILURE } else { error }
 }
 
 pub fn load_bitmap_resource(resource_id: u16) -> HBITMAP {

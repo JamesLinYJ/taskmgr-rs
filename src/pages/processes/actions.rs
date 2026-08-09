@@ -158,15 +158,17 @@ impl ProcessTreeTerminationOutcome {
 }
 
 impl ProcessPageState {
-    unsafe fn quick_confirm(&self, title: &str, body: &str) -> bool {
-        unsafe {
-            // 用户关闭“确认”选项后，危险操作直接放行，保持与原版 Task Manager 行为一致。
-            if !self.confirmations {
-                return true;
-            }
+    fn quick_confirm(&self, title: &str, body: &str) -> bool {
+        // 用户关闭“确认”选项后，危险操作直接放行，保持与原版 Task Manager 行为一致。
+        if !self.confirmations {
+            return true;
+        }
 
-            let title_wide = to_wide_null(title);
-            let body_wide = to_wide_null(body);
+        let title_wide = to_wide_null(title);
+        let body_wide = to_wide_null(body);
+        // SAFETY: both UTF-16 buffers are terminated and remain alive for the synchronous call;
+        // `hwnd_page` is borrowed and no ownership is transferred.
+        unsafe {
             MessageBoxW(
                 self.hwnd_page,
                 body_wide.as_ptr(),
@@ -177,15 +179,17 @@ impl ProcessPageState {
     }
 
     pub(super) fn show_failure_message(&self, body: &str, error: u32) {
+        let title = if self.strings.warning.is_empty() {
+            "Task Manager".to_string()
+        } else {
+            self.strings.warning.clone()
+        };
+        let message = format!("{body}\r\n\r\nWin32 error: {error}");
+        let title_wide = to_wide_null(&title);
+        let message_wide = to_wide_null(&message);
+        // SAFETY: both UTF-16 buffers are terminated and remain live for the synchronous call;
+        // the page HWND is borrowed and no ownership is transferred.
         unsafe {
-            let title = if self.strings.warning.is_empty() {
-                "Task Manager".to_string()
-            } else {
-                self.strings.warning.clone()
-            };
-            let message = format!("{body}\r\n\r\nWin32 error: {error}");
-            let title_wide = to_wide_null(&title);
-            let message_wide = to_wide_null(&message);
             MessageBoxW(
                 self.hwnd_page,
                 message_wide.as_ptr(),
@@ -196,119 +200,121 @@ impl ProcessPageState {
     }
 
     // 结束指定 PID 的进程。先弹确认框，再通过 TerminateProcess 终止。
-    pub(super) unsafe fn kill_process(&mut self, identity: ProcIdentity) -> bool {
-        unsafe {
-            if !self.quick_confirm(&self.strings.warning, &self.strings.kill) {
+    pub(super) fn kill_process(&mut self, identity: ProcIdentity) -> bool {
+        if !self.quick_confirm(&self.strings.warning, &self.strings.kill) {
+            return false;
+        }
+
+        let handle = match open_process_for_identity(
+            identity,
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_kill, error);
                 return false;
             }
+        };
 
-            let handle = match open_process_for_identity(
-                identity,
-                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-            ) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    self.show_failure_message(&self.strings.cant_kill, error);
-                    return false;
-                }
-            };
-
-            let result = TerminateProcess(handle.as_raw(), 1);
-            let error = windows_sys::Win32::Foundation::GetLastError();
-
-            if result == 0 {
-                self.show_failure_message(&self.strings.cant_kill, error);
-                false
-            } else {
-                self.paused = false;
-                self.refresh_processes();
-                true
-            }
+        // SAFETY: `open_process_for_identity` returned a live handle with PROCESS_TERMINATE
+        // access for the exact verified identity.
+        if unsafe { TerminateProcess(handle.as_raw(), 1) } == 0 {
+            let error = unsafe { GetLastError() };
+            self.show_failure_message(&self.strings.cant_kill, error);
+            false
+        } else {
+            self.paused = false;
+            self.refresh_processes();
+            true
         }
     }
 
     // 结束进程以及所有子进程。按叶子优先的顺序遍历进程树，逐进程 TerminateProcess。
-    pub(super) unsafe fn kill_process_tree(&mut self, identity: ProcIdentity) -> bool {
-        unsafe {
-            if !self.quick_confirm(&self.strings.warning, &self.strings.kill_tree) {
+    pub(super) fn kill_process_tree(&mut self, identity: ProcIdentity) -> bool {
+        if !self.quick_confirm(&self.strings.warning, &self.strings.kill_tree) {
+            return false;
+        }
+
+        let prepared = match prepare_process_tree_termination(identity) {
+            Ok(prepared) => prepared,
+            Err(ProcessTreePrepareError::Root(error)) => {
+                self.show_failure_message(&self.strings.cant_kill, error);
                 return false;
             }
-
-            let prepared = match prepare_process_tree_termination(identity) {
-                Ok(prepared) => prepared,
-                Err(ProcessTreePrepareError::Root(error)) => {
-                    self.show_failure_message(&self.strings.cant_kill, error);
-                    return false;
-                }
-                Err(ProcessTreePrepareError::Tree(error)) => {
-                    self.show_failure_message(&self.strings.kill_tree_fail_body, error);
-                    return false;
-                }
-            };
-            let outcome = terminate_prepared_process_tree(prepared);
-
-            if outcome.any_completed {
-                self.paused = false;
-                self.refresh_processes();
-            }
-
-            if outcome.root_error != 0 && !outcome.any_success() {
-                self.show_failure_message(&self.strings.cant_kill, outcome.root_error);
+            Err(ProcessTreePrepareError::Tree(error)) => {
+                self.show_failure_message(&self.strings.kill_tree_fail_body, error);
                 return false;
             }
+        };
+        let outcome = terminate_prepared_process_tree(prepared);
 
-            if outcome.any_failure() {
-                let body_wide = to_wide_null(&self.strings.kill_tree_fail_body);
-                let title_wide = to_wide_null(&self.strings.kill_tree_fail);
+        if outcome.any_completed {
+            self.paused = false;
+            self.refresh_processes();
+        }
+
+        if outcome.root_error != 0 && !outcome.any_success() {
+            self.show_failure_message(&self.strings.cant_kill, outcome.root_error);
+            return false;
+        }
+
+        if outcome.any_failure() {
+            let body_wide = to_wide_null(&self.strings.kill_tree_fail_body);
+            let title_wide = to_wide_null(&self.strings.kill_tree_fail);
+            // SAFETY: the page HWND is borrowed and both terminated buffers outlive this
+            // synchronous message box call.
+            unsafe {
                 MessageBoxW(
                     self.hwnd_page,
                     body_wide.as_ptr(),
                     title_wide.as_ptr(),
                     MB_OK | MB_ICONEXCLAMATION,
                 );
-                return false;
             }
-
-            outcome.completed_without_failure()
+            return false;
         }
+
+        outcome.completed_without_failure()
     }
 
     // 以 AeDebug 注册表配置的调试器启动并附加到目标进程。命令行传 -p <pid>。
-    pub(super) unsafe fn attach_debugger(&mut self, identity: ProcIdentity) -> bool {
-        unsafe {
-            let Some(debugger_path) = self.debugger_path.as_ref() else {
-                let error = match self.debugger_error {
-                    Some(error) => error,
-                    None => ERROR_FILE_NOT_FOUND,
-                };
-                self.show_failure_message(&self.strings.cant_debug, error);
-                return false;
+    pub(super) fn attach_debugger(&mut self, identity: ProcIdentity) -> bool {
+        let Some(debugger_path) = self.debugger_path.as_ref() else {
+            let error = match self.debugger_error {
+                Some(error) => error,
+                None => ERROR_FILE_NOT_FOUND,
+            };
+            self.show_failure_message(&self.strings.cant_debug, error);
+            return false;
+        };
+
+        if !self.quick_confirm(&self.strings.warning, &self.strings.debug) {
+            return false;
+        }
+
+        let target_handle =
+            match open_process_for_identity(identity, PROCESS_QUERY_LIMITED_INFORMATION) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    self.show_failure_message(&self.strings.cant_debug, error);
+                    return false;
+                }
             };
 
-            if !self.quick_confirm(&self.strings.warning, &self.strings.debug) {
-                return false;
-            }
+        let pid = identity.pid;
+        let command_line = format!("{} -p {pid}", quote_command_line_arg(debugger_path));
+        let mut command_line_wide = to_wide_null(&command_line);
+        let application_name = to_wide_null(debugger_path);
+        let startup_info = STARTUPINFOW {
+            cb: size_of::<STARTUPINFOW>() as u32,
+            ..unsafe { zeroed() }
+        };
+        let mut process_info = unsafe { zeroed::<PROCESS_INFORMATION>() };
 
-            let target_handle =
-                match open_process_for_identity(identity, PROCESS_QUERY_LIMITED_INFORMATION) {
-                    Ok(handle) => handle,
-                    Err(error) => {
-                        self.show_failure_message(&self.strings.cant_debug, error);
-                        return false;
-                    }
-                };
-
-            let pid = identity.pid;
-            let command_line = format!("{} -p {pid}", quote_command_line_arg(debugger_path));
-            let mut command_line_wide = to_wide_null(&command_line);
-            let application_name = to_wide_null(debugger_path);
-            let startup_info = STARTUPINFOW {
-                cb: size_of::<STARTUPINFOW>() as u32,
-                ..zeroed()
-            };
-            let mut process_info = zeroed::<PROCESS_INFORMATION>();
-
-            let created = CreateProcessW(
+        // SAFETY: the terminated application name, mutable command line, and initialized
+        // input/output structs all remain live for this synchronous call.
+        let created = unsafe {
+            CreateProcessW(
                 application_name.as_ptr(),
                 command_line_wide.as_mut_ptr(),
                 null_mut(),
@@ -319,60 +325,69 @@ impl ProcessPageState {
                 null(),
                 &startup_info,
                 &mut process_info,
-            );
-            let create_error = windows_sys::Win32::Foundation::GetLastError();
-            drop(target_handle);
+            )
+        };
+        // Capture last-error before dropping `target_handle`, whose destructor may change it.
+        let create_error = if created == 0 {
+            unsafe { GetLastError() }
+        } else {
+            0
+        };
+        drop(target_handle);
 
-            if created == 0 {
-                self.show_failure_message(&self.strings.cant_debug, create_error);
-                false
-            } else {
-                match own_created_process_handles(process_info) {
-                    Ok(_) => true,
-                    Err(error) => {
-                        self.show_failure_message(&self.strings.cant_debug, error);
-                        false
-                    }
+        if created == 0 {
+            self.show_failure_message(&self.strings.cant_debug, create_error);
+            false
+        } else {
+            // SAFETY: this branch is reached only after CreateProcessW succeeded, which returned
+            // two fresh handles whose ownership is transferred here.
+            match unsafe { own_created_process_handles(process_info) } {
+                Ok(_) => true,
+                Err(error) => {
+                    self.show_failure_message(&self.strings.cant_debug, error);
+                    false
                 }
             }
         }
     }
 
     // 通过 explorer.exe /select 命令在资源管理器中定位进程的可执行文件。
-    pub(super) unsafe fn open_file_location(&mut self, identity: ProcIdentity) -> bool {
-        unsafe {
-            let image_path = match query_process_image_path(identity) {
-                Ok(path) => path,
-                Err(error) => {
-                    self.show_failure_message(&self.strings.cant_open_file_location, error);
-                    return false;
-                }
-            };
-
-            if !Path::new(&image_path).exists() {
-                self.show_failure_message(&self.strings.cant_open_file_location, 2);
+    pub(super) fn open_file_location(&mut self, identity: ProcIdentity) -> bool {
+        let image_path = match query_process_image_path(identity) {
+            Ok(path) => path,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_open_file_location, error);
                 return false;
             }
+        };
 
-            let windows_directory = match query_windows_directory() {
-                Ok(path) => path,
-                Err(error) => {
-                    self.show_failure_message(&self.strings.cant_open_file_location, error);
-                    return false;
-                }
-            };
-            let explorer_path = format!("{windows_directory}\\explorer.exe");
-            let command_line = format!(
-                "{explorer_path} /select,{}",
-                quote_command_line_arg(&image_path)
-            );
-            let mut command_line_wide = to_wide_null(&command_line);
-            let startup_info = STARTUPINFOW {
-                cb: size_of::<STARTUPINFOW>() as u32,
-                ..zeroed()
-            };
-            let mut process_info = zeroed::<PROCESS_INFORMATION>();
-            let created = CreateProcessW(
+        if !Path::new(&image_path).exists() {
+            self.show_failure_message(&self.strings.cant_open_file_location, 2);
+            return false;
+        }
+
+        let windows_directory = match query_windows_directory() {
+            Ok(path) => path,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_open_file_location, error);
+                return false;
+            }
+        };
+        let explorer_path = format!("{windows_directory}\\explorer.exe");
+        let command_line = format!(
+            "{explorer_path} /select,{}",
+            quote_command_line_arg(&image_path)
+        );
+        let mut command_line_wide = to_wide_null(&command_line);
+        let startup_info = STARTUPINFOW {
+            cb: size_of::<STARTUPINFOW>() as u32,
+            ..unsafe { zeroed() }
+        };
+        let mut process_info = unsafe { zeroed::<PROCESS_INFORMATION>() };
+        // SAFETY: the mutable command line and initialized input/output structs remain live for
+        // the synchronous call; successful returned handles are adopted below.
+        let created = unsafe {
+            CreateProcessW(
                 null(),
                 command_line_wide.as_mut_ptr(),
                 null_mut(),
@@ -383,163 +398,154 @@ impl ProcessPageState {
                 null(),
                 &startup_info,
                 &mut process_info,
-            );
-            if created == 0 {
-                self.show_failure_message(
-                    &self.strings.cant_open_file_location,
-                    windows_sys::Win32::Foundation::GetLastError(),
-                );
-                return false;
-            }
+            )
+        };
+        if created == 0 {
+            let error = unsafe { GetLastError() };
+            self.show_failure_message(&self.strings.cant_open_file_location, error);
+            return false;
+        }
 
-            match own_created_process_handles(process_info) {
-                Ok(_) => true,
-                Err(error) => {
-                    self.show_failure_message(&self.strings.cant_open_file_location, error);
-                    false
-                }
+        // SAFETY: successful CreateProcessW returned fresh process/thread handles and this call
+        // is their first and only ownership transfer.
+        match unsafe { own_created_process_handles(process_info) } {
+            Ok(_) => true,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_open_file_location, error);
+                false
             }
         }
     }
 
     // 通过 SetPriorityClass 修改进程优先级类。先弹确认框，操作成功后刷新列表。
-    pub(super) unsafe fn set_priority(
-        &mut self,
-        identity: ProcIdentity,
-        priority: ProcPriority,
-    ) -> bool {
-        unsafe {
-            let priority_class = match priority {
-                ProcPriority::Low => IDLE_PRIORITY_CLASS,
-                ProcPriority::BelowNormal => BELOW_NORMAL_PRIORITY_CLASS,
-                ProcPriority::Normal => NORMAL_PRIORITY_CLASS,
-                ProcPriority::AboveNormal => ABOVE_NORMAL_PRIORITY_CLASS,
-                ProcPriority::High => HIGH_PRIORITY_CLASS,
-                ProcPriority::Realtime => REALTIME_PRIORITY_CLASS,
-            };
+    pub(super) fn set_priority(&mut self, identity: ProcIdentity, priority: ProcPriority) -> bool {
+        let priority_class = match priority {
+            ProcPriority::Low => IDLE_PRIORITY_CLASS,
+            ProcPriority::BelowNormal => BELOW_NORMAL_PRIORITY_CLASS,
+            ProcPriority::Normal => NORMAL_PRIORITY_CLASS,
+            ProcPriority::AboveNormal => ABOVE_NORMAL_PRIORITY_CLASS,
+            ProcPriority::High => HIGH_PRIORITY_CLASS,
+            ProcPriority::Realtime => REALTIME_PRIORITY_CLASS,
+        };
 
-            if !self.quick_confirm(&self.strings.warning, &self.strings.prichange) {
+        if !self.quick_confirm(&self.strings.warning, &self.strings.prichange) {
+            return false;
+        }
+
+        let handle = match open_process_for_identity(
+            identity,
+            PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_change_priority, error);
                 return false;
             }
+        };
 
-            let handle = match open_process_for_identity(
-                identity,
-                PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
-            ) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    self.show_failure_message(&self.strings.cant_change_priority, error);
-                    return false;
-                }
-            };
-
-            let result = SetPriorityClass(handle.as_raw(), priority_class);
-            let error = windows_sys::Win32::Foundation::GetLastError();
-
-            if result == 0 {
-                self.show_failure_message(&self.strings.cant_change_priority, error);
-                false
-            } else {
-                self.paused = false;
-                self.refresh_processes();
-                true
-            }
+        // SAFETY: the identity-validated handle has PROCESS_SET_INFORMATION access.
+        if unsafe { SetPriorityClass(handle.as_raw(), priority_class) } == 0 {
+            let error = unsafe { GetLastError() };
+            self.show_failure_message(&self.strings.cant_change_priority, error);
+            false
+        } else {
+            self.paused = false;
+            self.refresh_processes();
+            true
         }
     }
 
     // Single-group processes retain the classic hard-affinity API. Multi-group systems use CPU
     // Set IDs, whose group-qualified identities do not collapse at the 64-processor boundary.
-    pub(super) unsafe fn set_affinity(&mut self, identity: ProcIdentity) -> bool {
-        unsafe {
-            let handle = match open_process_for_identity(
-                identity,
-                PROCESS_QUERY_INFORMATION
-                    | PROCESS_QUERY_LIMITED_INFORMATION
-                    | PROCESS_SET_INFORMATION
-                    | PROCESS_SET_LIMITED_INFORMATION,
-            ) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    self.show_failure_message(&self.strings.cant_set_affinity, error);
-                    return false;
-                }
-            };
+    pub(super) fn set_affinity(&mut self, identity: ProcIdentity) -> bool {
+        let handle = match open_process_for_identity(
+            identity,
+            PROCESS_QUERY_INFORMATION
+                | PROCESS_QUERY_LIMITED_INFORMATION
+                | PROCESS_SET_INFORMATION
+                | PROCESS_SET_LIMITED_INFORMATION,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_set_affinity, error);
+                return false;
+            }
+        };
 
-            let topology = match CpuSetTopology::query(handle.as_raw()) {
-                Ok(topology) => topology,
-                Err(error) => {
-                    self.show_failure_message(&self.strings.cant_set_affinity, error.win32_code());
-                    return false;
-                }
-            };
-            let original_default_ids = match query_process_default_cpu_sets(handle.as_raw()) {
-                Ok(ids) => ids,
-                Err(error) => {
-                    self.show_failure_message(&self.strings.cant_set_affinity, error.win32_code());
-                    return false;
-                }
-            };
-            let original_process_groups = match query_process_groups(handle.as_raw()) {
-                Ok(groups) => groups,
-                Err(error) => {
-                    self.show_failure_message(&self.strings.cant_set_affinity, error);
-                    return false;
-                }
-            };
-            let selected_masks = match initial_affinity_masks(
-                handle.as_raw(),
-                &topology,
-                &original_default_ids,
-                &original_process_groups,
-            ) {
-                Ok(masks) => masks,
-                Err(error) => {
-                    self.show_failure_message(&self.strings.cant_set_affinity, error);
-                    return false;
-                }
-            };
-            let selected_group_index = selected_masks
-                .iter()
-                .position(|mask| *mask != 0)
-                .unwrap_or(0);
-            let mut context = AffinityDialogContext {
-                page: self as *mut ProcessPageState,
-                topology,
-                selected_masks,
-                selected_group_index,
-                original_default_ids,
-            };
+        let topology = match CpuSetTopology::query(handle.as_raw()) {
+            Ok(topology) => topology,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_set_affinity, error.win32_code());
+                return false;
+            }
+        };
+        let original_default_ids = match query_process_default_cpu_sets(handle.as_raw()) {
+            Ok(ids) => ids,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_set_affinity, error.win32_code());
+                return false;
+            }
+        };
+        let original_process_groups = match query_process_groups(handle.as_raw()) {
+            Ok(groups) => groups,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_set_affinity, error);
+                return false;
+            }
+        };
+        let selected_masks = match initial_affinity_masks(
+            handle.as_raw(),
+            &topology,
+            &original_default_ids,
+            &original_process_groups,
+        ) {
+            Ok(masks) => masks,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_set_affinity, error);
+                return false;
+            }
+        };
+        let selected_group_index = selected_masks
+            .iter()
+            .position(|mask| *mask != 0)
+            .unwrap_or(0);
+        let mut context = AffinityDialogContext {
+            page: self as *mut ProcessPageState,
+            topology,
+            selected_masks,
+            selected_group_index,
+            original_default_ids,
+        };
 
-            match dialog_box(
-                self.hinstance,
-                IDD_AFFINITY,
-                self.hwnd_page,
-                Some(affinity_dialog_proc),
-                &mut context as *mut AffinityDialogContext as LPARAM,
-            ) {
-                Ok(result) if result == IDOK as isize => {
-                    match apply_affinity_selection(handle.as_raw(), identity.pid, &context) {
-                        Ok(()) => {
-                            self.refresh_processes();
-                            true
-                        }
-                        Err(error) => {
-                            self.show_failure_message(&self.strings.cant_set_affinity, error);
-                            false
-                        }
+        match dialog_box(
+            self.hinstance,
+            IDD_AFFINITY,
+            self.hwnd_page,
+            Some(affinity_dialog_proc),
+            &mut context as *mut AffinityDialogContext as LPARAM,
+        ) {
+            Ok(result) if result == IDOK as isize => {
+                match apply_affinity_selection(handle.as_raw(), identity.pid, &context) {
+                    Ok(()) => {
+                        self.refresh_processes();
+                        true
+                    }
+                    Err(error) => {
+                        self.show_failure_message(&self.strings.cant_set_affinity, error);
+                        false
                     }
                 }
-                Ok(_) => false,
-                Err(error) => {
-                    self.show_failure_message(&self.strings.cant_set_affinity, error);
-                    false
-                }
+            }
+            Ok(_) => false,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_set_affinity, error);
+                false
             }
         }
     }
 }
 
-unsafe fn initial_affinity_masks(
+fn initial_affinity_masks(
     process: HANDLE,
     topology: &CpuSetTopology,
     default_ids: &[u32],
@@ -580,7 +586,7 @@ unsafe fn initial_affinity_masks(
     Ok(masks)
 }
 
-unsafe fn apply_affinity_selection(
+fn apply_affinity_selection(
     process: HANDLE,
     process_id: u32,
     context: &AffinityDialogContext,
@@ -594,18 +600,16 @@ unsafe fn apply_affinity_selection(
     }
 
     if context.topology.groups().len() == 1 {
-        unsafe {
-            set_process_default_cpu_sets(process, &[])?;
-            if SetProcessAffinityMask(process, context.selected_masks[0]) == 0 {
-                let error = nonzero_last_error();
-                let _ = set_process_default_cpu_sets(process, &context.original_default_ids);
-                return Err(error);
-            }
+        set_process_default_cpu_sets(process, &[])?;
+        if unsafe { SetProcessAffinityMask(process, context.selected_masks[0]) } == 0 {
+            let error = nonzero_last_error();
+            let _ = set_process_default_cpu_sets(process, &context.original_default_ids);
+            return Err(error);
         }
         return Ok(());
     }
 
-    unsafe { set_process_default_cpu_sets(process, &selected_ids)? };
+    set_process_default_cpu_sets(process, &selected_ids)?;
     let selected_groups = context
         .topology
         .groups()
@@ -619,14 +623,14 @@ unsafe fn apply_affinity_selection(
     // conflicting CPU Set assignment. Apply a group-qualified hard mask to every existing thread
     // so an old per-thread affinity cannot keep using a CPU the user just deselected. The process
     // default CPU Sets above cover threads created after the verified thread snapshot.
-    if let Err(error) = unsafe { apply_thread_group_affinities(process_id, &selected_groups) } {
-        let _ = unsafe { set_process_default_cpu_sets(process, &context.original_default_ids) };
+    if let Err(error) = apply_thread_group_affinities(process_id, &selected_groups) {
+        let _ = set_process_default_cpu_sets(process, &context.original_default_ids);
         return Err(error);
     }
     Ok(())
 }
 
-unsafe fn set_process_default_cpu_sets(process: HANDLE, ids: &[u32]) -> Result<(), u32> {
+fn set_process_default_cpu_sets(process: HANDLE, ids: &[u32]) -> Result<(), u32> {
     let (pointer, count) = if ids.is_empty() {
         (null(), 0)
     } else {
@@ -647,7 +651,7 @@ struct ChangedThreadAffinity {
     previous: GROUP_AFFINITY,
 }
 
-unsafe fn apply_thread_group_affinities(
+fn apply_thread_group_affinities(
     process_id: u32,
     selected_groups: &[(u16, usize)],
 ) -> Result<(), u32> {
@@ -659,7 +663,7 @@ unsafe fn apply_thread_group_affinities(
     let mut seen = HashSet::<u32>::new();
     let mut assignment_index = 0usize;
     let result = (|| -> Result<(), u32> {
-        let thread_ids = unsafe { enumerate_process_threads(process_id)? };
+        let thread_ids = enumerate_process_threads(process_id)?;
         for thread_id in thread_ids {
             let raw_thread = unsafe {
                 OpenThread(
@@ -668,7 +672,9 @@ unsafe fn apply_thread_group_affinities(
                     thread_id,
                 )
             };
-            let Some(thread) = OwnedHandle::new(raw_thread) else {
+            // SAFETY: a successful OpenThread call returns a newly opened handle owned by this
+            // scope and released with CloseHandle; null is mapped to None.
+            let Some(thread) = (unsafe { OwnedHandle::from_raw(raw_thread) }) else {
                 let error = nonzero_last_error();
                 if matches!(error, ERROR_INVALID_HANDLE | ERROR_INVALID_PARAMETER) {
                     continue;
@@ -704,9 +710,7 @@ unsafe fn apply_thread_group_affinities(
         if changed.is_empty() {
             return Err(ERROR_NOT_SUPPORTED);
         }
-        unsafe {
-            verify_racing_thread_affinities(process_id, &seen, selected_groups)?;
-        }
+        verify_racing_thread_affinities(process_id, &seen, selected_groups)?;
         Ok(())
     })();
 
@@ -724,17 +728,19 @@ unsafe fn apply_thread_group_affinities(
     result
 }
 
-unsafe fn verify_racing_thread_affinities(
+fn verify_racing_thread_affinities(
     process_id: u32,
     changed_thread_ids: &HashSet<u32>,
     selected_groups: &[(u16, usize)],
 ) -> Result<(), u32> {
-    for thread_id in unsafe { enumerate_process_threads(process_id)? } {
+    for thread_id in enumerate_process_threads(process_id)? {
         if changed_thread_ids.contains(&thread_id) {
             continue;
         }
         let raw_thread = unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, thread_id) };
-        let Some(thread) = OwnedHandle::new(raw_thread) else {
+        // SAFETY: a successful OpenThread call returns a newly opened handle owned by this scope
+        // and released with CloseHandle; null is mapped to None.
+        let Some(thread) = (unsafe { OwnedHandle::from_raw(raw_thread) }) else {
             let error = nonzero_last_error();
             if matches!(error, ERROR_INVALID_HANDLE | ERROR_INVALID_PARAMETER) {
                 continue;
@@ -778,9 +784,11 @@ pub(super) fn affinity_target_for_thread(
         .copied()
 }
 
-unsafe fn enumerate_process_threads(process_id: u32) -> Result<Vec<u32>, u32> {
+fn enumerate_process_threads(process_id: u32) -> Result<Vec<u32>, u32> {
     let raw_snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    let Some(snapshot) = OwnedHandle::new(raw_snapshot) else {
+    // SAFETY: CreateToolhelp32Snapshot returns either INVALID_HANDLE_VALUE or a fresh snapshot
+    // handle owned by this scope and released with CloseHandle.
+    let Some(snapshot) = (unsafe { OwnedHandle::from_raw(raw_snapshot) }) else {
         return Err(nonzero_last_error());
     };
     let mut entry = unsafe { zeroed::<THREADENTRY32>() };
@@ -813,7 +821,7 @@ unsafe fn enumerate_process_threads(process_id: u32) -> Result<Vec<u32>, u32> {
     Ok(thread_ids)
 }
 
-unsafe fn query_process_groups(process: HANDLE) -> Result<Vec<u16>, u32> {
+fn query_process_groups(process: HANDLE) -> Result<Vec<u16>, u32> {
     let mut required = 0u16;
     if unsafe { GetProcessGroupAffinity(process, &mut required, null_mut()) } != 0 {
         return Err(ERROR_INVALID_DATA);
@@ -931,7 +939,7 @@ unsafe extern "system" fn affinity_dialog_proc(
     }
 }
 
-unsafe fn initialize_affinity_group_selector(hwnd: HWND, context: &mut AffinityDialogContext) {
+fn initialize_affinity_group_selector(hwnd: HWND, context: &mut AffinityDialogContext) {
     let selector = unsafe { GetDlgItem(hwnd, IDC_AFFINITY_GROUP_SELECTOR) };
     unsafe { SendMessageW(selector, CB_RESETCONTENT, 0, 0) };
     for group in context.topology.groups() {
@@ -954,7 +962,7 @@ unsafe fn initialize_affinity_group_selector(hwnd: HWND, context: &mut AffinityD
     }
 }
 
-unsafe fn render_affinity_group(hwnd: HWND, context: &AffinityDialogContext) {
+fn render_affinity_group(hwnd: HWND, context: &AffinityDialogContext) {
     let group = &context.topology.groups()[context.selected_group_index];
     let selected_mask = context.selected_masks[context.selected_group_index];
     let multiple_groups = context.topology.groups().len() > 1;
@@ -984,7 +992,7 @@ unsafe fn render_affinity_group(hwnd: HWND, context: &AffinityDialogContext) {
     }
 }
 
-unsafe fn save_affinity_group(hwnd: HWND, context: &mut AffinityDialogContext) {
+fn save_affinity_group(hwnd: HWND, context: &mut AffinityDialogContext) {
     let group = &context.topology.groups()[context.selected_group_index];
     let mut selected_mask = 0usize;
     for cpu_index in 0..=MAX_AFFINITY_CPU {
@@ -1005,79 +1013,87 @@ pub(super) fn affinity_cpu_mask(cpu_index: i32) -> usize {
         .and_then(|shift| 1usize.checked_shl(shift))
         .unwrap_or(0)
 }
-pub(super) unsafe fn load_debugger_path() -> Result<Option<String>, u32> {
-    unsafe {
-        // 进程页的“调试”命令依赖 AeDebug 注册表配置。
-        // 这里只提取真正的可执行文件路径，过滤掉旧式 drwtsn32 之类的无效值。
-        let mut key: HKEY = null_mut();
-        let key_name = to_wide_null("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug");
-        let value_name = to_wide_null("Debugger");
-        let open_status =
-            RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_name.as_ptr(), 0, KEY_READ, &mut key);
-        if open_status != 0 {
-            return if open_status == ERROR_FILE_NOT_FOUND || open_status == ERROR_PATH_NOT_FOUND {
-                Ok(None)
-            } else {
-                Err(open_status)
-            };
-        }
 
-        let mut value_size = 0u32;
-        let size_status = RegQueryValueExW(
+pub(super) fn load_debugger_path() -> Result<Option<String>, u32> {
+    // 进程页的“调试”命令依赖 AeDebug 注册表配置。
+    // 这里只提取真正的可执行文件路径，过滤掉旧式 drwtsn32 之类的无效值。
+    let mut key: HKEY = null_mut();
+    let key_name = to_wide_null("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug");
+    let value_name = to_wide_null("Debugger");
+    // SAFETY: both input strings are terminated and `key` is a valid output location.
+    let open_status =
+        unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_name.as_ptr(), 0, KEY_READ, &mut key) };
+    if open_status != 0 {
+        return if open_status == ERROR_FILE_NOT_FOUND || open_status == ERROR_PATH_NOT_FOUND {
+            Ok(None)
+        } else {
+            Err(open_status)
+        };
+    }
+
+    let mut value_size = 0u32;
+    // SAFETY: `key` was opened successfully; this size query uses no data buffer and writes only
+    // to `value_size`.
+    let size_status = unsafe {
+        RegQueryValueExW(
             key,
             value_name.as_ptr(),
             null_mut(),
             null_mut(),
             null_mut(),
             &mut value_size,
-        );
-        if size_status != 0 || value_size < 2 {
-            let close_status = RegCloseKey(key);
-            if close_status != 0 {
-                return Err(close_status);
-            }
-            return if size_status == ERROR_FILE_NOT_FOUND {
-                Ok(None)
-            } else if size_status != 0 {
-                Err(size_status)
-            } else {
-                Err(ERROR_INVALID_DATA)
-            };
+        )
+    };
+    if size_status != 0 || value_size < 2 {
+        let close_status = unsafe { RegCloseKey(key) };
+        if close_status != 0 {
+            return Err(close_status);
         }
+        return if size_status == ERROR_FILE_NOT_FOUND {
+            Ok(None)
+        } else if size_status != 0 {
+            Err(size_status)
+        } else {
+            Err(ERROR_INVALID_DATA)
+        };
+    }
 
-        let mut buffer = vec![0u16; (value_size as usize / size_of::<u16>()).max(2)];
-        let mut value_type = 0u32;
-        let status = RegQueryValueExW(
+    let mut buffer = vec![0u16; (value_size as usize).div_ceil(size_of::<u16>()).max(2)];
+    let mut value_type = 0u32;
+    // SAFETY: `buffer` is writable for the byte count returned by the size query and all output
+    // pointers reference live local variables.
+    let status = unsafe {
+        RegQueryValueExW(
             key,
             value_name.as_ptr(),
             null_mut(),
             &mut value_type,
             buffer.as_mut_ptr() as *mut u8,
             &mut value_size,
-        );
-        let close_status = RegCloseKey(key);
-        if close_status != 0 {
-            return Err(close_status);
-        }
-
-        if status != 0 || value_size < 2 || !(value_type == REG_SZ || value_type == REG_EXPAND_SZ) {
-            return Err(if status != 0 {
-                status
-            } else {
-                ERROR_INVALID_DATA
-            });
-        }
-
-        let length = buffer
-            .iter()
-            .position(|value| *value == 0)
-            .unwrap_or(buffer.len());
-        let raw = String::from_utf16_lossy(&buffer[..length]);
-        let Some(executable) = normalize_debugger_command(&raw, value_type)? else {
-            return Ok(None);
-        };
-        Ok(Path::new(&executable).is_file().then_some(executable))
+        )
+    };
+    let close_status = unsafe { RegCloseKey(key) };
+    if close_status != 0 {
+        return Err(close_status);
     }
+
+    if status != 0 || value_size < 2 || !(value_type == REG_SZ || value_type == REG_EXPAND_SZ) {
+        return Err(if status != 0 {
+            status
+        } else {
+            ERROR_INVALID_DATA
+        });
+    }
+
+    let length = buffer
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(buffer.len());
+    let raw_command = String::from_utf16_lossy(&buffer[..length]);
+    let Some(executable) = normalize_debugger_command(&raw_command, value_type)? else {
+        return Ok(None);
+    };
+    Ok(Path::new(&executable).is_file().then_some(executable))
 }
 
 // 引用命令行参数。只在包含空格、制表符或引号时加引号，并正确处理反斜杠转义。
@@ -1276,56 +1292,56 @@ pub(super) fn terminate_prepared_process_tree(
 fn collect_process_tree_termination_order(
     root_identity: ProcIdentity,
 ) -> Result<Vec<ProcIdentity>, u32> {
-    unsafe {
-        let raw_snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        let Some(snapshot) = OwnedHandle::new(raw_snapshot) else {
-            let error = windows_sys::Win32::Foundation::GetLastError();
-            return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
-        };
+    let raw_snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    // SAFETY: a successful CreateToolhelp32Snapshot call returns a fresh snapshot handle owned
+    // by this scope and released with CloseHandle.
+    let Some(snapshot) = (unsafe { OwnedHandle::from_raw(raw_snapshot) }) else {
+        let error = unsafe { GetLastError() };
+        return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+    };
 
-        let mut snapshot_time = zeroed::<FILETIME>();
-        GetSystemTimeAsFileTime(&mut snapshot_time);
-        let snapshot_time_100ns = filetime_to_u64(snapshot_time);
+    let mut snapshot_time = unsafe { zeroed::<FILETIME>() };
+    unsafe { GetSystemTimeAsFileTime(&mut snapshot_time) };
+    let snapshot_time_100ns = filetime_to_u64(snapshot_time);
 
-        let mut child_map = HashMap::<u32, Vec<u32>>::new();
-        let mut process_entry = zeroed::<PROCESSENTRY32W>();
-        process_entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    let mut child_map = HashMap::<u32, Vec<u32>>::new();
+    let mut process_entry = unsafe { zeroed::<PROCESSENTRY32W>() };
+    process_entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
 
-        if Process32FirstW(snapshot.as_raw(), &mut process_entry) == 0 {
-            let error = windows_sys::Win32::Foundation::GetLastError();
-            return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
-        }
-
-        loop {
-            child_map
-                .entry(process_entry.th32ParentProcessID)
-                .or_default()
-                .push(process_entry.th32ProcessID);
-            if Process32NextW(snapshot.as_raw(), &mut process_entry) == 0 {
-                let error = windows_sys::Win32::Foundation::GetLastError();
-                if error != ERROR_NO_MORE_FILES {
-                    return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
-                }
-                break;
-            }
-        }
-
-        // The snapshot is keyed only by PID. Revalidate the root after enumeration so a root
-        // that exited and had its PID reused cannot lend the replacement's children to this tree.
-        let current_root = query_process_identity_for_pid(root_identity.pid)?;
-        validate_snapshot_root_identity(root_identity, current_root)?;
-
-        let mut identities = Vec::new();
-        let mut visited = HashSet::new();
-        collect_verified_process_tree_children(
-            root_identity,
-            snapshot_time_100ns,
-            &child_map,
-            &mut visited,
-            &mut identities,
-        )?;
-        Ok(identities)
+    if unsafe { Process32FirstW(snapshot.as_raw(), &mut process_entry) } == 0 {
+        let error = unsafe { GetLastError() };
+        return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
     }
+
+    loop {
+        child_map
+            .entry(process_entry.th32ParentProcessID)
+            .or_default()
+            .push(process_entry.th32ProcessID);
+        if unsafe { Process32NextW(snapshot.as_raw(), &mut process_entry) } == 0 {
+            let error = unsafe { GetLastError() };
+            if error != ERROR_NO_MORE_FILES {
+                return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+            }
+            break;
+        }
+    }
+
+    // The snapshot is keyed only by PID. Revalidate the root after enumeration so a root that
+    // exited and had its PID reused cannot lend the replacement's children to this tree.
+    let current_root = query_process_identity_for_pid(root_identity.pid)?;
+    validate_snapshot_root_identity(root_identity, current_root)?;
+
+    let mut identities = Vec::new();
+    let mut visited = HashSet::new();
+    collect_verified_process_tree_children(
+        root_identity,
+        snapshot_time_100ns,
+        &child_map,
+        &mut visited,
+        &mut identities,
+    )?;
+    Ok(identities)
 }
 
 const fn filetime_to_u64(filetime: FILETIME) -> u64 {
@@ -1344,44 +1360,42 @@ pub(super) fn validate_snapshot_root_identity(
 }
 
 // 后序遍历进程树；每条边都用创建时间验证，避免父 PID 被复用后串入旧子树。
-unsafe fn collect_verified_process_tree_children(
+fn collect_verified_process_tree_children(
     parent: ProcIdentity,
     snapshot_time_100ns: u64,
     child_map: &HashMap<u32, Vec<u32>>,
     visited: &mut HashSet<u32>,
     order: &mut Vec<ProcIdentity>,
 ) -> Result<(), u32> {
-    unsafe {
-        if !visited.insert(parent.pid) {
-            return Ok(());
-        }
-
-        if let Some(children) = child_map.get(&parent.pid) {
-            for &child_pid in children {
-                if visited.contains(&child_pid) {
-                    continue;
-                }
-                let child = match classify_descendant_process_result(
-                    query_process_identity_for_pid(child_pid),
-                    |child| is_valid_process_tree_edge(parent, *child, snapshot_time_100ns),
-                ) {
-                    DescendantProcessOutcome::Verified(child) => child,
-                    DescendantProcessOutcome::GoneOrReused => continue,
-                    DescendantProcessOutcome::Fatal(error) => return Err(error),
-                };
-                collect_verified_process_tree_children(
-                    child,
-                    snapshot_time_100ns,
-                    child_map,
-                    visited,
-                    order,
-                )?;
-            }
-        }
-
-        order.push(parent);
-        Ok(())
+    if !visited.insert(parent.pid) {
+        return Ok(());
     }
+
+    if let Some(children) = child_map.get(&parent.pid) {
+        for &child_pid in children {
+            if visited.contains(&child_pid) {
+                continue;
+            }
+            let child = match classify_descendant_process_result(
+                query_process_identity_for_pid(child_pid),
+                |child| is_valid_process_tree_edge(parent, *child, snapshot_time_100ns),
+            ) {
+                DescendantProcessOutcome::Verified(child) => child,
+                DescendantProcessOutcome::GoneOrReused => continue,
+                DescendantProcessOutcome::Fatal(error) => return Err(error),
+            };
+            collect_verified_process_tree_children(
+                child,
+                snapshot_time_100ns,
+                child_map,
+                visited,
+                order,
+            )?;
+        }
+    }
+
+    order.push(parent);
+    Ok(())
 }
 
 pub(super) fn is_valid_process_tree_edge(
@@ -1395,48 +1409,59 @@ pub(super) fn is_valid_process_tree_edge(
         && child.creation_time_100ns <= snapshot_time_100ns
 }
 
-fn own_created_process_handles(
+/// Adopts the two handles returned by a successful `CreateProcessW` call.
+///
+/// # Safety
+///
+/// `process_info.hProcess` and `process_info.hThread` must be fresh, uniquely owned handles from
+/// the same successful `CreateProcessW` call and must not have been closed or adopted elsewhere.
+unsafe fn own_created_process_handles(
     process_info: PROCESS_INFORMATION,
 ) -> Result<(OwnedHandle, OwnedHandle), u32> {
-    let process = OwnedHandle::new(process_info.hProcess);
-    let thread = OwnedHandle::new(process_info.hThread);
+    let process = unsafe { OwnedHandle::from_raw(process_info.hProcess) };
+    let thread = unsafe { OwnedHandle::from_raw(process_info.hThread) };
     match (process, thread) {
         (Some(process), Some(thread)) => Ok((process, thread)),
         _ => Err(ERROR_INVALID_HANDLE),
     }
 }
 
-unsafe fn query_process_image_path(identity: ProcIdentity) -> Result<String, u32> {
-    unsafe {
-        let handle = open_process_for_identity(identity, PROCESS_QUERY_LIMITED_INFORMATION)?;
+fn query_process_image_path(identity: ProcIdentity) -> Result<String, u32> {
+    let handle = open_process_for_identity(identity, PROCESS_QUERY_LIMITED_INFORMATION)?;
 
-        let mut capacity = 32768u32;
-        let mut buffer = vec![0u16; capacity as usize];
-        let success =
-            QueryFullProcessImageNameW(handle.as_raw(), 0, buffer.as_mut_ptr(), &mut capacity);
-        let error = windows_sys::Win32::Foundation::GetLastError();
-        drop(handle);
+    let mut capacity = 32768u32;
+    let mut buffer = vec![0u16; capacity as usize];
+    // SAFETY: the identity-validated handle is live and `buffer` is writable for `capacity`
+    // UTF-16 code units. The API updates `capacity` to the initialized length.
+    let success = unsafe {
+        QueryFullProcessImageNameW(handle.as_raw(), 0, buffer.as_mut_ptr(), &mut capacity)
+    };
+    let error = if success == 0 {
+        unsafe { GetLastError() }
+    } else {
+        0
+    };
+    drop(handle);
 
-        if success == 0 {
-            return Err(error);
-        }
-
-        Ok(String::from_utf16_lossy(&buffer[..capacity as usize]))
+    if success == 0 {
+        return Err(error);
     }
+
+    Ok(String::from_utf16_lossy(&buffer[..capacity as usize]))
 }
 
-unsafe fn query_windows_directory() -> Result<String, u32> {
-    unsafe {
-        let mut buffer = vec![0u16; 260];
-        loop {
-            let length = GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) as usize;
-            if length == 0 {
-                return Err(windows_sys::Win32::Foundation::GetLastError());
-            }
-            if length < buffer.len() {
-                return Ok(String::from_utf16_lossy(&buffer[..length]));
-            }
-            buffer.resize(length.saturating_add(1), 0);
+fn query_windows_directory() -> Result<String, u32> {
+    let mut buffer = vec![0u16; 260];
+    loop {
+        // SAFETY: `buffer` is writable for the advertised number of UTF-16 code units.
+        let length =
+            unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+        if length == 0 {
+            return Err(unsafe { GetLastError() });
         }
+        if length < buffer.len() {
+            return Ok(String::from_utf16_lossy(&buffer[..length]));
+        }
+        buffer.resize(length.saturating_add(1), 0);
     }
 }

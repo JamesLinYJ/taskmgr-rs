@@ -141,7 +141,7 @@ impl DirtyRowRange {
         self.end = self.end.max(index);
     }
 
-    unsafe fn redraw_visible(self, list_hwnd: HWND, item_count: usize) {
+    fn redraw_visible(self, list_hwnd: HWND, item_count: usize) {
         unsafe {
             let Some(start) = self.start else {
                 return;
@@ -374,11 +374,11 @@ impl ProcessPageState {
         Self::default()
     }
 
-    pub unsafe fn no_title(&self) -> bool {
+    pub fn no_title(&self) -> bool {
         self.no_title
     }
 
-    pub unsafe fn initialize(
+    pub fn initialize(
         &mut self,
         hinstance: HINSTANCE,
         hwnd_page: HWND,
@@ -420,55 +420,63 @@ impl ProcessPageState {
         }
     }
 
-    pub unsafe fn apply_options(&mut self, options: &Options, processor_count: usize) {
-        unsafe {
-            // 进程页的选项既影响行为，也影响列结构。
-            // 当列配置发生变化时，直接重建列和数据比做局部修补更可靠。
-            self.no_title = options.no_title();
-            self.confirmations = options.confirmations();
-            self.processor_count = processor_count.max(1);
+    pub fn apply_options(&mut self, options: &Options, processor_count: usize) {
+        // 进程页的选项既影响行为，也影响列结构。
+        // 当列配置发生变化时，直接重建列和数据比做局部修补更可靠。
+        self.no_title = options.no_title();
+        self.confirmations = options.confirmations();
+        self.processor_count = processor_count.max(1);
 
-            let desired_columns = columns_from_options(options);
-            if desired_columns != self.active_columns {
-                self.active_columns = desired_columns;
-                let visible_columns = DirtyColumns::from_columns(&self.active_columns);
-                for entry in &mut self.entries {
-                    entry.rebuild_display_columns(&self.active_columns);
-                    entry.dirty_columns = visible_columns;
-                }
-                self.setup_columns(options);
+        let desired_columns = columns_from_options(options);
+        if desired_columns != self.active_columns {
+            self.active_columns = desired_columns;
+            let visible_columns = DirtyColumns::from_columns(&self.active_columns);
+            for entry in &mut self.entries {
+                entry.rebuild_display_columns(&self.active_columns);
+                entry.dirty_columns = visible_columns;
             }
+            self.setup_columns(options);
         }
     }
 
-    pub unsafe fn timer_event(&mut self, options: &Options, force: bool) {
-        unsafe {
-            // 每一轮刷新都走“采样 -> 合并旧状态 -> 排序/重绘”这条统一链路。
-            self.paused = options.update_speed == UpdateSpeed::Paused as i32;
-            if force || !self.paused {
-                self.refresh_processes();
-            }
+    pub fn timer_event(&mut self, options: &Options, force: bool) {
+        // 每一轮刷新都走“采样 -> 合并旧状态 -> 排序/重绘”这条统一链路。
+        self.paused = options.update_speed == UpdateSpeed::Paused as i32;
+        if force || !self.paused {
+            self.refresh_processes();
         }
     }
 
-    pub unsafe fn deactivate(&mut self, options: &mut Options) {
-        unsafe {
-            if let Err(error) = self.save_column_layout(options) {
-                record_win32_error("process column layout persistence", error);
-            }
+    pub fn deactivate(&mut self, options: &mut Options) {
+        if let Err(error) = self.save_column_layout(options) {
+            record_win32_error("process column layout persistence", error);
         }
     }
 
-    pub unsafe fn destroy(&mut self) {
+    pub fn destroy(&mut self) {
         self.stop_worker_thread();
         self.entries.clear();
         self.displayed_identities.clear();
     }
 
+    /// Handles a notification forwarded by the process page dialog procedure.
+    ///
+    /// # Safety
+    ///
+    /// `lparam` must be the live `WM_NOTIFY` payload for this page's ListView. The payload must
+    /// have the structure implied by its `NMHDR::code` and remain readable (and, for
+    /// `LVN_GETDISPINFOW`, writable) for the duration of this synchronous call.
     pub unsafe fn handle_notify(&mut self, lparam: LPARAM) -> isize {
         unsafe {
             // ListView 处于 owner-data 风格，因此文本、排序和选择同步都靠通知消息驱动。
-            let notify_header = &*(lparam as *const NMHDR);
+            let Some(notify_header) = (lparam as *const NMHDR).as_ref() else {
+                return 0;
+            };
+            if notify_header.idFrom != IDC_PROCLIST as usize
+                || notify_header.hwndFrom != self.list_hwnd()
+            {
+                return 0;
+            }
             match notify_header.code {
                 code if code == LVN_GETDISPINFOW => {
                     let display_info = &mut *(lparam as *mut NMLVDISPINFOW);
@@ -509,54 +517,51 @@ impl ProcessPageState {
     }
 
     // 将命令 ID 分派到具体的进程操作（结束、调试、优先级、亲和性等）。
-    pub unsafe fn handle_command(&mut self, command_id: u16, options: Option<&mut Options>) {
-        unsafe {
-            let Some(command) = ProcCommand::from_command_id(command_id, IDC_TERMINATE as u16)
-            else {
-                return;
-            };
+    pub fn handle_command(&mut self, command_id: u16, options: Option<&mut Options>) {
+        let Some(command) = ProcCommand::from_command_id(command_id, IDC_TERMINATE as u16) else {
+            return;
+        };
 
-            match command {
-                ProcCommand::PickColumns => {
-                    if let Some(options) = options {
-                        self.pick_columns(options);
-                    }
+        match command {
+            ProcCommand::PickColumns => {
+                if let Some(options) = options {
+                    self.pick_columns(options);
                 }
-                ProcCommand::Terminate => {
-                    if let Some(identity) = self.current_selected_identity() {
-                        self.kill_process(identity);
-                    }
+            }
+            ProcCommand::Terminate => {
+                if let Some(identity) = self.current_selected_identity() {
+                    self.kill_process(identity);
                 }
-                ProcCommand::TerminateTree => {
-                    if let Some(identity) = self.current_selected_identity() {
-                        self.kill_process_tree(identity);
-                    }
+            }
+            ProcCommand::TerminateTree => {
+                if let Some(identity) = self.current_selected_identity() {
+                    self.kill_process_tree(identity);
                 }
-                ProcCommand::Debug => {
-                    if let Some(identity) = self.current_selected_identity() {
-                        self.attach_debugger(identity);
-                    }
+            }
+            ProcCommand::Debug => {
+                if let Some(identity) = self.current_selected_identity() {
+                    self.attach_debugger(identity);
                 }
-                ProcCommand::OpenFileLocation => {
-                    if let Some(identity) = self.current_selected_identity() {
-                        self.open_file_location(identity);
-                    }
+            }
+            ProcCommand::OpenFileLocation => {
+                if let Some(identity) = self.current_selected_identity() {
+                    self.open_file_location(identity);
                 }
-                ProcCommand::Affinity => {
-                    if let Some(identity) = self.current_selected_identity() {
-                        self.set_affinity(identity);
-                    }
+            }
+            ProcCommand::Affinity => {
+                if let Some(identity) = self.current_selected_identity() {
+                    self.set_affinity(identity);
                 }
-                ProcCommand::SetPriority(priority) => {
-                    if let Some(identity) = self.current_selected_identity() {
-                        self.set_priority(identity, priority);
-                    }
+            }
+            ProcCommand::SetPriority(priority) => {
+                if let Some(identity) = self.current_selected_identity() {
+                    self.set_priority(identity, priority);
                 }
             }
         }
     }
 
-    pub unsafe fn show_context_menu(&mut self, x: i32, y: i32) {
+    pub fn show_context_menu(&mut self, x: i32, y: i32) {
         unsafe {
             // 右键菜单会按当前选中进程和系统能力动态裁剪。
             self.selected_identity = self.current_selected_identity();
@@ -597,7 +602,7 @@ impl ProcessPageState {
     }
 
     // 构造进程右键菜单，包含结束进程、调试、打开文件位置、优先级和亲和性子菜单。
-    unsafe fn build_context_menu(&self, entry: &ProcEntry) -> Result<PopupMenu, u32> {
+    fn build_context_menu(&self, entry: &ProcEntry) -> Result<PopupMenu, u32> {
         let identity_verified = entry.identity.is_verified();
         let mut priority_menu = PopupMenu::new()?;
         let checked_priority = match entry.priority_class {
@@ -692,7 +697,7 @@ impl ProcessPageState {
         Ok(popup)
     }
 
-    pub unsafe fn size_page(&self) {
+    pub fn size_page(&self) {
         unsafe {
             // 进程页布局以“列表吃掉剩余空间，按钮贴右下角”为核心规则。
             let mut parent_rect = zeroed::<RECT>();
@@ -742,31 +747,29 @@ impl ProcessPageState {
     }
 
     // 从进程页跳转到指定 PID 的行并高亮选中。由任务页的“转到进程”命令触发。
-    pub unsafe fn find_process(&mut self, identity: ProcIdentity) -> bool {
-        unsafe {
-            if !identity.is_verified() {
-                return false;
-            }
-            let Some(index) = self
-                .entries
-                .iter()
-                .position(|entry| entry.identity == identity)
-            else {
-                self.pending_find_identity = Some(identity);
-                self.refresh_processes();
-                return true;
-            };
-
-            self.selected_identity = Some(self.entries[index].identity);
-            let list_hwnd = self.list_hwnd();
-            self.set_list_selection(
-                list_hwnd,
-                Some(index),
-                SelectionScrollPolicy::RevealSelection,
-            );
-            self.update_ui_state();
-            true
+    pub fn find_process(&mut self, identity: ProcIdentity) -> bool {
+        if !identity.is_verified() {
+            return false;
         }
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.identity == identity)
+        else {
+            self.pending_find_identity = Some(identity);
+            self.refresh_processes();
+            return true;
+        };
+
+        self.selected_identity = Some(self.entries[index].identity);
+        let list_hwnd = self.list_hwnd();
+        self.set_list_selection(
+            list_hwnd,
+            Some(index),
+            SelectionScrollPolicy::RevealSelection,
+        );
+        self.update_ui_state();
+        true
     }
 
     fn list_hwnd(&self) -> HWND {
@@ -798,7 +801,7 @@ impl ProcessPageState {
         self.strings.priority_unknown = text(TextKey::Unknown).to_string();
     }
 
-    unsafe fn update_ui_state(&self) {
+    fn update_ui_state(&self) {
         unsafe {
             // 当前实现里只有“结束进程”按钮依赖选择状态，
             // 但统一收口在这里，后续扩展其它按钮更容易。
@@ -812,14 +815,12 @@ impl ProcessPageState {
         }
     }
 
-    unsafe fn refresh_processes(&mut self) {
-        unsafe {
-            self.drain_worker_results();
-            self.schedule_process_collection();
-        }
+    fn refresh_processes(&mut self) {
+        self.drain_worker_results();
+        self.schedule_process_collection();
     }
 
-    unsafe fn schedule_process_collection(&mut self) {
+    fn schedule_process_collection(&mut self) {
         let Some(worker) = self.worker.as_mut() else {
             self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
             return;
@@ -832,84 +833,77 @@ impl ProcessPageState {
         }
     }
 
-    unsafe fn drain_worker_results(&mut self) {
+    fn drain_worker_results(&mut self) {
         let drain = match self.worker.as_mut() {
             Some(worker) => worker.drain(self.hwnd_page),
             None => return,
         };
         for completion in drain.completions {
-            crate::infrastructure::diagnostics::with_operation_id(
-                completion.operation_id,
-                || unsafe {
-                    self.apply_worker_completion(completion.value);
-                },
-            );
+            crate::infrastructure::diagnostics::with_operation_id(completion.operation_id, || {
+                self.apply_worker_completion(completion.value)
+            });
         }
         if let Some(error) = drain.error {
             self.set_refresh_error(error);
         }
     }
 
-    unsafe fn apply_worker_completion(&mut self, completion: ProcWorkerResult) {
-        unsafe {
-            match completion {
-                Ok(snapshot) => {
-                    self.last_refresh_error = None;
-                    if self.last_row_error != snapshot.row_error
-                        && let Some(error) = snapshot.row_error
-                    {
-                        record_win32_error("process row metadata", error);
-                    }
-                    self.last_row_error = snapshot.row_error;
-                    self.apply_process_snapshot(snapshot.entries);
+    fn apply_worker_completion(&mut self, completion: ProcWorkerResult) {
+        match completion {
+            Ok(snapshot) => {
+                self.last_refresh_error = None;
+                if self.last_row_error != snapshot.row_error
+                    && let Some(error) = snapshot.row_error
+                {
+                    record_win32_error("process row metadata", error);
                 }
-                Err(error) => {
-                    self.set_refresh_error(error);
-                }
+                self.last_row_error = snapshot.row_error;
+                self.apply_process_snapshot(snapshot.entries);
+            }
+            Err(error) => {
+                self.set_refresh_error(error);
             }
         }
     }
 
-    unsafe fn apply_process_snapshot(&mut self, entries: Vec<ProcEntry>) {
-        unsafe {
-            let previous_selection = self.current_selected_identity().or(self.selected_identity);
-            let current_pass = self.pass_count;
-            let visible_columns = DirtyColumns::from_columns(&self.active_columns);
-            let mut sort_dirty = false;
-            let mut existing_by_identity = HashMap::with_capacity(self.entries.len());
-            for (index, entry) in self.entries.iter_mut().enumerate() {
-                existing_by_identity.insert(entry.identity, index);
-            }
-
-            for snapshot in entries {
-                if let Some(&index) = existing_by_identity.get(&snapshot.identity) {
-                    let existing = &mut self.entries[index];
-                    let changed =
-                        update_process_entry(existing, &snapshot, current_pass, visible_columns);
-                    sort_dirty |= changed.contains(self.sort_column);
-                } else {
-                    self.entries.push(snapshot.with_pass_count(
-                        current_pass,
-                        &self.active_columns,
-                        visible_columns,
-                    ));
-                    sort_dirty = true;
-                }
-            }
-
-            sort_dirty |= self.remove_stale_entries(current_pass);
-            if sort_dirty {
-                self.resort_entries();
-            }
-            let requested_selection = self
-                .pending_find_identity
-                .take()
-                .filter(|identity| self.entries.iter().any(|entry| entry.identity == *identity));
-            let selection_scroll_policy = refresh_selection_scroll_policy(requested_selection);
-            self.selected_identity = requested_selection.or(previous_selection);
-            self.rebuild_listview(selection_scroll_policy);
-            self.pass_count = self.pass_count.wrapping_add(1);
+    fn apply_process_snapshot(&mut self, entries: Vec<ProcEntry>) {
+        let previous_selection = self.current_selected_identity().or(self.selected_identity);
+        let current_pass = self.pass_count;
+        let visible_columns = DirtyColumns::from_columns(&self.active_columns);
+        let mut sort_dirty = false;
+        let mut existing_by_identity = HashMap::with_capacity(self.entries.len());
+        for (index, entry) in self.entries.iter_mut().enumerate() {
+            existing_by_identity.insert(entry.identity, index);
         }
+
+        for snapshot in entries {
+            if let Some(&index) = existing_by_identity.get(&snapshot.identity) {
+                let existing = &mut self.entries[index];
+                let changed =
+                    update_process_entry(existing, &snapshot, current_pass, visible_columns);
+                sort_dirty |= changed.contains(self.sort_column);
+            } else {
+                self.entries.push(snapshot.with_pass_count(
+                    current_pass,
+                    &self.active_columns,
+                    visible_columns,
+                ));
+                sort_dirty = true;
+            }
+        }
+
+        sort_dirty |= self.remove_stale_entries(current_pass);
+        if sort_dirty {
+            self.resort_entries();
+        }
+        let requested_selection = self
+            .pending_find_identity
+            .take()
+            .filter(|identity| self.entries.iter().any(|entry| entry.identity == *identity));
+        let selection_scroll_policy = refresh_selection_scroll_policy(requested_selection);
+        self.selected_identity = requested_selection.or(previous_selection);
+        self.rebuild_listview(selection_scroll_policy);
+        self.pass_count = self.pass_count.wrapping_add(1);
     }
 
     fn set_refresh_error(&mut self, error: u32) {
@@ -919,10 +913,8 @@ impl ProcessPageState {
         self.last_refresh_error = Some(error);
     }
 
-    pub unsafe fn handle_worker_completion(&mut self) {
-        unsafe {
-            self.drain_worker_results();
-        }
+    pub fn handle_worker_completion(&mut self) {
+        self.drain_worker_results();
     }
 
     // 按当前排序列和方向重排 entries；文本列直接比较预先缓存的小写字符串。
@@ -939,7 +931,7 @@ impl ProcessPageState {
         previous_len != self.entries.len()
     }
 
-    unsafe fn rebuild_listview(&mut self, selection_scroll_policy: SelectionScrollPolicy) {
+    fn rebuild_listview(&mut self, selection_scroll_policy: SelectionScrollPolicy) {
         unsafe {
             // 进程列表使用 LVS_OWNERDATA；刷新只更新虚拟项数量和索引映射，
             // 不再为每个进程创建、删除或移动 Win32 ListView 项。
@@ -1005,7 +997,7 @@ impl ProcessPageState {
         }
     }
 
-    unsafe fn set_list_selection(
+    fn set_list_selection(
         &self,
         list_hwnd: HWND,
         selected_index: Option<usize>,
@@ -1040,6 +1032,12 @@ impl ProcessPageState {
         }
     }
 
+    /// Fills an `LVN_GETDISPINFOW` callback buffer.
+    ///
+    /// # Safety
+    ///
+    /// When `LVIF_TEXT` is set, `item.pszText` must be writable for at least
+    /// `item.cchTextMax` UTF-16 code units and remain exclusively available for this call.
     unsafe fn fill_display_info(&self, item: &mut LVITEMW) {
         unsafe {
             if (item.mask & LVIF_TEXT) == 0
@@ -1066,7 +1064,7 @@ impl ProcessPageState {
     }
 
     // 销毁现有列并按照 active_columns 重建所有列头。列宽优先从 options 读取，否则用默认值。
-    unsafe fn setup_columns(&self, options: &Options) {
+    fn setup_columns(&self, options: &Options) {
         unsafe {
             let list_hwnd = self.list_hwnd();
             while SendMessageW(list_hwnd, LVM_DELETECOLUMN, 0, 0) != 0 {}
@@ -1109,7 +1107,7 @@ impl ProcessPageState {
         }
     }
 
-    unsafe fn save_column_layout(&self, options: &mut Options) -> Result<(), u32> {
+    fn save_column_layout(&self, options: &mut Options) -> Result<(), u32> {
         unsafe {
             let column_count = self.active_columns.len();
             if column_count == 0 {
@@ -1146,7 +1144,7 @@ impl ProcessPageState {
         }
     }
 
-    unsafe fn current_selected_identity(&self) -> Option<ProcIdentity> {
+    fn current_selected_identity(&self) -> Option<ProcIdentity> {
         unsafe {
             let list_hwnd = self.list_hwnd();
             let index = SendMessageW(
@@ -1169,7 +1167,7 @@ impl ProcessPageState {
     }
 
     // 打开“选择列”对话框。通过 ColumnDialogContext 传递页面和选项指针给 dialog proc。
-    unsafe fn pick_columns(&mut self, options: &mut Options) {
+    fn pick_columns(&mut self, options: &mut Options) {
         let mut context = ColumnDialogContext {
             page: self as *mut ProcessPageState,
             options: options as *mut Options,
@@ -1276,7 +1274,7 @@ fn write_process_column_layout(
 }
 
 // 将对话框中的列勾选状态持久化到 options。保留已有顺序和列宽，新增列追加到末尾。
-unsafe fn apply_selected_columns(hwnd: HWND, options: &mut Options) {
+fn apply_selected_columns(hwnd: HWND, options: &mut Options) {
     unsafe {
         let existing_columns = columns_from_options(options);
         let mut existing_widths = HashMap::with_capacity(NUM_COLUMN);
@@ -1791,9 +1789,7 @@ mod tests {
             ..ProcessPageState::default()
         };
 
-        unsafe {
-            state.apply_worker_completion(Err(5));
-        }
+        state.apply_worker_completion(Err(5));
 
         assert_eq!(state.entries.len(), 1);
         assert_eq!(state.entries[0].image_name, "trusted.exe");

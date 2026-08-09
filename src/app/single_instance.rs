@@ -22,8 +22,8 @@ use std::ptr::{null, null_mut};
 
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_GEN_FAILURE, FALSE, GetLastError, HANDLE, HWND,
-    LocalFree, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_ALREADY_EXISTS, ERROR_GEN_FAILURE, FALSE, GetLastError, HANDLE, HWND, LocalFree,
+    WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -44,7 +44,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::infrastructure::diagnostics::{self, Field, Level};
-use crate::infrastructure::native::to_wide_null;
+use crate::infrastructure::native::{OwnedHandle, to_wide_null};
 
 const MAX_IMAGE_PATH_UNITS: usize = 32_768;
 
@@ -76,7 +76,7 @@ fn create_startup_mutex_with_suffix(suffix: &str) -> Result<CreatedMutex, u32> {
         GetCurrentProcessId()
     })?;
     let name = startup_mutex_name(&identity, suffix);
-    let sid = sid_to_string(identity.user_sid.as_ptr().cast_mut().cast())?;
+    let sid = identity.user_sid.to_string_sid()?;
     let mandatory_label = if identity.elevated {
         "S:(ML;;NW;;;HI)"
     } else {
@@ -103,7 +103,7 @@ fn create_startup_mutex_with_suffix(suffix: &str) -> Result<CreatedMutex, u32> {
 
 fn startup_mutex_name(identity: &ProcessIdentity, suffix: &str) -> Vec<u16> {
     let mut hasher = Sha256::new();
-    hasher.update(&identity.user_sid);
+    hasher.update(identity.user_sid.as_bytes());
     let digest = hasher.finalize();
     let user_hash = digest[..8]
         .iter()
@@ -188,8 +188,10 @@ impl AuthenticatedWindow {
                 process_id,
             )
         };
-        let process = OwnedHandle::new(process)?;
-        let peer = query_process_identity(process.raw(), process_id).ok()?;
+        // Safety: successful OpenProcess returns one owned process handle released by CloseHandle;
+        // no other owner is retained after this transfer.
+        let process = unsafe { OwnedHandle::from_raw(process) }?;
+        let peer = query_process_identity(process.as_raw(), process_id).ok()?;
         if !same_instance_identity(current, &peer) {
             diagnostics::event(
                 Level::Trace,
@@ -212,7 +214,8 @@ impl AuthenticatedWindow {
         // Safety: the PID output is writable and the retained process handle is live.
         let owner_exists =
             unsafe { GetWindowThreadProcessId(self.hwnd, &mut observed_process_id) } != 0;
-        let process_running = unsafe { WaitForSingleObject(self.process.raw(), 0) } == WAIT_TIMEOUT;
+        let process_running =
+            unsafe { WaitForSingleObject(self.process.as_raw(), 0) } == WAIT_TIMEOUT;
         window_binding_is_current(
             self.process_id,
             observed_process_id,
@@ -226,7 +229,7 @@ struct ProcessIdentity {
     session_id: u32,
     elevated: bool,
     integrity_rid: u32,
-    user_sid: Vec<u8>,
+    user_sid: OwnedSid,
     image_path: String,
 }
 
@@ -249,21 +252,23 @@ fn query_process_identity(process: HANDLE, process_id: u32) -> Result<ProcessIde
         return Err(last_error());
     }
     let token = open_process_token(process)?;
-    let elevation = token_information(token.raw(), TokenElevation)?;
+    let elevation = token_information(token.as_raw(), TokenElevation)?;
     if elevation.len().saturating_mul(size_of::<u64>()) < size_of::<TOKEN_ELEVATION>() {
         return Err(ERROR_GEN_FAILURE);
     }
     // Safety: token_information returns a suitably aligned byte allocation and length was checked.
     let elevated =
         unsafe { (*(elevation.as_ptr().cast::<TOKEN_ELEVATION>())).TokenIsElevated != 0 };
-    let user = token_information(token.raw(), TokenUser)?;
+    let user = token_information(token.as_raw(), TokenUser)?;
     if user.len().saturating_mul(size_of::<u64>()) < size_of::<TOKEN_USER>() {
         return Err(ERROR_GEN_FAILURE);
     }
     // Safety: the TOKEN_USER header and referenced SID stay inside `user` for its lifetime.
     let user_sid = unsafe { (*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
-    let user_sid = copy_sid(user_sid)?;
-    let integrity = token_information(token.raw(), TokenIntegrityLevel)?;
+    // Safety: TOKEN_USER came from the live, successfully populated token-information buffer and
+    // its SID remains readable while this function copies it.
+    let user_sid = unsafe { OwnedSid::copy_from_raw(user_sid) }?;
+    let integrity = token_information(token.as_raw(), TokenIntegrityLevel)?;
     if integrity.len().saturating_mul(size_of::<u64>()) < size_of::<TOKEN_MANDATORY_LABEL>() {
         return Err(ERROR_GEN_FAILURE);
     }
@@ -273,7 +278,10 @@ fn query_process_identity(process: HANDLE, process_id: u32) -> Result<ProcessIde
             .Label
             .Sid
     };
-    let integrity_rid = sid_last_subauthority(integrity_sid)?;
+    // Safety: TOKEN_MANDATORY_LABEL came from the live, successfully populated token-information
+    // buffer and its SID remains readable while this function copies it.
+    let integrity_sid = unsafe { OwnedSid::copy_from_raw(integrity_sid) }?;
+    let integrity_rid = integrity_sid.last_subauthority()?;
     let image_path = query_image_path(process)?;
     Ok(ProcessIdentity {
         session_id,
@@ -290,7 +298,9 @@ fn open_process_token(process: HANDLE) -> Result<OwnedHandle, u32> {
     if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
         Err(last_error())
     } else {
-        OwnedHandle::new(token).ok_or(ERROR_GEN_FAILURE)
+        // Safety: successful OpenProcessToken returns one owned token handle released by
+        // CloseHandle; ownership moves directly into the guard.
+        unsafe { OwnedHandle::from_raw(token) }.ok_or(ERROR_GEN_FAILURE)
     }
 }
 
@@ -325,34 +335,105 @@ fn token_information(token: HANDLE, class: i32) -> Result<Vec<u64>, u32> {
     }
 }
 
-fn copy_sid(sid: PSID) -> Result<Vec<u8>, u32> {
-    if sid.is_null() {
-        return Err(ERROR_GEN_FAILURE);
-    }
-    // Safety: the SID came from a validated token-information buffer.
-    let length = unsafe { GetLengthSid(sid) };
-    if length == 0 {
-        return Err(last_error());
-    }
-    // Safety: the SID reports its own byte length and remains live for this copy.
-    Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length as usize) }.to_vec())
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OwnedSid {
+    // TOKEN_* buffers are u64-aligned. Retaining that alignment avoids rebuilding a PSID from a
+    // `Vec<u8>`, whose type-level alignment would not satisfy native SID field accesses.
+    storage: Vec<u64>,
+    byte_len: usize,
 }
 
-fn sid_last_subauthority(sid: PSID) -> Result<u32, u32> {
-    if sid.is_null() {
-        return Err(ERROR_GEN_FAILURE);
+impl OwnedSid {
+    /// Copies a native SID into self-contained, suitably aligned storage.
+    ///
+    /// # Safety
+    ///
+    /// `sid` must point to a live, structurally valid SID that remains readable for the complete
+    /// byte length reported by `GetLengthSid` during this call.
+    unsafe fn copy_from_raw(sid: PSID) -> Result<Self, u32> {
+        if sid.is_null() {
+            return Err(ERROR_GEN_FAILURE);
+        }
+        // Safety: validity and readability are required by the function-level contract.
+        let byte_len = unsafe { GetLengthSid(sid) } as usize;
+        if byte_len == 0 {
+            return Err(last_error());
+        }
+        let mut storage = vec![0u64; byte_len.div_ceil(size_of::<u64>())];
+        // Safety: destination storage is aligned and at least `byte_len` bytes; the source range
+        // is readable and non-overlapping by the function-level contract.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                sid.cast::<u8>(),
+                storage.as_mut_ptr().cast::<u8>(),
+                byte_len,
+            );
+        }
+        Ok(Self { storage, byte_len })
     }
-    // Safety: the SID came from a validated token-information buffer.
-    let count = unsafe { GetSidSubAuthorityCount(sid) };
-    if count.is_null() || unsafe { *count } == 0 {
-        return Err(ERROR_GEN_FAILURE);
+
+    fn as_bytes(&self) -> &[u8] {
+        // Safety: `storage` contains at least `byte_len` initialized bytes copied above.
+        unsafe { std::slice::from_raw_parts(self.storage.as_ptr().cast::<u8>(), self.byte_len) }
     }
-    // Safety: count is nonzero and indexes the final subauthority of the same SID.
-    let value = unsafe { GetSidSubAuthority(sid, u32::from(*count) - 1) };
-    if value.is_null() {
-        Err(ERROR_GEN_FAILURE)
-    } else {
-        Ok(unsafe { *value })
+
+    fn as_psid(&self) -> PSID {
+        self.storage.as_ptr().cast_mut().cast()
+    }
+
+    fn last_subauthority(&self) -> Result<u32, u32> {
+        let sid = self.as_psid();
+        // Safety: this owner contains a complete, aligned SID and keeps it live through both calls.
+        let count = unsafe { GetSidSubAuthorityCount(sid) };
+        if count.is_null() || unsafe { *count } == 0 {
+            return Err(ERROR_GEN_FAILURE);
+        }
+        // Safety: the validated nonzero count indexes the final subauthority of the same SID.
+        let value = unsafe { GetSidSubAuthority(sid, u32::from(*count) - 1) };
+        if value.is_null() {
+            Err(ERROR_GEN_FAILURE)
+        } else {
+            Ok(unsafe { *value })
+        }
+    }
+
+    fn to_string_sid(&self) -> Result<String, u32> {
+        let mut value = null_mut::<u16>();
+        // Safety: this owner supplies a complete aligned SID, and `value` is a writable out slot.
+        if unsafe { ConvertSidToStringSidW(self.as_psid(), &mut value) } == 0 {
+            return Err(last_error());
+        }
+        let mut length = 0usize;
+        // Safety: the conversion API returns a NUL-terminated LocalAlloc string.
+        unsafe {
+            while *value.add(length) != 0 {
+                length += 1;
+            }
+        }
+        // Safety: the discovered range precedes the terminating NUL.
+        let output = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(value, length) });
+        // Safety: ConvertSidToStringSidW transfers a LocalAlloc allocation to the caller.
+        unsafe {
+            LocalFree(value.cast());
+        }
+        Ok(output)
+    }
+
+    #[cfg(test)]
+    fn from_identity_bytes(bytes: &[u8]) -> Self {
+        let mut storage = vec![0u64; bytes.len().div_ceil(size_of::<u64>())];
+        // Safety: destination has at least `bytes.len()` bytes and cannot overlap the input.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                storage.as_mut_ptr().cast::<u8>(),
+                bytes.len(),
+            );
+        }
+        Self {
+            storage,
+            byte_len: bytes.len(),
+        }
     }
 }
 
@@ -365,27 +446,6 @@ fn query_image_path(process: HANDLE) -> Result<String, u32> {
     }
     buffer.truncate(length as usize);
     Ok(OsString::from_wide(&buffer).to_string_lossy().into_owned())
-}
-
-fn sid_to_string(sid: PSID) -> Result<String, u32> {
-    let mut value = null_mut::<u16>();
-    // Safety: `sid` points at the copied, self-contained SID bytes owned by the caller.
-    if unsafe { ConvertSidToStringSidW(sid, &mut value) } == 0 {
-        return Err(last_error());
-    }
-    let mut length = 0usize;
-    // Safety: the conversion API returns a NUL-terminated LocalAlloc string.
-    unsafe {
-        while *value.add(length) != 0 {
-            length += 1;
-        }
-    }
-    // Safety: the discovered range precedes the terminating NUL.
-    let output = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(value, length) });
-    unsafe {
-        LocalFree(value.cast());
-    }
-    Ok(output)
 }
 
 struct OwnedSecurityDescriptor(PSECURITY_DESCRIPTOR);
@@ -425,28 +485,6 @@ impl Drop for OwnedSecurityDescriptor {
     }
 }
 
-struct OwnedHandle(HANDLE);
-
-impl OwnedHandle {
-    fn new(handle: HANDLE) -> Option<Self> {
-        (!handle.is_null()).then_some(Self(handle))
-    }
-
-    const fn raw(&self) -> HANDLE {
-        self.0
-    }
-}
-
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
-}
-
 fn last_error() -> u32 {
     let error = unsafe { GetLastError() };
     if error == 0 { ERROR_GEN_FAILURE } else { error }
@@ -457,7 +495,7 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::thread;
-    use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED};
     use windows_sys::Win32::System::Threading::ReleaseMutex;
 
     fn identity() -> ProcessIdentity {
@@ -465,7 +503,7 @@ mod tests {
             session_id: 3,
             elevated: true,
             integrity_rid: 0x3000,
-            user_sid: vec![1, 2, 3],
+            user_sid: OwnedSid::from_identity_bytes(&[1, 2, 3]),
             image_path: r"C:\Program Files\taskmgr-rs\taskmgr.exe".to_string(),
         }
     }
@@ -521,20 +559,27 @@ mod tests {
             "current session should be queryable"
         );
         let token = open_process_token(process).expect("current token should open");
-        token_information(token.raw(), TokenElevation).expect("elevation should be queryable");
-        let user = token_information(token.raw(), TokenUser).expect("user should be queryable");
+        token_information(token.as_raw(), TokenElevation).expect("elevation should be queryable");
+        let user = token_information(token.as_raw(), TokenUser).expect("user should be queryable");
         let user_sid = unsafe { (*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
-        let user_sid = copy_sid(user_sid).expect("user SID should copy");
-        let integrity = token_information(token.raw(), TokenIntegrityLevel)
+        // Safety: the SID is backed by the live TOKEN_USER buffer for this copy.
+        let user_sid = unsafe { OwnedSid::copy_from_raw(user_sid) }.expect("user SID should copy");
+        let integrity = token_information(token.as_raw(), TokenIntegrityLevel)
             .expect("integrity should be queryable");
         let integrity_sid = unsafe {
             (*(integrity.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()))
                 .Label
                 .Sid
         };
-        sid_last_subauthority(integrity_sid).expect("integrity SID should be valid");
+        // Safety: the SID is backed by the live TOKEN_MANDATORY_LABEL buffer for this copy.
+        let integrity_sid =
+            unsafe { OwnedSid::copy_from_raw(integrity_sid) }.expect("integrity SID should copy");
+        integrity_sid
+            .last_subauthority()
+            .expect("integrity SID should be valid");
         query_image_path(process).expect("current image path should be queryable");
-        let sid = sid_to_string(user_sid.as_ptr().cast_mut().cast())
+        let sid = user_sid
+            .to_string_sid()
             .expect("copied user SID should remain valid");
         OwnedSecurityDescriptor::from_sddl(&format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{sid})"))
             .expect("mutex security descriptor should parse");

@@ -351,6 +351,13 @@ pub fn append_32_bit_suffix(label: &str, show_suffix: bool) -> Cow<'_, str> {
     Cow::Owned(format!("{label} {}", text(TextKey::Bitness32Suffix)))
 }
 
+/// Forwards a message to a raw window procedure obtained from Win32.
+///
+/// # Safety
+///
+/// When `wndproc` is `Some`, it must be a live procedure pointer returned or registered by Win32
+/// for the supplied window. `hwnd`, `msg`, `wparam`, and `lparam` must satisfy that procedure's
+/// message-specific contract and remain valid for the synchronous call.
 pub unsafe fn call_window_proc(
     wndproc: WNDPROC,
     hwnd: HWND,
@@ -507,22 +514,55 @@ pub fn window_rect_relative_to_page(hwnd: HWND, page_hwnd: HWND) -> RECT {
     }
 }
 
-pub fn copy_text_to_callback_buffer(buffer: *mut u16, capacity: usize, text: &str) {
+/// Copies text into a caller-provided UTF-16 buffer and always terminates a non-empty buffer.
+pub fn copy_text_to_utf16_buffer(buffer: &mut [u16], text: &str) {
+    if buffer.is_empty() {
+        return;
+    }
+
+    let max_len = buffer.len() - 1;
+    let mut written = 0usize;
+    for character in text.chars() {
+        let mut encoded = [0u16; 2];
+        let code_units = character.encode_utf16(&mut encoded);
+        if written + code_units.len() > max_len {
+            break;
+        }
+        buffer[written..written + code_units.len()].copy_from_slice(code_units);
+        written += code_units.len();
+    }
+    buffer[written] = 0;
+}
+
+/// Copies text into a raw callback buffer supplied synchronously by Win32.
+///
+/// Null and zero-capacity buffers are ignored.
+///
+/// # Safety
+///
+/// When `buffer` is non-null and `capacity` is non-zero, it must be valid and properly aligned for
+/// writes of `capacity` consecutive `u16` values. The allocation must remain live and exclusively
+/// writable for this call, with no references aliasing the written region.
+pub unsafe fn copy_text_to_callback_buffer(buffer: *mut u16, capacity: usize, text: &str) {
     if buffer.is_null() || capacity == 0 {
         return;
     }
 
-    let max_len = capacity.saturating_sub(1);
-    let mut written = 0usize;
-    for code_unit in text.encode_utf16().take(max_len) {
-        // 安全性: `written` is bounded by capacity - 1.
-        unsafe { *buffer.add(written) = code_unit };
-        written += 1;
-    }
-    // 安全性: one slot was reserved for the terminator.
-    unsafe { *buffer.add(written) = 0 };
+    // 安全性: the function-level contract supplies validity, alignment, size, and exclusive
+    // access; the slice cannot outlive this synchronous call.
+    let buffer = unsafe { std::slice::from_raw_parts_mut(buffer, capacity) };
+    copy_text_to_utf16_buffer(buffer, text);
 }
 
+/// Copies a NUL-terminated UTF-16 string from a raw Win32 pointer.
+///
+/// Null is accepted and produces an empty string.
+///
+/// # Safety
+///
+/// A non-null `ptr` must be valid and properly aligned for reads through the first NUL code unit,
+/// with that terminator occurring within 32,768 `u16` elements. The allocation must remain live
+/// and must not be mutated for the duration of this call.
 pub unsafe fn widestr_ptr_to_string(ptr: *const u16) -> String {
     unsafe {
         // 安全性: 调用方必须传入有效的、以 NUL 结尾的 UTF-16 字符串指针。
@@ -538,5 +578,38 @@ pub unsafe fn widestr_ptr_to_string(ptr: *const u16) -> String {
             }
             String::from_utf16_lossy(std::slice::from_raw_parts(ptr, length))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_text_to_utf16_buffer;
+
+    #[test]
+    fn callback_text_is_nul_terminated_and_leaves_unused_tail_untouched() {
+        let mut buffer = [0xAAAA; 8];
+        copy_text_to_utf16_buffer(&mut buffer, "Task");
+        assert_eq!(
+            &buffer[..5],
+            &[b'T' as u16, b'a' as u16, b's' as u16, b'k' as u16, 0]
+        );
+        assert_eq!(&buffer[5..], &[0xAAAA; 3]);
+    }
+
+    #[test]
+    fn callback_text_truncation_does_not_split_surrogate_pairs() {
+        let mut buffer = [0xAAAA; 3];
+        copy_text_to_utf16_buffer(&mut buffer, "A😀");
+        assert_eq!(buffer, [b'A' as u16, 0, 0xAAAA]);
+    }
+
+    #[test]
+    fn callback_text_handles_empty_and_terminator_only_buffers() {
+        let mut empty = [];
+        copy_text_to_utf16_buffer(&mut empty, "ignored");
+
+        let mut terminator = [0xAAAA];
+        copy_text_to_utf16_buffer(&mut terminator, "ignored");
+        assert_eq!(terminator, [0]);
     }
 }

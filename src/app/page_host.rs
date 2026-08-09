@@ -131,15 +131,15 @@ impl PageState {
 
         match self {
             Self::Task(state) => state.complete_initialize()?,
-            Self::Process(state) => unsafe {
+            Self::Process(state) => {
                 state.initialize(hinstance, hwnd, main_hwnd)?;
-            },
+            }
             Self::Performance(state) => state.complete_initialize(hwnd)?,
             Self::Cpu(state) => state.initialize(hwnd)?,
             Self::Gpu(state) => state.initialize(hwnd, main_hwnd, hwnd_tabs)?,
-            Self::Network(state) => unsafe {
+            Self::Network(state) => {
                 state.initialize(hwnd, main_hwnd, hwnd_tabs)?;
-            },
+            }
             Self::Users(state) => state.initialize(hwnd)?,
         }
         Ok(())
@@ -157,10 +157,10 @@ impl PageState {
                 state.apply_options(options);
                 false
             }
-            Self::Process(state) => unsafe {
+            Self::Process(state) => {
                 state.apply_options(options, processor_count);
                 false
-            },
+            }
             Self::Performance(state) => {
                 if state.apply_options(hwnd, options, processor_count) {
                     state.size_page(hwnd, main_hwnd);
@@ -183,10 +183,10 @@ impl PageState {
                     false
                 }
             }
-            Self::Network(state) => unsafe {
+            Self::Network(state) => {
                 state.apply_options(options);
                 false
-            },
+            }
             Self::Users(state) => {
                 state.apply_options(options);
                 false
@@ -201,20 +201,20 @@ impl PageState {
         let force = reason.forces_list_refresh();
         match self {
             Self::Task(state) => state.timer_event(options, force),
-            Self::Process(state) => unsafe {
+            Self::Process(state) => {
                 state.apply_options(options, processor_count);
                 state.timer_event(options, force);
-            },
+            }
             Self::Performance(_) => {}
             Self::Cpu(state) => state.timer_event(reason.cpu_detail_refresh()),
             Self::Gpu(state) => {
                 let _ = state.apply_options(options);
                 state.timer_event();
             }
-            Self::Network(state) => unsafe {
+            Self::Network(state) => {
                 state.apply_options(options);
                 state.timer_event();
-            },
+            }
             Self::Users(state) => {
                 state.apply_options(options);
                 state.timer_event();
@@ -224,20 +224,18 @@ impl PageState {
 
     fn deactivate(&mut self, options: &mut Options) {
         if let Self::Process(state) = self {
-            unsafe {
-                state.deactivate(options);
-            }
+            state.deactivate(options);
         }
     }
 
     fn destroy(&mut self) {
         match self {
             Self::Task(state) => state.destroy(),
-            Self::Process(state) => unsafe { state.destroy() },
+            Self::Process(state) => state.destroy(),
             Self::Performance(state) => state.destroy(),
             Self::Cpu(state) => state.destroy(),
             Self::Gpu(state) => state.destroy(),
-            Self::Network(state) => unsafe { state.destroy() },
+            Self::Network(state) => state.destroy(),
             Self::Users(state) => state.destroy(),
         }
     }
@@ -263,10 +261,10 @@ impl PageState {
 
     fn handle_process_command(&mut self, command_id: u16, options: Option<&mut Options>) -> bool {
         match self {
-            Self::Process(state) => unsafe {
+            Self::Process(state) => {
                 state.handle_command(command_id, options);
                 true
-            },
+            }
             _ => false,
         }
     }
@@ -287,7 +285,7 @@ impl PageState {
 
     fn find_process(&mut self, identity: ProcIdentity) -> bool {
         match self {
-            Self::Process(state) => unsafe { state.find_process(identity) },
+            Self::Process(state) => state.find_process(identity),
             _ => false,
         }
     }
@@ -295,11 +293,11 @@ impl PageState {
     fn no_title(&self) -> bool {
         match self {
             Self::Task(state) => state.no_title(),
-            Self::Process(state) => unsafe { state.no_title() },
+            Self::Process(state) => state.no_title(),
             Self::Performance(state) => state.no_title(),
             Self::Cpu(state) => state.no_title(),
             Self::Gpu(state) => state.no_title(),
-            Self::Network(state) => unsafe { state.no_title() },
+            Self::Network(state) => state.no_title(),
             Self::Users(state) => state.no_title(),
         }
     }
@@ -328,21 +326,27 @@ impl PageState {
                 state.handle_command(command_id);
                 1
             }
-            Self::Process(state) => unsafe {
+            Self::Process(state) => {
                 state.handle_command(command_id, None);
                 1
-            },
+            }
             Self::Users(state) => isize::from(state.handle_command(command_id)),
             _ => 0,
         }
     }
 
-    fn handle_notify(&mut self, lparam: LPARAM) -> isize {
+    /// Forwards a `WM_NOTIFY` payload to the page that owns the originating control.
+    ///
+    /// # Safety
+    ///
+    /// `lparam` must be the live payload supplied with the current synchronous `WM_NOTIFY`
+    /// dispatch and must satisfy the selected page handler's notification contract.
+    unsafe fn handle_notify(&mut self, lparam: LPARAM) -> isize {
         match self {
-            Self::Task(state) => state.handle_notify(lparam),
+            Self::Task(state) => unsafe { state.handle_notify(lparam) },
             Self::Process(state) => unsafe { state.handle_notify(lparam) },
-            Self::Cpu(state) => state.handle_notify(lparam),
-            Self::Users(state) => state.handle_notify(lparam),
+            Self::Cpu(state) => unsafe { state.handle_notify(lparam) },
+            Self::Users(state) => unsafe { state.handle_notify(lparam) },
             _ => 0,
         }
     }
@@ -357,12 +361,10 @@ impl PageState {
                 Some(1)
             }
             Self::Process(state) if wparam as HWND == unsafe { GetDlgItem(hwnd, IDC_PROCLIST) } => {
-                unsafe {
-                    state.show_context_menu(
-                        i32::from((lparam & 0xFFFF) as i16),
-                        i32::from(((lparam >> 16) & 0xFFFF) as i16),
-                    );
-                }
+                state.show_context_menu(
+                    i32::from((lparam & 0xFFFF) as i16),
+                    i32::from(((lparam >> 16) & 0xFFFF) as i16),
+                );
                 Some(1)
             }
             Self::Users(state) if wparam as HWND == unsafe { GetDlgItem(hwnd, IDC_USERLIST) } => {
@@ -382,20 +384,20 @@ impl PageState {
                 state.size_page();
                 false
             }
-            Self::Process(state) => unsafe {
+            Self::Process(state) => {
                 state.size_page();
                 false
-            },
+            }
             Self::Performance(state) => {
                 state.size_page(hwnd, main_hwnd);
                 true
             }
             Self::Cpu(state) => state.size_page(),
             Self::Gpu(state) => state.size_page(),
-            Self::Network(state) => unsafe {
+            Self::Network(state) => {
                 state.size_page();
                 false
-            },
+            }
             Self::Users(state) => {
                 state.size_page();
                 false
@@ -426,7 +428,7 @@ impl PageState {
         !matches!(self, Self::Task(_))
     }
 
-    unsafe fn initialize_dialog_host(
+    fn initialize_dialog_host(
         &mut self,
         hinstance: HINSTANCE,
         hwnd: HWND,
@@ -443,6 +445,13 @@ impl PageState {
         self.handle_init_dialog(hinstance, hwnd, main_hwnd, hwnd_tabs)
     }
 
+    /// Dispatches one raw Win32 message to the active page state.
+    ///
+    /// # Safety
+    ///
+    /// `hwnd`, `wparam`, and `lparam` must be the live parameters supplied by Win32 for `msg`.
+    /// Message-specific pointer payloads must remain valid for the duration of this synchronous
+    /// call.
     unsafe fn handle_message(
         &mut self,
         hwnd: HWND,
@@ -460,7 +469,7 @@ impl PageState {
             },
             WM_NOTIFY => match self {
                 Self::Task(_) | Self::Process(_) | Self::Cpu(_) | Self::Users(_) => {
-                    Some(self.handle_notify(lparam))
+                    Some(unsafe { self.handle_notify(lparam) })
                 }
                 _ => None,
             },
@@ -531,12 +540,12 @@ impl PageState {
             }
             WM_VSCROLL => match self {
                 Self::Gpu(state) => Some(state.handle_vscroll(wparam)),
-                Self::Network(state) => Some(unsafe { state.handle_vscroll(wparam) }),
+                Self::Network(state) => Some(state.handle_vscroll(wparam)),
                 _ => None,
             },
             WM_MOUSEWHEEL => match self {
                 Self::Gpu(state) => Some(state.handle_mouse_wheel(wparam)),
-                Self::Network(state) => Some(unsafe { state.handle_mouse_wheel(wparam) }),
+                Self::Network(state) => Some(state.handle_mouse_wheel(wparam)),
                 _ => None,
             },
             PWM_TASK_WORKER_COMPLETE => match self {
@@ -548,9 +557,7 @@ impl PageState {
             },
             PWM_PROC_WORKER_COMPLETE => match self {
                 Self::Process(state) => {
-                    unsafe {
-                        state.handle_worker_completion();
-                    }
+                    state.handle_worker_completion();
                     Some(1)
                 }
                 _ => None,
@@ -585,9 +592,7 @@ impl PageState {
             },
             PWM_NET_WORKER_COMPLETE => match self {
                 Self::Network(state) => {
-                    unsafe {
-                        state.handle_worker_completion();
-                    }
+                    state.handle_worker_completion();
                     Some(0)
                 }
                 _ => None,
@@ -872,7 +877,14 @@ fn page_from_hwnd(hwnd: HWND, msg: u32, lparam: LPARAM) -> *mut DialogPage {
     page_pointer_for_message(msg, get_window_userdata(hwnd), lparam)
 }
 
-fn bind_page(hwnd: HWND, page: *mut DialogPage) {
+/// Binds the initialization pointer supplied to the dialog manager to its page HWND.
+///
+/// # Safety
+///
+/// A non-null `page` must be the live, uniquely accessible `DialogPage` pointer originally passed
+/// to `CreateDialogParamW` for `hwnd`. The page allocation must outlive the HWND and remain on the
+/// owning UI thread until `WM_NCDESTROY` clears the stored pointer.
+unsafe fn bind_page(hwnd: HWND, page: *mut DialogPage) {
     if !page.is_null() {
         // 安全性: WM_INITDIALOG supplies the DialogPage pointer passed to CreateDialogParam.
         unsafe {

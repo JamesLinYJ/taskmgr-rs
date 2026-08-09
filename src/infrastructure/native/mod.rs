@@ -23,7 +23,7 @@ pub(crate) use errors::{
     record_hresult_error_with_fields, record_ntstatus_error_with_fields,
     record_pdh_error_with_fields, record_win32_error_with_fields,
 };
-pub use handles::{OwnedHandle, OwnedWtsMemory, destroy_icon_handle};
+pub use handles::{OwnedHandle, OwnedIcon, OwnedWtsMemory};
 pub use safety::{enable_debug_privilege, process_is_elevated, process_needs_32_bit_suffix_handle};
 pub use ui::{
     append_32_bit_suffix, call_window_proc, copy_text_to_callback_buffer, finish_list_view_update,

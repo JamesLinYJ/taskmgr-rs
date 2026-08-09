@@ -89,12 +89,24 @@ struct OwnedIfTable {
 }
 
 impl OwnedIfTable {
-    fn new(ptr: *mut MIB_IF_TABLE2) -> Option<Self> {
+    /// Takes ownership of a table returned by a successful `GetIfTable2` call.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be null or uniquely owned storage allocated by `GetIfTable2` that has not
+    /// already been passed to `FreeMibTable`. Ownership is transferred to the returned value.
+    unsafe fn from_raw(ptr: *mut MIB_IF_TABLE2) -> Option<Self> {
         (!ptr.is_null()).then_some(Self { ptr })
     }
 
-    fn as_ptr(&self) -> *mut MIB_IF_TABLE2 {
-        self.ptr
+    fn rows(&self) -> &[MIB_IF_ROW2] {
+        // SAFETY: construction guarantees that `ptr` is the live allocation returned by
+        // `GetIfTable2`; that allocation contains exactly `NumEntries` initialized rows and
+        // remains owned by `self` for the lifetime of the returned slice.
+        unsafe {
+            let count = (*self.ptr).NumEntries as usize;
+            slice::from_raw_parts((*self.ptr).Table.as_ptr(), count)
+        }
     }
 }
 
@@ -243,29 +255,22 @@ impl NetworkPageState {
         Self::default()
     }
 
-    pub unsafe fn initialize(
-        &mut self,
-        hwnd: HWND,
-        main_hwnd: HWND,
-        hwnd_tabs: HWND,
-    ) -> Result<(), u32> {
-        unsafe {
-            // 初始化只建立控件和基础布局；当前页由激活入口采样，隐藏页由首帧后的预热消息采样。
-            self.hwnd = hwnd;
-            self.main_hwnd = main_hwnd;
-            self.hwnd_tabs = hwnd_tabs;
-            self.start_worker_thread()?;
-            let list = self.list_hwnd();
-            if !list.is_null() {
-                subclass_list_view(list);
-            }
-            self.configure_columns();
-            self.size_page();
-            Ok(())
+    pub fn initialize(&mut self, hwnd: HWND, main_hwnd: HWND, hwnd_tabs: HWND) -> Result<(), u32> {
+        // 初始化只建立控件和基础布局；当前页由激活入口采样，隐藏页由首帧后的预热消息采样。
+        self.hwnd = hwnd;
+        self.main_hwnd = main_hwnd;
+        self.hwnd_tabs = hwnd_tabs;
+        self.start_worker_thread()?;
+        let list = self.list_hwnd();
+        if !list.is_null() {
+            subclass_list_view(list);
         }
+        self.configure_columns();
+        self.size_page();
+        Ok(())
     }
 
-    pub unsafe fn apply_options(&mut self, options: &Options) {
+    pub fn apply_options(&mut self, options: &Options) {
         // 网络页当前只有无标题布局依赖全局选项，因此这里比较轻量。
         let previous = self.no_title;
         self.no_title = options.no_title();
@@ -273,27 +278,21 @@ impl NetworkPageState {
             return;
         }
 
-        unsafe {
-            self.size_page();
-        }
+        self.size_page();
     }
 
-    pub unsafe fn no_title(&self) -> bool {
+    pub fn no_title(&self) -> bool {
         self.no_title
     }
 
-    pub unsafe fn timer_event(&mut self) {
-        unsafe {
-            // 历史轴只在 worker 成功提交快照时推进，避免慢采样或失败时重绘旧数据。
-            self.refresh();
-        }
+    pub fn timer_event(&mut self) {
+        // 历史轴只在 worker 成功提交快照时推进，避免慢采样或失败时重绘旧数据。
+        self.refresh();
     }
 
-    pub unsafe fn destroy(&mut self) {
-        unsafe {
-            self.stop_worker_thread();
-            self.destroy_graphs();
-        }
+    pub fn destroy(&mut self) {
+        self.stop_worker_thread();
+        self.destroy_graphs();
     }
 
     fn start_worker_thread(&mut self) -> Result<(), u32> {
@@ -307,7 +306,7 @@ impl NetworkPageState {
             keep_pending,
             |()| NetworkWorkerCompletion {
                 sampled_at: Instant::now(),
-                result: unsafe { NetworkPageState::collect_adapters() },
+                result: NetworkPageState::collect_adapters(),
             },
         )?);
         Ok(())
@@ -317,7 +316,7 @@ impl NetworkPageState {
         self.worker = None;
     }
 
-    unsafe fn ensure_graph_surface(&mut self, width: i32, height: i32) -> bool {
+    fn ensure_graph_surface(&mut self, width: i32, height: i32) -> bool {
         unsafe {
             if self.cached_graph_dc.is_null()
                 || width > self.cached_graph_width
@@ -375,6 +374,11 @@ impl NetworkPageState {
         }
     }
 
+    /// Draws one network graph into a borrowed device context.
+    ///
+    /// # Safety
+    ///
+    /// `hdc` must be a live device context that is valid for drawing throughout this call.
     pub unsafe fn draw_graph(&mut self, hdc: HDC, rect: RECT, pane_index: usize) {
         unsafe {
             // 每个图表面板都根据当前适配器的历史数据独立绘制，
@@ -512,7 +516,7 @@ impl NetworkPageState {
         frame.end()
     }
 
-    pub unsafe fn size_page(&mut self) {
+    pub fn size_page(&mut self) {
         unsafe {
             // 网络页需要同时布局“多块图表 + 滚动条 + 底部列表”，
             // 因此会先算出一页能显示多少图，再决定是否出现滚动条。
@@ -669,11 +673,11 @@ impl NetworkPageState {
         }
     }
 
-    pub unsafe fn handle_vscroll(&mut self, wparam: WPARAM) -> isize {
-        unsafe { self.handle_vscroll_steps(wparam, 1) }
+    pub fn handle_vscroll(&mut self, wparam: WPARAM) -> isize {
+        self.handle_vscroll_steps(wparam, 1)
     }
 
-    unsafe fn handle_vscroll_steps(&mut self, wparam: WPARAM, steps: i32) -> isize {
+    fn handle_vscroll_steps(&mut self, wparam: WPARAM, steps: i32) -> isize {
         unsafe {
             let scrollbar = GetDlgItem(self.hwnd, IDC_GRAPHSCROLLVERT);
             if scrollbar.is_null() {
@@ -719,29 +723,25 @@ impl NetworkPageState {
         }
     }
 
-    pub unsafe fn handle_mouse_wheel(&mut self, wparam: WPARAM) -> isize {
-        unsafe {
-            // 鼠标滚轮被翻译成垂直滚动命令，保持和滚动条一致的行为。
-            let delta = i32::from(hiword(wparam) as i16);
-            if delta == 0 {
-                return 0;
-            }
-
-            let wheel_delta = WHEEL_DELTA as i32;
-            let step = ((delta.abs() + wheel_delta - 1) / wheel_delta).max(1);
-            let command = if delta < 0 { SB_LINEDOWN } else { SB_LINEUP };
-            self.handle_vscroll_steps(command as usize, step)
+    pub fn handle_mouse_wheel(&mut self, wparam: WPARAM) -> isize {
+        // 鼠标滚轮被翻译成垂直滚动命令，保持和滚动条一致的行为。
+        let delta = i32::from(hiword(wparam) as i16);
+        if delta == 0 {
+            return 0;
         }
+
+        let wheel_delta = WHEEL_DELTA as i32;
+        let step = ((delta.abs() + wheel_delta - 1) / wheel_delta).max(1);
+        let command = if delta < 0 { SB_LINEDOWN } else { SB_LINEUP };
+        self.handle_vscroll_steps(command as usize, step)
     }
 
-    unsafe fn refresh(&mut self) {
-        unsafe {
-            self.drain_worker_results();
-            self.schedule_collection();
-        }
+    fn refresh(&mut self) {
+        self.drain_worker_results();
+        self.schedule_collection();
     }
 
-    unsafe fn schedule_collection(&mut self) {
+    fn schedule_collection(&mut self) {
         let Some(worker) = self.worker.as_mut() else {
             self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
             return;
@@ -752,24 +752,21 @@ impl NetworkPageState {
         }
     }
 
-    unsafe fn drain_worker_results(&mut self) {
+    fn drain_worker_results(&mut self) {
         let drained = match self.worker.as_mut() {
             Some(worker) => worker.drain(self.hwnd),
             None => return,
         };
         for completion in drained.completions {
-            crate::infrastructure::diagnostics::with_operation_id(
-                completion.operation_id,
-                || unsafe {
-                    match completion.value.result {
-                        Ok(adapters) => {
-                            self.last_refresh_error = None;
-                            self.apply_adapter_snapshot(adapters, completion.value.sampled_at);
-                        }
-                        Err(error) => self.set_refresh_error(error),
+            crate::infrastructure::diagnostics::with_operation_id(completion.operation_id, || {
+                match completion.value.result {
+                    Ok(adapters) => {
+                        self.last_refresh_error = None;
+                        self.apply_adapter_snapshot(adapters, completion.value.sampled_at);
                     }
-                },
-            );
+                    Err(error) => self.set_refresh_error(error),
+                }
+            });
         }
         if let Some(error) = drained.error {
             self.set_refresh_error(error);
@@ -783,45 +780,58 @@ impl NetworkPageState {
         self.last_refresh_error = Some(error);
     }
 
-    pub unsafe fn handle_worker_completion(&mut self) {
-        unsafe {
-            self.drain_worker_results();
-        }
+    pub fn handle_worker_completion(&mut self) {
+        self.drain_worker_results();
     }
 
-    unsafe fn apply_adapter_snapshot(
-        &mut self,
-        raw_adapters: Vec<RawAdapterEntry>,
-        sampled_at: Instant,
-    ) {
-        unsafe {
-            // UI 提交阶段把完整原始快照转换为列表文本和历史曲线；过程中没有系统查询。
-            let raw_adapters = collapse_raw_adapters(raw_adapters);
-            let needs_initial_layout = self.last_sample_time.is_none();
-            let previous_adapter_count = self.adapters.len();
-            let previous_adapter_order = self
-                .adapters
-                .iter()
-                .map(|adapter| adapter.key)
-                .collect::<Vec<_>>();
-            let elapsed_secs = self
-                .last_sample_time
-                .replace(sampled_at)
-                .map(|previous| sampled_at.duration_since(previous).as_secs_f64())
-                .unwrap_or(0.0);
+    fn apply_adapter_snapshot(&mut self, raw_adapters: Vec<RawAdapterEntry>, sampled_at: Instant) {
+        // UI 提交阶段把完整原始快照转换为列表文本和历史曲线；过程中没有系统查询。
+        let raw_adapters = collapse_raw_adapters(raw_adapters);
+        let needs_initial_layout = self.last_sample_time.is_none();
+        let previous_adapter_count = self.adapters.len();
+        let previous_adapter_order = self
+            .adapters
+            .iter()
+            .map(|adapter| adapter.key)
+            .collect::<Vec<_>>();
+        let elapsed_secs = self
+            .last_sample_time
+            .replace(sampled_at)
+            .map(|previous| sampled_at.duration_since(previous).as_secs_f64())
+            .unwrap_or(0.0);
 
-            let mut previous_by_key = HashMap::with_capacity(self.adapters.len());
-            for adapter in self.adapters.drain(..) {
-                previous_by_key.insert(adapter.key, adapter);
-            }
+        let mut previous_by_key = HashMap::with_capacity(self.adapters.len());
+        for adapter in self.adapters.drain(..) {
+            previous_by_key.insert(adapter.key, adapter);
+        }
 
-            let mut adapters = Vec::with_capacity(raw_adapters.len());
-            let mut adapter_labels_changed = false;
-            for raw in raw_adapters {
-                let (mut sent_history, mut received_history, mut total_history, previous_state) =
-                    if let Some(previous_adapter) = previous_by_key.remove(&raw.key) {
-                        adapter_labels_changed |= previous_adapter.name != raw.name;
-                        let NetworkAdapterEntry {
+        let mut adapters = Vec::with_capacity(raw_adapters.len());
+        let mut adapter_labels_changed = false;
+        for raw_adapter in raw_adapters {
+            let (mut sent_history, mut received_history, mut total_history, previous_state) =
+                if let Some(previous_adapter) = previous_by_key.remove(&raw_adapter.key) {
+                    adapter_labels_changed |= previous_adapter.name != raw_adapter.name;
+                    let NetworkAdapterEntry {
+                        name,
+                        state,
+                        link_speed,
+                        utilization,
+                        bytes_sent,
+                        bytes_received,
+                        bytes_total,
+                        current_sent,
+                        current_received,
+                        sent_history,
+                        received_history,
+                        total_history,
+                        ..
+                    } = previous_adapter;
+
+                    (
+                        sent_history,
+                        received_history,
+                        total_history,
+                        Some(PreviousAdapterState {
                             name,
                             state,
                             link_speed,
@@ -831,155 +841,138 @@ impl NetworkPageState {
                             bytes_total,
                             current_sent,
                             current_received,
-                            sent_history,
-                            received_history,
-                            total_history,
-                            ..
-                        } = previous_adapter;
-
-                        (
-                            sent_history,
-                            received_history,
-                            total_history,
-                            Some(PreviousAdapterState {
-                                name,
-                                state,
-                                link_speed,
-                                utilization,
-                                bytes_sent,
-                                bytes_received,
-                                bytes_total,
-                                current_sent,
-                                current_received,
-                            }),
-                        )
-                    } else {
-                        adapter_labels_changed = true;
-                        (
-                            HistoryBuffer::zeroed(HIST_SIZE),
-                            HistoryBuffer::zeroed(HIST_SIZE),
-                            HistoryBuffer::zeroed(HIST_SIZE),
-                            None,
-                        )
-                    };
-                let counter_delta = adapter_counter_delta(
-                    raw.bytes_sent,
-                    raw.bytes_received,
-                    previous_state
-                        .as_ref()
-                        .map(|state| (state.current_sent, state.current_received)),
-                );
-                // A zero curve point marks an unavailable interval after first sight or counter
-                // reset; the textual value remains "-" so it is not presented as measured idle.
-                let total_delta = counter_delta.map_or(0, |delta| delta.2);
-                let sent_util = counter_delta.map_or(0, |delta| {
-                    utilization_percent_for_history(delta.0, raw.link_speed_bps, elapsed_secs)
-                });
-                let received_util = counter_delta.map_or(0, |delta| {
-                    utilization_percent_for_history(delta.1, raw.link_speed_bps, elapsed_secs)
-                });
-                let total_util = counter_delta.map_or(0, |delta| {
-                    utilization_percent_for_history(delta.2, raw.link_speed_bps, elapsed_secs)
-                });
-
-                push_history(&mut sent_history, sent_util);
-                push_history(&mut received_history, received_util);
-                push_history(&mut total_history, total_util);
-
-                let bytes_total = raw.bytes_sent.checked_add(raw.bytes_received);
-                let mut adapter = NetworkAdapterEntry {
-                    interface_index: raw.interface_index,
-                    key: raw.key,
-                    name: raw.name,
-                    state: raw.state,
-                    link_speed: format_link_speed(raw.link_speed_bps),
-                    utilization: counter_delta
-                        .map(|_| utilization_text(total_delta, raw.link_speed_bps, elapsed_secs))
-                        .unwrap_or_else(|| "-".to_string()),
-                    bytes_sent: format_counter(raw.bytes_sent),
-                    bytes_received: format_counter(raw.bytes_received),
-                    bytes_total: bytes_total
-                        .map(format_counter)
-                        .unwrap_or_else(|| "-".to_string()),
-                    current_sent: raw.bytes_sent,
-                    current_received: raw.bytes_received,
-                    sent_history,
-                    received_history,
-                    total_history,
-                    dirty: true,
+                        }),
+                    )
+                } else {
+                    adapter_labels_changed = true;
+                    (
+                        HistoryBuffer::zeroed(HIST_SIZE),
+                        HistoryBuffer::zeroed(HIST_SIZE),
+                        HistoryBuffer::zeroed(HIST_SIZE),
+                        None,
+                    )
                 };
-                if let Some(previous_state) = previous_state.as_ref() {
-                    adapter.dirty = previous_state.name != adapter.name
-                        || previous_state.state != adapter.state
-                        || previous_state.link_speed != adapter.link_speed
-                        || previous_state.utilization != adapter.utilization
-                        || previous_state.bytes_sent != adapter.bytes_sent
-                        || previous_state.bytes_received != adapter.bytes_received
-                        || previous_state.bytes_total != adapter.bytes_total;
-                }
-                adapters.push(adapter);
-            }
+            let counter_delta = adapter_counter_delta(
+                raw_adapter.bytes_sent,
+                raw_adapter.bytes_received,
+                previous_state
+                    .as_ref()
+                    .map(|state| (state.current_sent, state.current_received)),
+            );
+            // A zero curve point marks an unavailable interval after first sight or counter
+            // reset; the textual value remains "-" so it is not presented as measured idle.
+            let total_delta = counter_delta.map_or(0, |delta| delta.2);
+            let sent_util = counter_delta.map_or(0, |delta| {
+                utilization_percent_for_history(delta.0, raw_adapter.link_speed_bps, elapsed_secs)
+            });
+            let received_util = counter_delta.map_or(0, |delta| {
+                utilization_percent_for_history(delta.1, raw_adapter.link_speed_bps, elapsed_secs)
+            });
+            let total_util = counter_delta.map_or(0, |delta| {
+                utilization_percent_for_history(delta.2, raw_adapter.link_speed_bps, elapsed_secs)
+            });
 
-            self.adapters = adapters;
-            self.scroll_offset = (self.scroll_offset + 2) % GRAPH_GRID;
-            let labels_changed = adapter_labels_changed
-                || previous_adapter_order
-                    .iter()
-                    .copied()
-                    .ne(self.adapters.iter().map(|adapter| adapter.key));
-            self.update_listview();
-            if needs_initial_layout || previous_adapter_count != self.adapters.len() {
-                self.size_page();
-            } else if labels_changed {
-                self.label_graphs();
+            push_history(&mut sent_history, sent_util);
+            push_history(&mut received_history, received_util);
+            push_history(&mut total_history, total_util);
+
+            let bytes_total = raw_adapter
+                .bytes_sent
+                .checked_add(raw_adapter.bytes_received);
+            let mut adapter = NetworkAdapterEntry {
+                interface_index: raw_adapter.interface_index,
+                key: raw_adapter.key,
+                name: raw_adapter.name,
+                state: raw_adapter.state,
+                link_speed: format_link_speed(raw_adapter.link_speed_bps),
+                utilization: counter_delta
+                    .map(|_| {
+                        utilization_text(total_delta, raw_adapter.link_speed_bps, elapsed_secs)
+                    })
+                    .unwrap_or_else(|| "-".to_string()),
+                bytes_sent: format_counter(raw_adapter.bytes_sent),
+                bytes_received: format_counter(raw_adapter.bytes_received),
+                bytes_total: bytes_total
+                    .map(format_counter)
+                    .unwrap_or_else(|| "-".to_string()),
+                current_sent: raw_adapter.bytes_sent,
+                current_received: raw_adapter.bytes_received,
+                sent_history,
+                received_history,
+                total_history,
+                dirty: true,
+            };
+            if let Some(previous_state) = previous_state.as_ref() {
+                adapter.dirty = previous_state.name != adapter.name
+                    || previous_state.state != adapter.state
+                    || previous_state.link_speed != adapter.link_speed
+                    || previous_state.utilization != adapter.utilization
+                    || previous_state.bytes_sent != adapter.bytes_sent
+                    || previous_state.bytes_received != adapter.bytes_received
+                    || previous_state.bytes_total != adapter.bytes_total;
             }
-            self.update_graphs();
+            adapters.push(adapter);
         }
+
+        self.adapters = adapters;
+        self.scroll_offset = (self.scroll_offset + 2) % GRAPH_GRID;
+        let labels_changed = adapter_labels_changed
+            || previous_adapter_order
+                .iter()
+                .copied()
+                .ne(self.adapters.iter().map(|adapter| adapter.key));
+        self.update_listview();
+        if needs_initial_layout || previous_adapter_count != self.adapters.len() {
+            self.size_page();
+        } else if labels_changed {
+            self.label_graphs();
+        }
+        self.update_graphs();
     }
 
-    unsafe fn collect_adapters() -> Result<Vec<RawAdapterEntry>, u32> {
-        unsafe {
-            let mut table = null_mut::<MIB_IF_TABLE2>();
-            let status = GetIfTable2(&mut table);
-            let table = OwnedIfTable::new(table);
-            if status != 0 {
-                return Err(status);
-            }
-            let table = table.ok_or(windows_sys::Win32::Foundation::ERROR_INVALID_DATA)?;
-            let table_ptr = table.as_ptr();
-
-            let count = (*table_ptr).NumEntries as usize;
-            let mut adapters = Vec::with_capacity(count);
-            let rows = slice::from_raw_parts((*table_ptr).Table.as_ptr(), count);
-            for row in rows {
-                if !include_adapter(row) {
-                    continue;
-                }
-
-                let mut name = wide_array_to_string(&row.Alias);
-                if name.is_empty() {
-                    name = wide_array_to_string(&row.Description);
-                }
-                let key = AdapterIdentity {
-                    luid: row.InterfaceLuid.Value,
-                    interface_index: row.InterfaceIndex,
-                };
-
-                adapters.push(RawAdapterEntry {
-                    interface_index: row.InterfaceIndex,
-                    key,
-                    name,
-                    state: adapter_state_text(row.OperStatus),
-                    link_speed_bps: row.ReceiveLinkSpeed.max(row.TransmitLinkSpeed),
-                    bytes_sent: row.OutOctets,
-                    bytes_received: row.InOctets,
-                });
-            }
-            Ok(adapters)
+    fn collect_adapters() -> Result<Vec<RawAdapterEntry>, u32> {
+        let mut raw_table = null_mut::<MIB_IF_TABLE2>();
+        let status = unsafe { GetIfTable2(&mut raw_table) };
+        if status != 0 {
+            return Err(status);
         }
+        // SAFETY: a successful `GetIfTable2` call transfers a fresh table allocation through
+        // `raw_table`; this is the sole owner and will release it with `FreeMibTable`.
+        let table = unsafe { OwnedIfTable::from_raw(raw_table) }
+            .ok_or(windows_sys::Win32::Foundation::ERROR_INVALID_DATA)?;
+
+        let mut adapters = Vec::with_capacity(table.rows().len());
+        for row in table.rows() {
+            if !include_adapter(row) {
+                continue;
+            }
+
+            let mut name = wide_array_to_string(&row.Alias);
+            if name.is_empty() {
+                name = wide_array_to_string(&row.Description);
+            }
+            // SAFETY: the live row comes from a successfully initialized MIB_IF_TABLE2; Win32
+            // initializes InterfaceLuid, and reading its Value view does not outlive the owner.
+            let luid = unsafe { row.InterfaceLuid.Value };
+            let key = AdapterIdentity {
+                luid,
+                interface_index: row.InterfaceIndex,
+            };
+
+            adapters.push(RawAdapterEntry {
+                interface_index: row.InterfaceIndex,
+                key,
+                name,
+                state: adapter_state_text(row.OperStatus),
+                link_speed_bps: row.ReceiveLinkSpeed.max(row.TransmitLinkSpeed),
+                bytes_sent: row.OutOctets,
+                bytes_received: row.InOctets,
+            });
+        }
+        Ok(adapters)
     }
 
-    unsafe fn configure_columns(&self) {
+    fn configure_columns(&self) {
         unsafe {
             let list = self.list_hwnd();
             if list.is_null() {
@@ -1024,7 +1017,7 @@ impl NetworkPageState {
         }
     }
 
-    unsafe fn update_listview(&self) {
+    fn update_listview(&self) {
         unsafe {
             // 列表只在适配器身份变化时替换整行，普通数值更新尽量走原位写回。
             let list = self.list_hwnd();
@@ -1124,7 +1117,7 @@ impl NetworkPageState {
         }
     }
 
-    unsafe fn ensure_graphs(&mut self, required: usize) {
+    fn ensure_graphs(&mut self, required: usize) {
         unsafe {
             if required <= self.graphs.len() || self.hwnd.is_null() {
                 return;
@@ -1187,7 +1180,7 @@ impl NetworkPageState {
         }
     }
 
-    unsafe fn destroy_graphs(&mut self) {
+    fn destroy_graphs(&mut self) {
         unsafe {
             for graph in self.graphs.drain(..) {
                 if !graph.graph_hwnd.is_null() {
@@ -1216,7 +1209,7 @@ impl NetworkPageState {
         }
     }
 
-    unsafe fn update_graphs(&self) {
+    fn update_graphs(&self) {
         unsafe {
             // 只重绘当前一页真正可见的图表，避免隐藏面板也跟着刷新。
             for pane_index in 0..self.graphs_per_page {
@@ -1228,7 +1221,7 @@ impl NetworkPageState {
         }
     }
 
-    unsafe fn label_graphs(&mut self) {
+    fn label_graphs(&mut self) {
         unsafe {
             // 图表标题始终绑定当前可见适配器切片，滚动后要一起更新标题文字。
             let first_visible = self.first_visible_adapter();
@@ -1793,7 +1786,7 @@ unsafe fn draw_graph_scale_overlay(hdc: HDC, rect: RECT, scale_max: u8) {
     }
 }
 
-unsafe fn layout_spacing() -> (i32, i32) {
+fn layout_spacing() -> (i32, i32) {
     unsafe {
         let units = GetDialogBaseUnits() as usize;
         let def_spacing = (DEFSPACING_BASE * i32::from(loword(units))) / DLG_SCALE_X;

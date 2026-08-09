@@ -21,7 +21,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
-use windows_sys::Win32::Foundation::{ERROR_INVALID_DATA, HWND};
+use windows_sys::Win32::Foundation::{ERROR_INVALID_DATA, HWND, SetLastError};
 use windows_sys::Win32::UI::Controls::{
     HIMAGELIST, ImageList_Create, ImageList_Destroy, ImageList_Remove, ImageList_ReplaceIcon,
 };
@@ -35,7 +35,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::{TaskIdentity, last_error_or_gen_failure, window_matches_identity};
-use crate::infrastructure::native::{destroy_icon_handle, record_win32_error};
+use crate::infrastructure::native::{OwnedIcon, record_win32_error};
 use crate::ui::assets::{DEFAULT_PROCESS_ICON_RESOURCE, load_icon_resource};
 
 const MAX_TASK_ICON_WORKERS: usize = 8;
@@ -52,8 +52,8 @@ pub(super) struct TaskIconRequest {
 
 pub(super) struct TaskIconResult {
     pub(super) identity: TaskIdentity,
-    small_icon: isize,
-    large_icon: isize,
+    small_icon: Option<OwnedIcon>,
+    large_icon: Option<OwnedIcon>,
 }
 
 pub(super) struct TaskIconCompletion {
@@ -68,27 +68,12 @@ pub(super) struct TaskIconBatchRequest {
 }
 
 impl TaskIconResult {
-    pub(super) fn take_small_icon(&mut self) -> HICON {
-        let icon = self.small_icon as HICON;
-        self.small_icon = 0;
-        icon
+    pub(super) fn take_small_icon(&mut self) -> Option<OwnedIcon> {
+        self.small_icon.take()
     }
 
-    pub(super) fn take_large_icon(&mut self) -> HICON {
-        let icon = self.large_icon as HICON;
-        self.large_icon = 0;
-        icon
-    }
-}
-
-impl Drop for TaskIconResult {
-    fn drop(&mut self) {
-        if self.small_icon != 0 {
-            destroy_icon_handle(self.small_icon as HICON);
-        }
-        if self.large_icon != 0 {
-            destroy_icon_handle(self.large_icon as HICON);
-        }
+    pub(super) fn take_large_icon(&mut self) -> Option<OwnedIcon> {
+        self.large_icon.take()
     }
 }
 
@@ -96,8 +81,8 @@ impl Drop for TaskIconResult {
 pub(super) struct TaskIconStore {
     small: HIMAGELIST,
     large: HIMAGELIST,
-    default_small: HICON,
-    default_large: HICON,
+    default_small: Option<OwnedIcon>,
+    default_large: Option<OwnedIcon>,
     pub(super) free_slots: Vec<usize>,
 }
 
@@ -131,7 +116,7 @@ impl TaskIconStore {
                 return Err(last_error_or_gen_failure());
             }
 
-            next.default_small = load_icon_resource(
+            next.default_small = Some(load_icon_resource(
                 DEFAULT_PROCESS_ICON_RESOURCE,
                 windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
                     windows_sys::Win32::UI::WindowsAndMessaging::SM_CXSMICON,
@@ -140,8 +125,8 @@ impl TaskIconStore {
                     windows_sys::Win32::UI::WindowsAndMessaging::SM_CYSMICON,
                 ),
                 0,
-            );
-            next.default_large = load_icon_resource(
+            )?);
+            next.default_large = Some(load_icon_resource(
                 DEFAULT_PROCESS_ICON_RESOURCE,
                 windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
                     windows_sys::Win32::UI::WindowsAndMessaging::SM_CXICON,
@@ -150,10 +135,7 @@ impl TaskIconStore {
                     windows_sys::Win32::UI::WindowsAndMessaging::SM_CYICON,
                 ),
                 0,
-            );
-            if next.default_small.is_null() || next.default_large.is_null() {
-                return Err(last_error_or_gen_failure());
-            }
+            )?);
             next.reset()?;
         }
         *self = next;
@@ -168,8 +150,12 @@ impl TaskIconStore {
         self.large
     }
 
-    pub(super) fn allocate(&mut self, small_icon: HICON, large_icon: HICON) -> Result<usize, u32> {
-        if small_icon.is_null() && large_icon.is_null() {
+    pub(super) fn allocate(
+        &mut self,
+        small_icon: Option<OwnedIcon>,
+        large_icon: Option<OwnedIcon>,
+    ) -> Result<usize, u32> {
+        if small_icon.is_none() && large_icon.is_none() {
             return Ok(0);
         }
         let requested_slot = self.free_slots.last().copied();
@@ -177,50 +163,40 @@ impl TaskIconStore {
         let target = match requested_slot {
             Some(slot) => match i32::try_from(slot) {
                 Ok(slot) => slot,
-                Err(_) => {
-                    destroy_icon_handle(small_icon);
-                    destroy_icon_handle(large_icon);
-                    return Err(ERROR_INVALID_DATA);
-                }
+                Err(_) => return Err(ERROR_INVALID_DATA),
             },
             None => -1,
         };
 
-        let small_index =
-            match replace_owned_icon(self.small, target, small_icon, self.default_small) {
-                Ok(index) => index,
-                Err(error) => {
-                    destroy_icon_handle(large_icon);
-                    return Err(error);
-                }
-            };
-        let large_index =
-            match replace_owned_icon(self.large, target, large_icon, self.default_large) {
-                Ok(index) => index,
-                Err(error) => {
-                    rollback_icon_slot(
-                        self.small,
-                        small_index,
-                        self.default_small,
-                        appended,
-                        "task small icon rollback",
-                    );
-                    return Err(error);
-                }
-            };
+        let default_small = self.default_small_raw();
+        let default_large = self.default_large_raw();
+        let small_index = replace_owned_icon(self.small, target, small_icon, default_small)?;
+        let large_index = match replace_owned_icon(self.large, target, large_icon, default_large) {
+            Ok(index) => index,
+            Err(error) => {
+                rollback_icon_slot(
+                    self.small,
+                    small_index,
+                    default_small,
+                    appended,
+                    "task small icon rollback",
+                );
+                return Err(error);
+            }
+        };
 
         if small_index != large_index || requested_slot.is_some_and(|slot| slot != small_index) {
             rollback_icon_slot(
                 self.small,
                 small_index,
-                self.default_small,
+                default_small,
                 appended,
                 "task small icon rollback",
             );
             rollback_icon_slot(
                 self.large,
                 large_index,
-                self.default_large,
+                default_large,
                 appended,
                 "task large icon rollback",
             );
@@ -240,10 +216,10 @@ impl TaskIconStore {
             return Err(ERROR_INVALID_DATA);
         };
         let small_result =
-            unsafe { ImageList_ReplaceIcon(self.small, slot_i32, self.default_small) };
+            unsafe { ImageList_ReplaceIcon(self.small, slot_i32, self.default_small_raw()) };
         let small_error = (small_result < 0).then(last_error_or_gen_failure);
         let large_result =
-            unsafe { ImageList_ReplaceIcon(self.large, slot_i32, self.default_large) };
+            unsafe { ImageList_ReplaceIcon(self.large, slot_i32, self.default_large_raw()) };
         let large_error = (large_result < 0).then(last_error_or_gen_failure);
         if let Some(error) = small_error.or(large_error) {
             return Err(error);
@@ -252,21 +228,41 @@ impl TaskIconStore {
         Ok(())
     }
 
-    unsafe fn reset(&mut self) -> Result<(), u32> {
-        unsafe {
-            ImageList_Remove(self.small, -1);
-            ImageList_Remove(self.large, -1);
-            let small_index = ImageList_ReplaceIcon(self.small, -1, self.default_small);
-            let large_index = ImageList_ReplaceIcon(self.large, -1, self.default_large);
-            if small_index != 0 || large_index != 0 {
-                let error = last_error_or_gen_failure();
+    fn reset(&mut self) -> Result<(), u32> {
+        // ImageList_Remove owns only list storage; the default icons remain borrowed here.
+        unsafe { SetLastError(0) };
+        if unsafe { ImageList_Remove(self.small, -1) } == 0 {
+            return Err(last_error_or_gen_failure());
+        }
+        unsafe { SetLastError(0) };
+        if unsafe { ImageList_Remove(self.large, -1) } == 0 {
+            return Err(last_error_or_gen_failure());
+        }
+
+        unsafe { SetLastError(0) };
+        let small_index =
+            unsafe { ImageList_ReplaceIcon(self.small, -1, self.default_small_raw()) };
+        if small_index != 0 {
+            let error = last_error_or_gen_failure();
+            unsafe {
                 ImageList_Remove(self.small, -1);
                 ImageList_Remove(self.large, -1);
-                return Err(error);
             }
-            self.free_slots.clear();
-            Ok(())
+            return Err(error);
         }
+        unsafe { SetLastError(0) };
+        let large_index =
+            unsafe { ImageList_ReplaceIcon(self.large, -1, self.default_large_raw()) };
+        if large_index != 0 {
+            let error = last_error_or_gen_failure();
+            unsafe {
+                ImageList_Remove(self.small, -1);
+                ImageList_Remove(self.large, -1);
+            }
+            return Err(error);
+        }
+        self.free_slots.clear();
+        Ok(())
     }
 
     pub(super) fn destroy(&mut self) {
@@ -280,11 +276,21 @@ impl TaskIconStore {
                 self.large = 0;
             }
         }
-        destroy_icon_handle(self.default_small);
-        destroy_icon_handle(self.default_large);
-        self.default_small = null_mut();
-        self.default_large = null_mut();
+        self.default_small = None;
+        self.default_large = None;
         self.free_slots.clear();
+    }
+
+    fn default_small_raw(&self) -> HICON {
+        self.default_small
+            .as_ref()
+            .map_or(null_mut(), OwnedIcon::as_raw)
+    }
+
+    fn default_large_raw(&self) -> HICON {
+        self.default_large
+            .as_ref()
+            .map_or(null_mut(), OwnedIcon::as_raw)
     }
 }
 
@@ -461,16 +467,9 @@ fn collect_task_icon_work(work: &TaskIconBatchWork) -> TaskIconPoolResult {
         if window_matches_identity(request.identity) {
             results.push(TaskIconResult {
                 identity: request.identity,
-                small_icon: small_icon as isize,
-                large_icon: large_icon as isize,
+                small_icon,
+                large_icon,
             });
-        } else {
-            if !small_icon.is_null() {
-                destroy_icon_handle(small_icon);
-            }
-            if !large_icon.is_null() {
-                destroy_icon_handle(large_icon);
-            }
         }
     }
     Ok(results)
@@ -519,7 +518,7 @@ fn io_error_code(error: std::io::Error) -> u32 {
         .unwrap_or(windows_sys::Win32::Foundation::ERROR_GEN_FAILURE)
 }
 
-fn fetch_window_icons(hwnd: HWND, is_hung: bool) -> (HICON, HICON) {
+fn fetch_window_icons(hwnd: HWND, is_hung: bool) -> (Option<OwnedIcon>, Option<OwnedIcon>) {
     let (small2, big) = if is_hung {
         (null_mut(), null_mut())
     } else {
@@ -562,20 +561,20 @@ fn fetch_window_icons(hwnd: HWND, is_hung: bool) -> (HICON, HICON) {
         }
     }
 
-    unsafe {
-        (
-            if small_source.is_null() {
-                null_mut()
-            } else {
-                CopyIcon(small_source)
-            },
-            if large_source.is_null() {
-                null_mut()
-            } else {
-                CopyIcon(large_source)
-            },
-        )
+    (
+        copy_icon_source(small_source),
+        copy_icon_source(large_source),
+    )
+}
+
+fn copy_icon_source(source: HICON) -> Option<OwnedIcon> {
+    if source.is_null() {
+        return None;
     }
+    // 安全性: the source is borrowed for this synchronous call. Microsoft documents a successful
+    // `CopyIcon` result as a new owned icon that the application must release with `DestroyIcon`.
+    let icon = unsafe { CopyIcon(source) };
+    unsafe { OwnedIcon::from_raw(icon) }
 }
 
 // 通过 SendMessageTimeoutW(WM_GETICON) 查询窗口图标。
@@ -614,16 +613,11 @@ fn query_class_icon_source(hwnd: HWND, class_index: i32) -> HICON {
 fn replace_owned_icon(
     imagelist: HIMAGELIST,
     target: i32,
-    owned_icon: HICON,
+    owned_icon: Option<OwnedIcon>,
     default_icon: HICON,
 ) -> Result<usize, u32> {
-    let source = if owned_icon.is_null() {
-        default_icon
-    } else {
-        owned_icon
-    };
+    let source = owned_icon.as_ref().map_or(default_icon, OwnedIcon::as_raw);
     let index = unsafe { ImageList_ReplaceIcon(imagelist, target, source) };
-    destroy_icon_handle(owned_icon);
     if index < 0 {
         Err(last_error_or_gen_failure())
     } else {

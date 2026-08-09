@@ -345,12 +345,26 @@ impl TaskPageState {
         }
     }
 
-    pub fn handle_notify(&mut self, lparam: LPARAM) -> isize {
+    /// Handles a notification forwarded by the task page dialog procedure.
+    ///
+    /// # Safety
+    ///
+    /// `lparam` must be the live `WM_NOTIFY` payload for this page's ListView. The payload must
+    /// have the structure implied by its `NMHDR::code` and remain readable (and, for
+    /// `LVN_GETDISPINFOW`, writable) for the duration of this synchronous call.
+    pub unsafe fn handle_notify(&mut self, lparam: LPARAM) -> isize {
         // 任务页同样依赖 ListView 通知来驱动选择同步、双击切换和列表排序。
         // 安全性: task dialog proc forwards only WM_NOTIFY LPARAM values from Win32; each cast is
         // matched to the notification code before accessing the payload.
         unsafe {
-            let notify_header = &*(lparam as *const NMHDR);
+            let Some(notify_header) = (lparam as *const NMHDR).as_ref() else {
+                return 0;
+            };
+            if notify_header.idFrom != IDC_TASKLIST as usize
+                || notify_header.hwndFrom != self.list_hwnd()
+            {
+                return 0;
+            }
             match notify_header.code {
                 code if code == LVN_GETDISPINFOW => {
                     let display_info = &mut *(lparam as *mut NMLVDISPINFOW);
@@ -1139,8 +1153,13 @@ impl TaskPageState {
         }
     }
 
-    fn fill_display_info(&self, item: &mut LVITEMW) {
-        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
+    /// Fills an `LVN_GETDISPINFOW` callback buffer.
+    ///
+    /// # Safety
+    ///
+    /// When `LVIF_TEXT` is set, `item.pszText` must be writable for at least
+    /// `item.cchTextMax` UTF-16 code units and remain exclusively available for this call.
+    unsafe fn fill_display_info(&self, item: &mut LVITEMW) {
         unsafe {
             if (item.mask & LVIF_TEXT) == 0
                 || item.iItem < 0
@@ -1441,7 +1460,7 @@ mod tests {
     #[test]
     fn missing_custom_icons_share_the_default_slot() {
         let mut store = TaskIconStore::default();
-        assert_eq!(store.allocate(null_mut(), null_mut()), Ok(0));
+        assert_eq!(store.allocate(None, None), Ok(0));
         assert!(store.free_slots.is_empty());
     }
 

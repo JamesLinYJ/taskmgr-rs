@@ -27,7 +27,7 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{HICON, HMENU, LR_DEFAULTCOLOR, LR_DEFAULTSIZE};
 
 use crate::infrastructure::native::{
-    destroy_icon_handle, format_resource_string, record_win32_error, to_wide_null,
+    OwnedIcon, format_resource_string, record_win32_error, to_wide_null,
 };
 use crate::system::sampler::SystemSample;
 use crate::ui::assets::{TRAY_CPU_ICON_RESOURCES, load_icon_resource};
@@ -59,7 +59,7 @@ impl RuntimeStatsController {
 /// 托盘图标控制器。
 /// 管理 12 级 CPU 占用图标和通知区域提示文本。
 pub struct TrayController {
-    icons: Vec<HICON>,
+    icons: Vec<OwnedIcon>,
     registered: Cell<bool>,
     last_error: Cell<Option<u32>>,
 }
@@ -78,20 +78,12 @@ impl TrayController {
     pub fn load_icons(&mut self) -> Result<(), u32> {
         let mut loaded = Vec::with_capacity(TRAY_CPU_ICON_RESOURCES.len());
         for resource_name in TRAY_CPU_ICON_RESOURCES {
-            let icon_handle =
-                load_icon_resource(resource_name, 0, 0, LR_DEFAULTCOLOR | LR_DEFAULTSIZE);
-            if icon_handle.is_null() {
-                let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-                for icon in loaded {
-                    destroy_icon_handle(icon);
-                }
-                return Err(if error == 0 {
-                    windows_sys::Win32::Foundation::ERROR_RESOURCE_DATA_NOT_FOUND
-                } else {
-                    error
-                });
-            }
-            loaded.push(icon_handle);
+            loaded.push(load_icon_resource(
+                resource_name,
+                0,
+                0,
+                LR_DEFAULTCOLOR | LR_DEFAULTSIZE,
+            )?);
         }
         self.clear_icons();
         self.icons = loaded;
@@ -99,7 +91,7 @@ impl TrayController {
     }
 
     pub fn first_icon(&self) -> Option<HICON> {
-        self.icons.first().copied()
+        self.icons.first().map(OwnedIcon::as_raw)
     }
 
     pub fn update_tray(&self, main_hwnd: HWND, command: u32, icon: HICON, tip: &str) {
@@ -163,17 +155,13 @@ impl TrayController {
         self.update_tray(
             main_hwnd,
             windows_sys::Win32::UI::Shell::NIM_MODIFY,
-            self.icons[icon_index],
+            self.icons[icon_index].as_raw(),
             &tooltip,
         );
     }
 
     pub fn clear_icons(&mut self) {
-        for icon in self.icons.drain(..) {
-            if !icon.is_null() {
-                destroy_icon_handle(icon);
-            }
-        }
+        self.icons.clear();
     }
 }
 

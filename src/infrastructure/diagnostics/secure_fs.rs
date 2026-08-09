@@ -22,7 +22,7 @@ use std::mem::{offset_of, size_of};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Component, Path, PathBuf, Prefix};
-use std::ptr::{copy_nonoverlapping, null, null_mut, read_unaligned};
+use std::ptr::{copy_nonoverlapping, null, null_mut};
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
@@ -174,7 +174,7 @@ impl SecureDirectory {
             disposition,
             FILE_ATTRIBUTE_DIRECTORY,
             FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
-            security.as_ref().map(SecurityDescriptor::as_ptr),
+            security.as_ref(),
         )?;
         validate_handle(&file, ExpectedKind::Directory, false)?;
         Ok(Self {
@@ -239,7 +239,7 @@ impl SecureDirectory {
             FILE_CREATE,
             FILE_ATTRIBUTE_NORMAL,
             FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
-            Some(security.as_ptr()),
+            Some(&security),
         )?;
         validate_handle(&file, ExpectedKind::RegularFile, true)?;
         Ok(file)
@@ -302,11 +302,12 @@ impl SecureDirectory {
             if status < 0 && status != STATUS_BUFFER_OVERFLOW {
                 return Err(ntstatus_error(status));
             }
-            let returned = status_block.Information.min(DIRECTORY_QUERY_BUFFER_BYTES);
+            let returned = status_block.Information;
             if returned == 0 {
                 break;
             }
-            parse_directory_entries(storage.as_ptr().cast::<u8>(), returned, &mut entries)?;
+            let bytes = directory_query_bytes(&storage, returned)?;
+            parse_directory_entries(bytes, &mut entries)?;
             restart_scan = false;
         }
         Ok(entries)
@@ -443,7 +444,7 @@ fn open_relative(
     disposition: u32,
     file_attributes: u32,
     options: u32,
-    security_descriptor: Option<*const SECURITY_DESCRIPTOR>,
+    security_descriptor: Option<&SecurityDescriptor>,
 ) -> io::Result<File> {
     let mut name = name.encode_wide().collect::<Vec<_>>();
     let byte_length = name
@@ -461,7 +462,7 @@ fn open_relative(
         RootDirectory: parent,
         ObjectName: &raw const unicode,
         Attributes: OBJ_CASE_INSENSITIVE,
-        SecurityDescriptor: security_descriptor.unwrap_or(null()),
+        SecurityDescriptor: security_descriptor.map_or(null(), SecurityDescriptor::as_ptr),
         SecurityQualityOfService: null(),
     };
     let mut status_block = IO_STATUS_BLOCK::default();
@@ -551,61 +552,123 @@ fn validate_handle(file: &File, expected: ExpectedKind, reject_hard_links: bool)
     Ok(())
 }
 
+fn directory_query_bytes(storage: &[u64], initialized_len: usize) -> io::Result<&[u8]> {
+    let capacity = storage
+        .len()
+        .checked_mul(size_of::<u64>())
+        .ok_or_else(|| invalid_directory_data("directory query buffer size overflow"))?;
+    if initialized_len > capacity {
+        return Err(invalid_directory_data(
+            "directory enumeration returned more bytes than the query buffer",
+        ));
+    }
+
+    // Safety: `storage` is a live, initialized allocation and `initialized_len` was bounded by
+    // its byte capacity above. The returned slice cannot outlive the borrowed storage.
+    Ok(unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), initialized_len) })
+}
+
 fn parse_directory_entries(
-    buffer: *const u8,
-    length: usize,
+    buffer: &[u8],
     output: &mut Vec<SecureDirectoryEntry>,
 ) -> io::Result<()> {
     let fixed = offset_of!(FILE_DIRECTORY_INFORMATION, FileName);
     let mut offset = 0usize;
     loop {
-        if length.saturating_sub(offset) < fixed {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+        let remaining = buffer
+            .get(offset..)
+            .ok_or_else(|| invalid_directory_data("directory record offset is out of bounds"))?;
+        if remaining.len() < fixed {
+            return Err(invalid_directory_data(
                 "directory enumeration returned a truncated record",
             ));
         }
-        // Safety: bounds above cover the fixed header; unaligned reads avoid layout assumptions.
-        let information =
-            unsafe { read_unaligned(buffer.add(offset).cast::<FILE_DIRECTORY_INFORMATION>()) };
-        let name_bytes = information.FileNameLength as usize;
+
+        let next = read_u32_field(
+            remaining,
+            offset_of!(FILE_DIRECTORY_INFORMATION, NextEntryOffset),
+        )
+        .ok_or_else(|| invalid_directory_data("directory record is missing its next offset"))?
+            as usize;
+        let record_len = if next == 0 {
+            remaining.len()
+        } else {
+            if next < fixed || next > remaining.len() {
+                return Err(invalid_directory_data(
+                    "directory enumeration returned an invalid next-entry offset",
+                ));
+            }
+            next
+        };
+
+        let name_bytes = read_u32_field(
+            remaining,
+            offset_of!(FILE_DIRECTORY_INFORMATION, FileNameLength),
+        )
+        .ok_or_else(|| invalid_directory_data("directory record is missing its name length"))?
+            as usize;
         if !name_bytes.is_multiple_of(size_of::<u16>())
             || fixed
                 .checked_add(name_bytes)
-                .is_none_or(|record| record > length.saturating_sub(offset))
+                .is_none_or(|name_end| name_end > record_len)
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(invalid_directory_data(
                 "directory enumeration returned an invalid file name",
             ));
         }
-        let units = name_bytes / size_of::<u16>();
-        // Safety: the validated record contains `units` UTF-16 code units after the fixed header.
-        let name = unsafe {
-            let pointer = buffer.add(offset + fixed).cast::<u16>();
-            OsString::from_wide(std::slice::from_raw_parts(pointer, units))
-        };
+
+        let name_end = fixed + name_bytes;
+        let name_units = remaining[fixed..name_end]
+            .chunks_exact(size_of::<u16>())
+            .map(|bytes| u16::from_ne_bytes([bytes[0], bytes[1]]))
+            .collect::<Vec<_>>();
+        let name = OsString::from_wide(&name_units);
         if name != OsStr::new(".") && name != OsStr::new("..") {
             validate_component(&name)?;
             output.push(SecureDirectoryEntry {
                 name,
-                attributes: information.FileAttributes,
-                last_write_time: information.LastWriteTime,
+                attributes: read_u32_field(
+                    remaining,
+                    offset_of!(FILE_DIRECTORY_INFORMATION, FileAttributes),
+                )
+                .ok_or_else(|| {
+                    invalid_directory_data("directory record is missing its attributes")
+                })?,
+                last_write_time: read_i64_field(
+                    remaining,
+                    offset_of!(FILE_DIRECTORY_INFORMATION, LastWriteTime),
+                )
+                .ok_or_else(|| {
+                    invalid_directory_data("directory record is missing its write time")
+                })?,
             });
         }
-        if information.NextEntryOffset == 0 {
+        if next == 0 {
             break;
-        }
-        let next = information.NextEntryOffset as usize;
-        if next < fixed || next > length.saturating_sub(offset) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "directory enumeration returned an invalid next-entry offset",
-            ));
         }
         offset += next;
     }
     Ok(())
+}
+
+fn read_u32_field(buffer: &[u8], offset: usize) -> Option<u32> {
+    let bytes: [u8; size_of::<u32>()] = buffer
+        .get(offset..offset.checked_add(size_of::<u32>())?)?
+        .try_into()
+        .ok()?;
+    Some(u32::from_ne_bytes(bytes))
+}
+
+fn read_i64_field(buffer: &[u8], offset: usize) -> Option<i64> {
+    let bytes: [u8; size_of::<i64>()] = buffer
+        .get(offset..offset.checked_add(size_of::<i64>())?)?
+        .try_into()
+        .ok()?;
+    Some(i64::from_ne_bytes(bytes))
+}
+
+fn invalid_directory_data(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 fn split_absolute_path(path: &Path) -> io::Result<(PathBuf, Vec<OsString>)> {
@@ -790,7 +853,9 @@ fn current_user_sid_string() -> io::Result<String> {
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    let token = OwnedHandle::new(token)
+    // Safety: successful OpenProcessToken transferred one owned token handle whose documented
+    // release function is CloseHandle; no other owner is retained.
+    let token = unsafe { OwnedHandle::from_raw(token) }
         .ok_or_else(|| io::Error::other("OpenProcessToken returned an invalid handle"))?;
 
     let mut required = 0u32;
@@ -846,6 +911,100 @@ fn current_user_sid_string() -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_u32_field(buffer: &mut [u8], offset: usize, value: u32) {
+        buffer[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn write_i64_field(buffer: &mut [u8], offset: usize, value: i64) {
+        buffer[offset..offset + size_of::<i64>()].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn directory_record(name: &str, attributes: u32, last_write_time: i64) -> Vec<u8> {
+        let fixed = offset_of!(FILE_DIRECTORY_INFORMATION, FileName);
+        let name = name.encode_utf16().collect::<Vec<_>>();
+        let mut record = vec![0u8; fixed + name.len() * size_of::<u16>()];
+        write_u32_field(
+            &mut record,
+            offset_of!(FILE_DIRECTORY_INFORMATION, FileNameLength),
+            (name.len() * size_of::<u16>()) as u32,
+        );
+        write_u32_field(
+            &mut record,
+            offset_of!(FILE_DIRECTORY_INFORMATION, FileAttributes),
+            attributes,
+        );
+        write_i64_field(
+            &mut record,
+            offset_of!(FILE_DIRECTORY_INFORMATION, LastWriteTime),
+            last_write_time,
+        );
+        for (index, unit) in name.into_iter().enumerate() {
+            let start = fixed + index * size_of::<u16>();
+            record[start..start + size_of::<u16>()].copy_from_slice(&unit.to_ne_bytes());
+        }
+        record
+    }
+
+    #[test]
+    fn directory_query_length_is_bounded_by_typed_storage() {
+        let storage = [0u64; 2];
+        assert_eq!(
+            directory_query_bytes(&storage, 7)
+                .expect("in-range byte count should be accepted")
+                .len(),
+            7
+        );
+        assert_eq!(
+            directory_query_bytes(&storage, 17)
+                .expect_err("out-of-range byte count must be rejected")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn directory_parser_reads_a_typed_record_slice() {
+        let record = directory_record("task.log", FILE_ATTRIBUTE_NORMAL, 42);
+        let mut entries = Vec::new();
+        parse_directory_entries(&record, &mut entries).expect("record should parse");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, OsStr::new("task.log"));
+        assert_eq!(entries[0].attributes, FILE_ATTRIBUTE_NORMAL);
+        assert_eq!(entries[0].last_write_time, 42);
+    }
+
+    #[test]
+    fn directory_parser_rejects_a_name_crossing_the_record_boundary() {
+        let mut record = directory_record("task.log", FILE_ATTRIBUTE_NORMAL, 42);
+        write_u32_field(
+            &mut record,
+            offset_of!(FILE_DIRECTORY_INFORMATION, NextEntryOffset),
+            offset_of!(FILE_DIRECTORY_INFORMATION, FileName) as u32,
+        );
+        let mut entries = Vec::new();
+        assert_eq!(
+            parse_directory_entries(&record, &mut entries)
+                .expect_err("name must stay within its own record")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn directory_parser_rejects_a_truncated_header() {
+        let fixed = offset_of!(FILE_DIRECTORY_INFORMATION, FileName);
+        let truncated = vec![0u8; fixed - 1];
+        let mut entries = Vec::new();
+        assert_eq!(
+            parse_directory_entries(&truncated, &mut entries)
+                .expect_err("truncated header must be rejected")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(entries.is_empty());
+    }
 
     #[test]
     fn security_descriptors_name_the_token_user_instead_of_owner_rights() {
