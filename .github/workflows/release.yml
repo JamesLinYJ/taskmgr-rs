@@ -20,6 +20,7 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
+      - .github/workflows/release.yml
   workflow_dispatch:
     inputs:
       tag:
@@ -70,10 +71,11 @@ jobs:
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
+          REQUESTED_RELEASE_TAG: ${{ inputs.tag }}
         run: |
           $eventName = '${{ github.event_name }}'
           if ($eventName -eq 'workflow_dispatch') {
-              $tag = '${{ inputs.tag }}'
+              $tag = $env:REQUESTED_RELEASE_TAG
               $shouldRelease = 'true'
           } elseif ($env:GITHUB_REF -like 'refs/tags/*') {
               $tag = $env:GITHUB_REF_NAME
@@ -96,8 +98,46 @@ jobs:
               & git ls-remote --exit-code --tags origin "refs/tags/$tag" *> $null
               $tagLookupExitCode = $LASTEXITCODE
               if ($tagLookupExitCode -eq 0) {
-                  Write-Host "Release tag $tag already exists; nothing to publish for this push."
-                  $shouldRelease = 'false'
+                  function Find-ReleaseByTag {
+                      param([Parameter(Mandatory)][string]$Tag)
+
+                      $page = 1
+                      while ($true) {
+                          $pageText = & gh api `
+                              "repos/$env:GITHUB_REPOSITORY/releases?per_page=100&page=$page"
+                          if ($LASTEXITCODE -ne 0) {
+                              throw "listing releases failed with exit code $LASTEXITCODE"
+                          }
+
+                          $pageItems = @($pageText | ConvertFrom-Json)
+                          $matches = @(
+                              $pageItems |
+                                  Where-Object { $_.tag_name -ceq $Tag }
+                          )
+                          if ($matches.Count -gt 1) {
+                              throw "multiple releases use tag $Tag"
+                          }
+                          if ($matches.Count -eq 1) {
+                              return $matches[0]
+                          }
+                          if ($pageItems.Count -lt 100) {
+                              return $null
+                          }
+                          $page += 1
+                      }
+                  }
+
+                  $existingRelease = Find-ReleaseByTag -Tag $tag
+                  if ($null -eq $existingRelease) {
+                      Write-Host "Release tag $tag exists without a release; publication will resume."
+                      $shouldRelease = 'true'
+                  } elseif ($existingRelease.draft) {
+                      Write-Host "Draft release $tag exists; publication will resume."
+                      $shouldRelease = 'true'
+                  } else {
+                      Write-Host "Published release $tag already exists; nothing to publish for this push."
+                      $shouldRelease = 'false'
+                  }
               } elseif ($tagLookupExitCode -eq 2) {
                   & gh api `
                       --method POST `
@@ -111,6 +151,10 @@ jobs:
               } else {
                   throw "checking release tag $tag failed with exit code $tagLookupExitCode"
               }
+          }
+
+          if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$') {
+              throw "release tag is not a supported semantic version: $tag"
           }
 
           "release_tag=$tag" | Out-File `
@@ -333,13 +377,38 @@ jobs:
                   ForEach-Object FullName
           )
 
-          $existingText = & gh release view $tag `
-              --repo $env:GITHUB_REPOSITORY `
-              --json isDraft 2>$null
-          $releaseExists = $LASTEXITCODE -eq 0
-          if ($releaseExists) {
-              $existing = $existingText | ConvertFrom-Json
-              if (-not $existing.isDraft) {
+          function Find-ReleaseByTag {
+              param([Parameter(Mandatory)][string]$Tag)
+
+              $page = 1
+              while ($true) {
+                  $pageText = & gh api `
+                      "repos/$env:GITHUB_REPOSITORY/releases?per_page=100&page=$page"
+                  if ($LASTEXITCODE -ne 0) {
+                      throw "listing releases failed with exit code $LASTEXITCODE"
+                  }
+
+                  $pageItems = @($pageText | ConvertFrom-Json)
+                  $matches = @(
+                      $pageItems |
+                          Where-Object { $_.tag_name -ceq $Tag }
+                  )
+                  if ($matches.Count -gt 1) {
+                      throw "multiple releases use tag $Tag"
+                  }
+                  if ($matches.Count -eq 1) {
+                      return $matches[0]
+                  }
+                  if ($pageItems.Count -lt 100) {
+                      return $null
+                  }
+                  $page += 1
+              }
+          }
+
+          $existing = Find-ReleaseByTag -Tag $tag
+          if ($null -ne $existing) {
+              if (-not $existing.draft) {
                   Write-Host "Published release $tag already exists; assets will only be verified."
               } else {
                   & gh release upload $tag @assetPaths `
@@ -364,16 +433,45 @@ jobs:
           }
 
       - name: Verify uploaded asset digests
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = $env:RELEASE_TAG
-          $releaseText = & gh api `
-              "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
-          if ($LASTEXITCODE -ne 0) {
-              throw "reading release metadata failed with exit code $LASTEXITCODE"
+
+          function Find-ReleaseByTag {
+              param([Parameter(Mandatory)][string]$Tag)
+
+              $page = 1
+              while ($true) {
+                  $pageText = & gh api `
+                      "repos/$env:GITHUB_REPOSITORY/releases?per_page=100&page=$page"
+                  if ($LASTEXITCODE -ne 0) {
+                      throw "listing releases failed with exit code $LASTEXITCODE"
+                  }
+
+                  $pageItems = @($pageText | ConvertFrom-Json)
+                  $matches = @(
+                      $pageItems |
+                          Where-Object { $_.tag_name -ceq $Tag }
+                  )
+                  if ($matches.Count -gt 1) {
+                      throw "multiple releases use tag $Tag"
+                  }
+                  if ($matches.Count -eq 1) {
+                      return $matches[0]
+                  }
+                  if ($pageItems.Count -lt 100) {
+                      return $null
+                  }
+                  $page += 1
+              }
           }
-          $release = $releaseText | ConvertFrom-Json
+
+          $release = Find-ReleaseByTag -Tag $tag
+          if ($null -eq $release) {
+              throw "release metadata for $tag was not found"
+          }
           $localFiles = @(Get-ChildItem -LiteralPath dist -File)
           foreach ($localFile in $localFiles) {
               $matches = @(
@@ -399,26 +497,41 @@ jobs:
               throw "release contains unexpected assets"
           }
 
+          "release_id=$($release.id)" | Out-File `
+              -FilePath $env:GITHUB_OUTPUT `
+              -Encoding utf8 `
+              -Append
+          "is_draft=$($release.draft.ToString().ToLowerInvariant())" | Out-File `
+              -FilePath $env:GITHUB_OUTPUT `
+              -Encoding utf8 `
+              -Append
+
       - name: Publish verified draft
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = $env:RELEASE_TAG
-          $releaseText = & gh release view $tag `
-              --repo $env:GITHUB_REPOSITORY `
-              --json isDraft
-          if ($LASTEXITCODE -ne 0) {
-              throw "reading release state failed with exit code $LASTEXITCODE"
-          }
-          $release = $releaseText | ConvertFrom-Json
-          if ($release.isDraft) {
-              & gh release edit $tag `
-                  --repo $env:GITHUB_REPOSITORY `
-                  --draft=false `
-                  --latest
+          $releaseId = '${{ steps.release.outputs.release_id }}'
+          $isDraft = '${{ steps.release.outputs.is_draft }}'
+          if ($isDraft -eq 'true') {
+              & gh api `
+                  --method PATCH `
+                  "repos/$env:GITHUB_REPOSITORY/releases/$releaseId" `
+                  -F draft=false `
+                  -f make_latest=true
               if ($LASTEXITCODE -ne 0) {
                   throw "publishing release failed with exit code $LASTEXITCODE"
               }
+          }
+
+          $publishedText = & gh api `
+              "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
+          if ($LASTEXITCODE -ne 0) {
+              throw "reading published release failed with exit code $LASTEXITCODE"
+          }
+          $published = $publishedText | ConvertFrom-Json
+          if ($published.draft -or $published.tag_name -cne $tag) {
+              throw "release $tag was not published with the expected tag"
           }
 
           "Published release: https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$tag" |
