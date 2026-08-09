@@ -170,10 +170,7 @@ impl TaskIconStore {
 
         let default_small = self.default_small_raw();
         let default_large = self.default_large_raw();
-        let small_index = match replace_owned_icon(self.small, target, small_icon, default_small) {
-            Ok(index) => index,
-            Err(error) => return Err(error),
-        };
+        let small_index = replace_owned_icon(self.small, target, small_icon, default_small)?;
         let large_index = match replace_owned_icon(self.large, target, large_icon, default_large) {
             Ok(index) => index,
             Err(error) => {

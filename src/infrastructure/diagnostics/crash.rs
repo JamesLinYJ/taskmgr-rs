@@ -235,9 +235,7 @@ fn build_crash_path<'a>(
     tid: u32,
     extension: &str,
 ) -> Option<NulTerminatedWide<'a>> {
-    let Some(directory) = CRASH_DIRECTORY.get() else {
-        return None;
-    };
+    let directory = CRASH_DIRECTORY.get()?;
     let mut offset = 0usize;
     if !push_wide(output, &mut offset, directory) {
         return None;

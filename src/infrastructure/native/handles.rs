@@ -121,6 +121,15 @@ impl Drop for OwnedIcon {
     }
 }
 
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.handle.is_null() && self.handle != INVALID_HANDLE_VALUE {
+            // 安全性: `OwnedHandle` exclusively owns this Win32 HANDLE.
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::OwnedIcon;
@@ -129,14 +138,5 @@ mod tests {
     fn owned_icon_can_transfer_between_threads() {
         fn assert_send<T: Send>() {}
         assert_send::<OwnedIcon>();
-    }
-}
-
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        if !self.handle.is_null() && self.handle != INVALID_HANDLE_VALUE {
-            // 安全性: `OwnedHandle` exclusively owns this Win32 HANDLE.
-            unsafe { CloseHandle(self.handle) };
-        }
     }
 }
