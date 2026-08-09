@@ -13,8 +13,13 @@ name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
+    paths:
+      - Cargo.toml
+      - Cargo.lock
   workflow_dispatch:
     inputs:
       tag:
@@ -32,17 +37,99 @@ concurrency:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
-  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 defaults:
   run:
     shell: pwsh
 
 jobs:
-  validate:
-    name: Validate release tag
+  prepare:
+    name: Resolve release tag
     runs-on: windows-2025-vs2026
     timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      should_release: ${{ steps.release.outputs.should_release }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install stable --profile minimal
+          rustup show active-toolchain
+
+      - name: Resolve or create release tag
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $eventName = '${{ github.event_name }}'
+          if ($eventName -eq 'workflow_dispatch') {
+              $tag = '${{ inputs.tag }}'
+              $shouldRelease = 'true'
+          } elseif ($env:GITHUB_REF -like 'refs/tags/*') {
+              $tag = $env:GITHUB_REF_NAME
+              $shouldRelease = 'true'
+          } else {
+              $metadataText = & cargo metadata --locked --no-deps --format-version 1
+              if ($LASTEXITCODE -ne 0) {
+                  throw "cargo metadata failed with exit code $LASTEXITCODE"
+              }
+              $metadata = $metadataText | ConvertFrom-Json
+              $package = @($metadata.packages) |
+                  Where-Object { $_.name -eq 'taskmgr-rs' } |
+                  Select-Object -First 1
+              if ($null -eq $package) {
+                  throw 'cargo metadata did not contain taskmgr-rs'
+              }
+
+              $tag = "v$($package.version)"
+              $PSNativeCommandUseErrorActionPreference = $false
+              & git ls-remote --exit-code --tags origin "refs/tags/$tag" *> $null
+              $tagLookupExitCode = $LASTEXITCODE
+              if ($tagLookupExitCode -eq 0) {
+                  Write-Host "Release tag $tag already exists; nothing to publish for this push."
+                  $shouldRelease = 'false'
+              } elseif ($tagLookupExitCode -eq 2) {
+                  & gh api `
+                      --method POST `
+                      "repos/$env:GITHUB_REPOSITORY/git/refs" `
+                      -f "ref=refs/tags/$tag" `
+                      -f "sha=$env:GITHUB_SHA"
+                  if ($LASTEXITCODE -ne 0) {
+                      throw "creating release tag $tag failed with exit code $LASTEXITCODE"
+                  }
+                  $shouldRelease = 'true'
+              } else {
+                  throw "checking release tag $tag failed with exit code $tagLookupExitCode"
+              }
+          }
+
+          "release_tag=$tag" | Out-File `
+              -FilePath $env:GITHUB_OUTPUT `
+              -Encoding utf8 `
+              -Append
+          "should_release=$shouldRelease" | Out-File `
+              -FilePath $env:GITHUB_OUTPUT `
+              -Encoding utf8 `
+              -Append
+
+  validate:
+    name: Validate release tag
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 10
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
     outputs:
       version: ${{ steps.metadata.outputs.version }}
 
@@ -97,9 +184,13 @@ jobs:
 
   build:
     name: Build (${{ matrix.target }})
-    needs: validate
+    needs:
+      - prepare
+      - validate
     runs-on: windows-2025-vs2026
     timeout-minutes: 30
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -173,10 +264,13 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs:
+      - prepare
       - validate
       - build
     runs-on: windows-2025-vs2026
     timeout-minutes: 15
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
     permissions:
       contents: write
       id-token: write
