@@ -243,9 +243,8 @@ impl TaskIconStore {
         }
 
         unsafe { SetLastError(0) };
-        let small_index = unsafe {
-            ImageList_ReplaceIcon(self.small, -1, self.default_small_raw())
-        };
+        let small_index =
+            unsafe { ImageList_ReplaceIcon(self.small, -1, self.default_small_raw()) };
         if small_index != 0 {
             let error = last_error_or_gen_failure();
             unsafe {
@@ -255,9 +254,8 @@ impl TaskIconStore {
             return Err(error);
         }
         unsafe { SetLastError(0) };
-        let large_index = unsafe {
-            ImageList_ReplaceIcon(self.large, -1, self.default_large_raw())
-        };
+        let large_index =
+            unsafe { ImageList_ReplaceIcon(self.large, -1, self.default_large_raw()) };
         if large_index != 0 {
             let error = last_error_or_gen_failure();
             unsafe {
@@ -566,7 +564,10 @@ fn fetch_window_icons(hwnd: HWND, is_hung: bool) -> (Option<OwnedIcon>, Option<O
         }
     }
 
-    (copy_icon_source(small_source), copy_icon_source(large_source))
+    (
+        copy_icon_source(small_source),
+        copy_icon_source(large_source),
+    )
 }
 
 fn copy_icon_source(source: HICON) -> Option<OwnedIcon> {
@@ -618,9 +619,7 @@ fn replace_owned_icon(
     owned_icon: Option<OwnedIcon>,
     default_icon: HICON,
 ) -> Result<usize, u32> {
-    let source = owned_icon
-        .as_ref()
-        .map_or(default_icon, OwnedIcon::as_raw);
+    let source = owned_icon.as_ref().map_or(default_icon, OwnedIcon::as_raw);
     let index = unsafe { ImageList_ReplaceIcon(imagelist, target, source) };
     if index < 0 {
         Err(last_error_or_gen_failure())

@@ -255,12 +255,7 @@ impl NetworkPageState {
         Self::default()
     }
 
-    pub fn initialize(
-        &mut self,
-        hwnd: HWND,
-        main_hwnd: HWND,
-        hwnd_tabs: HWND,
-    ) -> Result<(), u32> {
+    pub fn initialize(&mut self, hwnd: HWND, main_hwnd: HWND, hwnd_tabs: HWND) -> Result<(), u32> {
         // 初始化只建立控件和基础布局；当前页由激活入口采样，隐藏页由首帧后的预热消息采样。
         self.hwnd = hwnd;
         self.main_hwnd = main_hwnd;
@@ -763,18 +758,15 @@ impl NetworkPageState {
             None => return,
         };
         for completion in drained.completions {
-            crate::infrastructure::diagnostics::with_operation_id(
-                completion.operation_id,
-                || {
-                    match completion.value.result {
-                        Ok(adapters) => {
-                            self.last_refresh_error = None;
-                            self.apply_adapter_snapshot(adapters, completion.value.sampled_at);
-                        }
-                        Err(error) => self.set_refresh_error(error),
+            crate::infrastructure::diagnostics::with_operation_id(completion.operation_id, || {
+                match completion.value.result {
+                    Ok(adapters) => {
+                        self.last_refresh_error = None;
+                        self.apply_adapter_snapshot(adapters, completion.value.sampled_at);
                     }
-                },
-            );
+                    Err(error) => self.set_refresh_error(error),
+                }
+            });
         }
         if let Some(error) = drained.error {
             self.set_refresh_error(error);
@@ -792,11 +784,7 @@ impl NetworkPageState {
         self.drain_worker_results();
     }
 
-    fn apply_adapter_snapshot(
-        &mut self,
-        raw_adapters: Vec<RawAdapterEntry>,
-        sampled_at: Instant,
-    ) {
+    fn apply_adapter_snapshot(&mut self, raw_adapters: Vec<RawAdapterEntry>, sampled_at: Instant) {
         // UI 提交阶段把完整原始快照转换为列表文本和历史曲线；过程中没有系统查询。
         let raw_adapters = collapse_raw_adapters(raw_adapters);
         let needs_initial_layout = self.last_sample_time.is_none();
@@ -875,25 +863,13 @@ impl NetworkPageState {
             // reset; the textual value remains "-" so it is not presented as measured idle.
             let total_delta = counter_delta.map_or(0, |delta| delta.2);
             let sent_util = counter_delta.map_or(0, |delta| {
-                utilization_percent_for_history(
-                    delta.0,
-                    raw_adapter.link_speed_bps,
-                    elapsed_secs,
-                )
+                utilization_percent_for_history(delta.0, raw_adapter.link_speed_bps, elapsed_secs)
             });
             let received_util = counter_delta.map_or(0, |delta| {
-                utilization_percent_for_history(
-                    delta.1,
-                    raw_adapter.link_speed_bps,
-                    elapsed_secs,
-                )
+                utilization_percent_for_history(delta.1, raw_adapter.link_speed_bps, elapsed_secs)
             });
             let total_util = counter_delta.map_or(0, |delta| {
-                utilization_percent_for_history(
-                    delta.2,
-                    raw_adapter.link_speed_bps,
-                    elapsed_secs,
-                )
+                utilization_percent_for_history(delta.2, raw_adapter.link_speed_bps, elapsed_secs)
             });
 
             push_history(&mut sent_history, sent_util);
@@ -975,8 +951,11 @@ impl NetworkPageState {
             if name.is_empty() {
                 name = wide_array_to_string(&row.Description);
             }
+            // SAFETY: the live row comes from a successfully initialized MIB_IF_TABLE2; Win32
+            // initializes InterfaceLuid, and reading its Value view does not outlive the owner.
+            let luid = unsafe { row.InterfaceLuid.Value };
             let key = AdapterIdentity {
-                luid: row.InterfaceLuid.Value,
+                luid,
                 interface_index: row.InterfaceIndex,
             };
 

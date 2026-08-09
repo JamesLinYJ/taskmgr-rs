@@ -62,21 +62,21 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DestroyAcceleratorTable, DestroyWindow, DispatchMessageW, DrawMenuBar, EnableMenuItem,
     GWL_STYLE, GetClassInfoW, GetClientRect, GetCursorPos, GetDlgItem, GetForegroundWindow,
     GetMenu, GetMenuItemInfoW, GetMessageW, GetShellWindow, GetWindowLongW, GetWindowPlacement,
-    GetWindowRect, HACCEL, HICON, HMENU, HTCAPTION, HTCLIENT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
-    IDCANCEL, IsDialogMessageW, IsIconic, IsWindowVisible, IsZoomed,
-    KillTimer, LR_DEFAULTCOLOR, LR_DEFAULTSIZE, MB_ICONSTOP, MB_OK, MENUITEMINFOW, MF_BYCOMMAND,
-    MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_SYSMENU, MF_UNCHECKED, MIIM_ID,
-    MINMAXINFO, MSG, MessageBoxW, OpenIcon, PostMessageW, PostQuitMessage, RegisterClassW,
-    SIZE_MINIMIZED, SW_HIDE, SW_MINIMIZE, SW_SHOW, SW_SHOWMAXIMIZED, SW_SHOWMINNOACTIVE,
-    SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREDRAW,
-    SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetMenu, SetMenuDefaultItem,
-    SetTimer, SetWindowLongW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD,
-    TrackPopupMenuEx, TranslateAcceleratorW, TranslateMessage, WINDOWPLACEMENT, WM_CLOSE,
-    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO,
-    WM_INITDIALOG, WM_INITMENU, WM_LBUTTONDBLCLK, WM_MENUSELECT, WM_MOVE, WM_NCHITTEST,
-    WM_NCLBUTTONDBLCLK, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETICON, WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS,
-    WS_DLGFRAME, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_TILEDWINDOW, WS_VISIBLE,
+    GetWindowRect, HACCEL, HICON, HMENU, HTCAPTION, HTCLIENT, HWND_NOTOPMOST, HWND_TOP,
+    HWND_TOPMOST, IDCANCEL, IsDialogMessageW, IsIconic, IsWindowVisible, IsZoomed, KillTimer,
+    LR_DEFAULTCOLOR, LR_DEFAULTSIZE, MB_ICONSTOP, MB_OK, MENUITEMINFOW, MF_BYCOMMAND, MF_CHECKED,
+    MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_SYSMENU, MF_UNCHECKED, MIIM_ID, MINMAXINFO,
+    MSG, MessageBoxW, OpenIcon, PostMessageW, PostQuitMessage, RegisterClassW, SIZE_MINIMIZED,
+    SW_HIDE, SW_MINIMIZE, SW_SHOW, SW_SHOWMAXIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE,
+    SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREDRAW, SWP_NOSIZE,
+    SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetMenu, SetMenuDefaultItem, SetTimer,
+    SetWindowLongW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TrackPopupMenuEx,
+    TranslateAcceleratorW, TranslateMessage, WINDOWPLACEMENT, WM_CLOSE, WM_COMMAND, WM_CREATE,
+    WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITDIALOG, WM_INITMENU,
+    WM_LBUTTONDBLCLK, WM_MENUSELECT, WM_MOVE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCRBUTTONDOWN,
+    WM_NCRBUTTONUP, WM_NOTIFY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETICON, WM_SETREDRAW, WM_SIZE,
+    WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_DLGFRAME, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_TILEDWINDOW, WS_VISIBLE,
 };
 
 use self::controllers::{
@@ -1919,12 +1919,7 @@ impl App {
             let body = to_wide_null(&body);
             // Safety: the owner HWND is live and both UTF-16 buffers remain valid for the call.
             unsafe {
-                MessageBoxW(
-                    hwnd,
-                    body.as_ptr(),
-                    title.as_ptr(),
-                    MB_OK | MB_ICONSTOP,
-                );
+                MessageBoxW(hwnd, body.as_ptr(), title.as_ptr(), MB_OK | MB_ICONSTOP);
             }
         }
     }
@@ -2722,9 +2717,8 @@ unsafe extern "system" fn main_window_proc(
 mod tests {
     use super::page_registry::PageId;
     use super::{
-        active_page_id, active_page_uses_normal_minimum, clamped_window_size, is_active_page,
-        ShellExecuteFailure, help_documentation_url, page_uses_normal_minimum,
-        shell_execute_failure,
+        ShellExecuteFailure, active_page_id, active_page_uses_normal_minimum, clamped_window_size,
+        help_documentation_url, is_active_page, page_uses_normal_minimum, shell_execute_failure,
     };
 
     #[test]

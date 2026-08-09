@@ -544,11 +544,7 @@ unsafe fn collect_process_entries(
             let memory_handle = if pid == 0 {
                 None
             } else {
-                let raw_handle = OpenProcess(
-                    PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                    0,
-                    pid,
-                );
+                let raw_handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
                 // 安全性: a successful OpenProcess call returns one owned kernel handle whose
                 // release function is CloseHandle.
                 OwnedHandle::from_raw(raw_handle)

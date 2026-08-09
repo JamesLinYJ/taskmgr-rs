@@ -173,9 +173,7 @@ impl CpuSetTopology {
     }
 }
 
-pub(crate) fn query_process_default_cpu_sets(
-    process: HANDLE,
-) -> Result<Vec<u32>, CpuSetError> {
+pub(crate) fn query_process_default_cpu_sets(process: HANDLE) -> Result<Vec<u32>, CpuSetError> {
     let mut required = 0u32;
     // SAFETY: the null buffer is paired with a zero capacity and `required` is a valid output.
     let size_result = unsafe { GetProcessDefaultCpuSets(process, null_mut(), 0, &mut required) };

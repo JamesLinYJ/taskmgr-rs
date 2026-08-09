@@ -22,8 +22,8 @@ use std::ptr::{null, null_mut};
 
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_GEN_FAILURE, FALSE, GetLastError, HANDLE, HWND,
-    LocalFree, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_ALREADY_EXISTS, ERROR_GEN_FAILURE, FALSE, GetLastError, HANDLE, HWND, LocalFree,
+    WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -411,8 +411,7 @@ impl OwnedSid {
             }
         }
         // Safety: the discovered range precedes the terminating NUL.
-        let output =
-            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(value, length) });
+        let output = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(value, length) });
         // Safety: ConvertSidToStringSidW transfers a LocalAlloc allocation to the caller.
         unsafe {
             LocalFree(value.cast());
@@ -496,7 +495,7 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::thread;
-    use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED};
     use windows_sys::Win32::System::Threading::ReleaseMutex;
 
     fn identity() -> ProcessIdentity {
@@ -564,8 +563,7 @@ mod tests {
         let user = token_information(token.as_raw(), TokenUser).expect("user should be queryable");
         let user_sid = unsafe { (*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
         // Safety: the SID is backed by the live TOKEN_USER buffer for this copy.
-        let user_sid = unsafe { OwnedSid::copy_from_raw(user_sid) }
-            .expect("user SID should copy");
+        let user_sid = unsafe { OwnedSid::copy_from_raw(user_sid) }.expect("user SID should copy");
         let integrity = token_information(token.as_raw(), TokenIntegrityLevel)
             .expect("integrity should be queryable");
         let integrity_sid = unsafe {
@@ -574,8 +572,8 @@ mod tests {
                 .Sid
         };
         // Safety: the SID is backed by the live TOKEN_MANDATORY_LABEL buffer for this copy.
-        let integrity_sid = unsafe { OwnedSid::copy_from_raw(integrity_sid) }
-            .expect("integrity SID should copy");
+        let integrity_sid =
+            unsafe { OwnedSid::copy_from_raw(integrity_sid) }.expect("integrity SID should copy");
         integrity_sid
             .last_subauthority()
             .expect("integrity SID should be valid");

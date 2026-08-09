@@ -418,11 +418,7 @@ impl ProcessPageState {
     }
 
     // 通过 SetPriorityClass 修改进程优先级类。先弹确认框，操作成功后刷新列表。
-    pub(super) fn set_priority(
-        &mut self,
-        identity: ProcIdentity,
-        priority: ProcPriority,
-    ) -> bool {
+    pub(super) fn set_priority(&mut self, identity: ProcIdentity, priority: ProcPriority) -> bool {
         let priority_class = match priority {
             ProcPriority::Low => IDLE_PRIORITY_CLASS,
             ProcPriority::BelowNormal => BELOW_NORMAL_PRIORITY_CLASS,
@@ -1025,9 +1021,8 @@ pub(super) fn load_debugger_path() -> Result<Option<String>, u32> {
     let key_name = to_wide_null("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug");
     let value_name = to_wide_null("Debugger");
     // SAFETY: both input strings are terminated and `key` is a valid output location.
-    let open_status = unsafe {
-        RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_name.as_ptr(), 0, KEY_READ, &mut key)
-    };
+    let open_status =
+        unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_name.as_ptr(), 0, KEY_READ, &mut key) };
     if open_status != 0 {
         return if open_status == ERROR_FILE_NOT_FOUND || open_status == ERROR_PATH_NOT_FOUND {
             Ok(None)
@@ -1063,12 +1058,7 @@ pub(super) fn load_debugger_path() -> Result<Option<String>, u32> {
         };
     }
 
-    let mut buffer = vec![
-        0u16;
-        (value_size as usize)
-            .div_ceil(size_of::<u16>())
-            .max(2)
-    ];
+    let mut buffer = vec![0u16; (value_size as usize).div_ceil(size_of::<u16>()).max(2)];
     let mut value_type = 0u32;
     // SAFETY: `buffer` is writable for the byte count returned by the size query and all output
     // pointers reference live local variables.
@@ -1464,8 +1454,8 @@ fn query_windows_directory() -> Result<String, u32> {
     let mut buffer = vec![0u16; 260];
     loop {
         // SAFETY: `buffer` is writable for the advertised number of UTF-16 code units.
-        let length = unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) }
-            as usize;
+        let length =
+            unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
         if length == 0 {
             return Err(unsafe { GetLastError() });
         }

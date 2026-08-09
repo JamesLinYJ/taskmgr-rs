@@ -589,7 +589,10 @@ mod tests {
     fn callback_text_is_nul_terminated_and_leaves_unused_tail_untouched() {
         let mut buffer = [0xAAAA; 8];
         copy_text_to_utf16_buffer(&mut buffer, "Task");
-        assert_eq!(&buffer[..5], &[b'T' as u16, b'a' as u16, b's' as u16, b'k' as u16, 0]);
+        assert_eq!(
+            &buffer[..5],
+            &[b'T' as u16, b'a' as u16, b's' as u16, b'k' as u16, 0]
+        );
         assert_eq!(&buffer[5..], &[0xAAAA; 3]);
     }
 

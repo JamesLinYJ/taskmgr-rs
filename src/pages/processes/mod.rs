@@ -748,30 +748,28 @@ impl ProcessPageState {
 
     // 从进程页跳转到指定 PID 的行并高亮选中。由任务页的“转到进程”命令触发。
     pub fn find_process(&mut self, identity: ProcIdentity) -> bool {
-        unsafe {
-            if !identity.is_verified() {
-                return false;
-            }
-            let Some(index) = self
-                .entries
-                .iter()
-                .position(|entry| entry.identity == identity)
-            else {
-                self.pending_find_identity = Some(identity);
-                self.refresh_processes();
-                return true;
-            };
-
-            self.selected_identity = Some(self.entries[index].identity);
-            let list_hwnd = self.list_hwnd();
-            self.set_list_selection(
-                list_hwnd,
-                Some(index),
-                SelectionScrollPolicy::RevealSelection,
-            );
-            self.update_ui_state();
-            true
+        if !identity.is_verified() {
+            return false;
         }
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.identity == identity)
+        else {
+            self.pending_find_identity = Some(identity);
+            self.refresh_processes();
+            return true;
+        };
+
+        self.selected_identity = Some(self.entries[index].identity);
+        let list_hwnd = self.list_hwnd();
+        self.set_list_selection(
+            list_hwnd,
+            Some(index),
+            SelectionScrollPolicy::RevealSelection,
+        );
+        self.update_ui_state();
+        true
     }
 
     fn list_hwnd(&self) -> HWND {
@@ -841,10 +839,9 @@ impl ProcessPageState {
             None => return,
         };
         for completion in drain.completions {
-            crate::infrastructure::diagnostics::with_operation_id(
-                completion.operation_id,
-                || self.apply_worker_completion(completion.value),
-            );
+            crate::infrastructure::diagnostics::with_operation_id(completion.operation_id, || {
+                self.apply_worker_completion(completion.value)
+            });
         }
         if let Some(error) = drain.error {
             self.set_refresh_error(error);
@@ -1792,9 +1789,7 @@ mod tests {
             ..ProcessPageState::default()
         };
 
-        unsafe {
-            state.apply_worker_completion(Err(5));
-        }
+        state.apply_worker_completion(Err(5));
 
         assert_eq!(state.entries.len(), 1);
         assert_eq!(state.entries[0].image_name, "trusted.exe");
