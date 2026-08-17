@@ -53,25 +53,25 @@ jobs:
               -New "name = `"taskmgr-rs`"`nversion = `"0.2.6`""
 
           $oldEnglish = @'
-To publish a version, first update `Cargo.toml` and `Cargo.lock`, merge the change, then push the
-matching tag such as `v0.2.5`. The Release workflow rejects a tag that does not exactly match the
-Cargo package version. It builds all three architectures in parallel, verifies the PE machine and
-'@
+          To publish a version, first update `Cargo.toml` and `Cargo.lock`, merge the change, then push the
+          matching tag such as `v0.2.5`. The Release workflow rejects a tag that does not exactly match the
+          Cargo package version. It builds all three architectures in parallel, verifies the PE machine and
+          '@
           $newEnglish = @'
-To publish a version, update `Cargo.toml` and `Cargo.lock` together and merge the change to `main`.
-The Release workflow reads the package version and automatically creates the matching tag (for
-example `v0.2.6`) when it does not exist. It builds all three architectures in parallel, verifies the PE machine and
-'@
+          To publish a version, update `Cargo.toml` and `Cargo.lock` together and merge the change to `main`.
+          The Release workflow reads the package version and automatically creates the matching tag (for
+          example `v0.2.6`) when it does not exist. It builds all three architectures in parallel, verifies the PE machine and
+          '@
           Replace-ExactlyOnce -Path 'README.md' -Old $oldEnglish.TrimEnd("`r", "`n") -New $newEnglish.TrimEnd("`r", "`n")
 
           $oldChinese = @'
-发布版本时，先同步修改 `Cargo.toml` 与 `Cargo.lock` 并合入主线，再推送与版本完全一致的 tag，
-例如 `v0.2.5`。Release 工作流会拒绝与 Cargo 包版本不一致的 tag，并行构建三种架构，核对 PE
-'@
+          发布版本时，先同步修改 `Cargo.toml` 与 `Cargo.lock` 并合入主线，再推送与版本完全一致的 tag，
+          例如 `v0.2.5`。Release 工作流会拒绝与 Cargo 包版本不一致的 tag，并行构建三种架构，核对 PE
+          '@
           $newChinese = @'
-发布版本时，只需同步修改 `Cargo.toml` 与 `Cargo.lock` 并合入 `main`。Release 工作流会读取包
-版本；如果对应 tag（例如 `v0.2.6`）尚不存在，就自动创建 tag，并行构建三种架构，核对 PE
-'@
+          发布版本时，只需同步修改 `Cargo.toml` 与 `Cargo.lock` 并合入 `main`。Release 工作流会读取包
+          版本；如果对应 tag（例如 `v0.2.6`）尚不存在，就自动创建 tag，并行构建三种架构，核对 PE
+          '@
           Replace-ExactlyOnce -Path 'README.zh-CN.md' -Old $oldChinese.TrimEnd("`r", "`n") -New $newChinese.TrimEnd("`r", "`n")
 
           Remove-Item -LiteralPath '.github/workflows/agent-prepare-v0.2.6.yml'
@@ -80,6 +80,9 @@ example `v0.2.6`) when it does not exist. It builds all three architectures in p
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock README.md README.zh-CN.md .github/workflows/agent-prepare-v0.2.6.yml
           git diff --cached --check
-          git diff --cached --exit-code --quiet && throw 'release preparation produced no changes'
+          git diff --cached --exit-code --quiet
+          if ($LASTEXITCODE -eq 0) {
+              throw 'release preparation produced no changes'
+          }
           git commit -m "Prepare v0.2.6 automatic release"
           git push origin "HEAD:$env:GITHUB_REF_NAME"
