@@ -12,16 +12,18 @@
 //! Every target process is reopened through `ProcIdentity` immediately before use.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
     ERROR_BUSY, ERROR_FILE_NOT_FOUND, ERROR_GEN_FAILURE, ERROR_INSUFFICIENT_BUFFER,
-    ERROR_INVALID_DATA, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES,
-    ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND, FILETIME, GetLastError, HANDLE, HWND, LPARAM,
-    WAIT_OBJECT_0, WPARAM,
+    ERROR_INVALID_DATA, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA,
+    ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND, FILETIME, GetLastError, HANDLE,
+    HWND, LPARAM, WAIT_OBJECT_0, WPARAM,
 };
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -29,22 +31,27 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_EXPAND_SZ, REG_SZ, RegCloseKey, RegOpenKeyExW,
-    RegQueryValueExW,
+    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY, REG_EXPAND_SZ, REG_SZ,
+    RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
 };
 use windows_sys::Win32::System::SystemInformation::{
-    GROUP_AFFINITY, GetSystemTimeAsFileTime, GetWindowsDirectoryW,
+    GROUP_AFFINITY, GetSystemTimeAsFileTime, GetWindowsDirectoryW, IMAGE_FILE_MACHINE_AMD64,
+    IMAGE_FILE_MACHINE_ARM, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_ARMNT,
+    IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_IA64, IMAGE_FILE_MACHINE_THUMB,
+    IMAGE_FILE_MACHINE_UNKNOWN,
 };
 use windows_sys::Win32::System::Threading::{
-    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, CreateProcessW,
+    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, CREATE_NEW_CONSOLE, CreateEventW,
+    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
     GetProcessAffinityMask, GetProcessGroupAffinity, GetProcessIdOfThread, GetThreadGroupAffinity,
-    HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, OpenThread,
-    PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SET_INFORMATION, PROCESS_SET_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    QueryFullProcessImageNameW, REALTIME_PRIORITY_CLASS, STARTUPINFOW, SetPriorityClass,
-    SetProcessAffinityMask, SetProcessDefaultCpuSets, SetThreadGroupAffinity,
-    THREAD_QUERY_LIMITED_INFORMATION, THREAD_SET_INFORMATION, TerminateProcess,
-    WaitForSingleObject,
+    HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, InitializeProcThreadAttributeList, IsWow64Process2,
+    LPPROC_THREAD_ATTRIBUTE_LIST, NORMAL_PRIORITY_CLASS, OpenThread,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SET_LIMITED_INFORMATION,
+    PROCESS_TERMINATE, QueryFullProcessImageNameW, REALTIME_PRIORITY_CLASS, STARTUPINFOEXW,
+    STARTUPINFOW, SetPriorityClass, SetProcessAffinityMask, SetProcessDefaultCpuSets,
+    SetThreadGroupAffinity, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SET_INFORMATION,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Controls::{
     BST_CHECKED, BST_UNCHECKED, CheckDlgButton, IsDlgButtonChecked,
@@ -277,17 +284,9 @@ impl ProcessPageState {
         outcome.completed_without_failure()
     }
 
-    // 以 AeDebug 注册表配置的调试器启动并附加到目标进程。命令行传 -p <pid>。
+    // 使用目标进程位数对应的 AeDebug 命令模板启动调试器。完整模板中的第一个
+    // `%ld` 接收 PID，第二个接收唯一继承给调试器的 ready-event 句柄。
     pub(super) fn attach_debugger(&mut self, identity: ProcIdentity) -> bool {
-        let Some(debugger_path) = self.debugger_path.as_ref() else {
-            let error = match self.debugger_error {
-                Some(error) => error,
-                None => ERROR_FILE_NOT_FOUND,
-            };
-            self.show_failure_message(&self.strings.cant_debug, error);
-            return false;
-        };
-
         if !self.quick_confirm(&self.strings.warning, &self.strings.debug) {
             return false;
         }
@@ -300,34 +299,88 @@ impl ProcessPageState {
                     return false;
                 }
             };
+        let registry_view = match debugger_registry_view_for_process(target_handle.as_raw()) {
+            Ok(view) => view,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_debug, error);
+                return false;
+            }
+        };
+        let debugger = match load_debugger_command(registry_view) {
+            Ok(Some(debugger)) => debugger,
+            Ok(None) => {
+                self.show_failure_message(&self.strings.cant_debug, ERROR_FILE_NOT_FOUND);
+                return false;
+            }
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_debug, error);
+                return false;
+            }
+        };
+        if !Path::new(&debugger.executable).is_file() {
+            self.show_failure_message(&self.strings.cant_debug, ERROR_FILE_NOT_FOUND);
+            return false;
+        }
 
-        let pid = identity.pid;
-        let command_line = format!("{} -p {pid}", quote_command_line_arg(debugger_path));
+        let security = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: null_mut(),
+            bInheritHandle: 1,
+        };
+        // SAFETY: `security` remains live for the synchronous call and requests one unnamed,
+        // nonsignaled event whose returned handle is adopted immediately.
+        let raw_event = unsafe { CreateEventW(&security, 0, 0, null()) };
+        let Some(debugger_ready_event) = (unsafe { OwnedHandle::from_raw(raw_event) }) else {
+            self.show_failure_message(&self.strings.cant_debug, nonzero_last_error());
+            return false;
+        };
+        let command_line = match format_debugger_template(
+            &debugger.template,
+            identity.pid,
+            debugger_ready_event.as_raw() as usize,
+        ) {
+            Ok(command_line) => command_line,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_debug, error);
+                return false;
+            }
+        };
+        let attributes = match ProcThreadAttributeList::for_handle(debugger_ready_event.as_raw()) {
+            Ok(attributes) => attributes,
+            Err(error) => {
+                self.show_failure_message(&self.strings.cant_debug, error);
+                return false;
+            }
+        };
+
         let mut command_line_wide = to_wide_null(&command_line);
-        let application_name = to_wide_null(debugger_path);
-        let startup_info = STARTUPINFOW {
-            cb: size_of::<STARTUPINFOW>() as u32,
-            ..unsafe { zeroed() }
+        let application_name = to_wide_null(&debugger.executable);
+        let startup_info = STARTUPINFOEXW {
+            StartupInfo: STARTUPINFOW {
+                cb: size_of::<STARTUPINFOEXW>() as u32,
+                ..unsafe { zeroed() }
+            },
+            lpAttributeList: attributes.as_ptr(),
         };
         let mut process_info = unsafe { zeroed::<PROCESS_INFORMATION>() };
 
-        // SAFETY: the terminated application name, mutable command line, and initialized
-        // input/output structs all remain live for this synchronous call.
+        // SAFETY: the application/command buffers and extended startup information remain live
+        // for the call. bInheritHandles is required by PROC_THREAD_ATTRIBUTE_HANDLE_LIST, which
+        // restricts inheritance to the one event in `attributes`.
         let created = unsafe {
             CreateProcessW(
                 application_name.as_ptr(),
                 command_line_wide.as_mut_ptr(),
                 null_mut(),
                 null_mut(),
-                0,
-                windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE,
+                1,
+                CREATE_NEW_CONSOLE | EXTENDED_STARTUPINFO_PRESENT,
                 null(),
                 null(),
-                &startup_info,
+                &startup_info.StartupInfo,
                 &mut process_info,
             )
         };
-        // Capture last-error before dropping `target_handle`, whose destructor may change it.
         let create_error = if created == 0 {
             unsafe { GetLastError() }
         } else {
@@ -336,11 +389,18 @@ impl ProcessPageState {
         drop(target_handle);
 
         if created == 0 {
-            self.show_failure_message(&self.strings.cant_debug, create_error);
+            self.show_failure_message(
+                &self.strings.cant_debug,
+                if create_error == 0 {
+                    ERROR_GEN_FAILURE
+                } else {
+                    create_error
+                },
+            );
             false
         } else {
-            // SAFETY: this branch is reached only after CreateProcessW succeeded, which returned
-            // two fresh handles whose ownership is transferred here.
+            // SAFETY: successful CreateProcessW returned two fresh handles and this is their only
+            // ownership transfer. The child owns its inherited copy of the ready event.
             match unsafe { own_created_process_handles(process_info) } {
                 Ok(_) => true,
                 Err(error) => {
@@ -1014,86 +1074,259 @@ pub(super) fn affinity_cpu_mask(cpu_index: i32) -> usize {
         .unwrap_or(0)
 }
 
-pub(super) fn load_debugger_path() -> Result<Option<String>, u32> {
-    // 进程页的“调试”命令依赖 AeDebug 注册表配置。
-    // 这里只提取真正的可执行文件路径，过滤掉旧式 drwtsn32 之类的无效值。
-    let mut key: HKEY = null_mut();
-    let key_name = to_wide_null("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug");
-    let value_name = to_wide_null("Debugger");
-    // SAFETY: both input strings are terminated and `key` is a valid output location.
-    let open_status =
-        unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_name.as_ptr(), 0, KEY_READ, &mut key) };
-    if open_status != 0 {
-        return if open_status == ERROR_FILE_NOT_FOUND || open_status == ERROR_PATH_NOT_FOUND {
-            Ok(None)
-        } else {
-            Err(open_status)
-        };
-    }
+const AEDEBUG_KEY: &str = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug";
+const AEDEBUG_VALUE: &str = "Debugger";
+const MAX_DEBUGGER_COMMAND_BYTES: u32 = 1024 * 1024;
 
-    let mut value_size = 0u32;
-    // SAFETY: `key` was opened successfully; this size query uses no data buffer and writes only
-    // to `value_size`.
-    let size_status = unsafe {
-        RegQueryValueExW(
-            key,
-            value_name.as_ptr(),
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            &mut value_size,
-        )
-    };
-    if size_status != 0 || value_size < 2 {
-        let close_status = unsafe { RegCloseKey(key) };
-        if close_status != 0 {
-            return Err(close_status);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DebuggerRegistryView {
+    Native,
+    Registry32,
+    Registry64,
+}
+
+impl DebuggerRegistryView {
+    const fn access_mask(self) -> u32 {
+        match self {
+            Self::Native => 0,
+            Self::Registry32 => KEY_WOW64_32KEY,
+            Self::Registry64 => KEY_WOW64_64KEY,
         }
-        return if size_status == ERROR_FILE_NOT_FOUND {
-            Ok(None)
-        } else if size_status != 0 {
-            Err(size_status)
-        } else {
-            Err(ERROR_INVALID_DATA)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DebuggerCommand {
+    template: String,
+    executable: String,
+}
+
+struct ProcThreadAttributeList {
+    storage: Vec<usize>,
+    handles: Box<[HANDLE; 1]>,
+    initialized: bool,
+}
+
+impl ProcThreadAttributeList {
+    fn for_handle(handle: HANDLE) -> Result<Self, u32> {
+        if handle.is_null() {
+            return Err(ERROR_INVALID_HANDLE);
+        }
+
+        let mut byte_count = 0usize;
+        unsafe {
+            InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut byte_count);
+        }
+        if byte_count == 0 {
+            return Err(nonzero_last_error());
+        }
+
+        let word_count = byte_count.div_ceil(size_of::<usize>());
+        let mut value = Self {
+            storage: vec![0usize; word_count],
+            handles: Box::new([handle]),
+            initialized: false,
         };
+        if unsafe { InitializeProcThreadAttributeList(value.as_ptr(), 1, 0, &mut byte_count) } == 0
+        {
+            return Err(nonzero_last_error());
+        }
+        value.initialized = true;
+        if unsafe {
+            UpdateProcThreadAttribute(
+                value.as_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                value.handles.as_mut_ptr().cast::<c_void>(),
+                size_of::<HANDLE>(),
+                null_mut(),
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(nonzero_last_error());
+        }
+        Ok(value)
     }
 
-    let mut buffer = vec![0u16; (value_size as usize).div_ceil(size_of::<u16>()).max(2)];
-    let mut value_type = 0u32;
-    // SAFETY: `buffer` is writable for the byte count returned by the size query and all output
-    // pointers reference live local variables.
-    let status = unsafe {
-        RegQueryValueExW(
+    fn as_ptr(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        self.storage.as_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST
+    }
+}
+
+impl Drop for ProcThreadAttributeList {
+    fn drop(&mut self) {
+        if self.initialized {
+            unsafe { DeleteProcThreadAttributeList(self.as_ptr()) };
+        }
+    }
+}
+
+pub(super) fn load_debugger_path() -> Result<Option<String>, u32> {
+    // This is an availability probe for menu state. Launch-time selection is repeated against
+    // the selected process' machine type so the command can never use the wrong registry view.
+    let mut first_error = None;
+    for view in [
+        DebuggerRegistryView::Native,
+        DebuggerRegistryView::Registry64,
+        DebuggerRegistryView::Registry32,
+    ] {
+        match load_debugger_command(view) {
+            Ok(Some(command)) if Path::new(&command.executable).is_file() => {
+                return Ok(Some(command.executable));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(None)
+    }
+}
+
+fn load_debugger_command(view: DebuggerRegistryView) -> Result<Option<DebuggerCommand>, u32> {
+    let Some((raw_command, value_type)) = read_aedebug_string(view)? else {
+        return Ok(None);
+    };
+    parse_debugger_command(&raw_command, value_type)
+}
+
+fn read_aedebug_string(view: DebuggerRegistryView) -> Result<Option<(String, u32)>, u32> {
+    unsafe {
+        let key_name = to_wide_null(AEDEBUG_KEY);
+        let value_name = to_wide_null(AEDEBUG_VALUE);
+        let mut key: HKEY = null_mut();
+        let open_status = RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            key_name.as_ptr(),
+            0,
+            KEY_READ | view.access_mask(),
+            &mut key,
+        );
+        if open_status == ERROR_FILE_NOT_FOUND || open_status == ERROR_PATH_NOT_FOUND {
+            return Ok(None);
+        }
+        if open_status != 0 {
+            return Err(open_status);
+        }
+
+        let mut value_type = 0u32;
+        let mut value_size = 0u32;
+        let size_status = RegQueryValueExW(
             key,
             value_name.as_ptr(),
             null_mut(),
             &mut value_type,
-            buffer.as_mut_ptr() as *mut u8,
+            null_mut(),
             &mut value_size,
-        )
-    };
-    let close_status = unsafe { RegCloseKey(key) };
-    if close_status != 0 {
-        return Err(close_status);
-    }
+        );
+        if size_status == ERROR_FILE_NOT_FOUND {
+            let close_status = RegCloseKey(key);
+            return if close_status == 0 {
+                Ok(None)
+            } else {
+                Err(close_status)
+            };
+        }
+        if size_status != 0 {
+            RegCloseKey(key);
+            return Err(size_status);
+        }
+        if !matches!(value_type, REG_SZ | REG_EXPAND_SZ)
+            || value_size < size_of::<u16>() as u32
+            || !value_size.is_multiple_of(size_of::<u16>() as u32)
+            || value_size > MAX_DEBUGGER_COMMAND_BYTES
+        {
+            RegCloseKey(key);
+            return Err(ERROR_INVALID_DATA);
+        }
 
-    if status != 0 || value_size < 2 || !(value_type == REG_SZ || value_type == REG_EXPAND_SZ) {
-        return Err(if status != 0 {
-            status
-        } else {
-            ERROR_INVALID_DATA
-        });
+        let mut buffer = vec![0u16; value_size as usize / size_of::<u16>()];
+        let mut actual_size = value_size;
+        let read_status = RegQueryValueExW(
+            key,
+            value_name.as_ptr(),
+            null_mut(),
+            &mut value_type,
+            buffer.as_mut_ptr().cast::<u8>(),
+            &mut actual_size,
+        );
+        let close_status = RegCloseKey(key);
+        if read_status == ERROR_MORE_DATA {
+            return Err(ERROR_MORE_DATA);
+        }
+        if read_status != 0 {
+            return Err(read_status);
+        }
+        if close_status != 0 {
+            return Err(close_status);
+        }
+        if !matches!(value_type, REG_SZ | REG_EXPAND_SZ)
+            || actual_size < size_of::<u16>() as u32
+            || !actual_size.is_multiple_of(size_of::<u16>() as u32)
+            || actual_size > value_size
+        {
+            return Err(ERROR_INVALID_DATA);
+        }
+        let units = actual_size as usize / size_of::<u16>();
+        let Some(length) = buffer[..units].iter().position(|value| *value == 0) else {
+            return Err(ERROR_INVALID_DATA);
+        };
+        Ok(Some((
+            String::from_utf16(&buffer[..length]).map_err(|_| ERROR_INVALID_DATA)?,
+            value_type,
+        )))
     }
+}
 
-    let length = buffer
-        .iter()
-        .position(|value| *value == 0)
-        .unwrap_or(buffer.len());
-    let raw_command = String::from_utf16_lossy(&buffer[..length]);
-    let Some(executable) = normalize_debugger_command(&raw_command, value_type)? else {
-        return Ok(None);
+fn debugger_registry_view_for_process(process: HANDLE) -> Result<DebuggerRegistryView, u32> {
+    if process.is_null() {
+        return Err(ERROR_INVALID_HANDLE);
+    }
+    let mut process_machine = IMAGE_FILE_MACHINE_UNKNOWN;
+    let mut native_machine = IMAGE_FILE_MACHINE_UNKNOWN;
+    if unsafe { IsWow64Process2(process, &mut process_machine, &mut native_machine) } == 0 {
+        return Err(nonzero_last_error());
+    }
+    debugger_registry_view_for_machines(process_machine, native_machine)
+}
+
+fn debugger_registry_view_for_machines(
+    process_machine: u16,
+    native_machine: u16,
+) -> Result<DebuggerRegistryView, u32> {
+    let effective_machine = if process_machine == IMAGE_FILE_MACHINE_UNKNOWN {
+        native_machine
+    } else {
+        process_machine
     };
-    Ok(Path::new(&executable).is_file().then_some(executable))
+    let target_is_32_bit = match effective_machine {
+        IMAGE_FILE_MACHINE_I386
+        | IMAGE_FILE_MACHINE_ARM
+        | IMAGE_FILE_MACHINE_ARMNT
+        | IMAGE_FILE_MACHINE_THUMB => true,
+        IMAGE_FILE_MACHINE_AMD64 | IMAGE_FILE_MACHINE_ARM64 | IMAGE_FILE_MACHINE_IA64 => false,
+        _ => return Err(ERROR_NOT_SUPPORTED),
+    };
+    let native_is_64_bit = match native_machine {
+        IMAGE_FILE_MACHINE_AMD64 | IMAGE_FILE_MACHINE_ARM64 | IMAGE_FILE_MACHINE_IA64 => true,
+        IMAGE_FILE_MACHINE_I386
+        | IMAGE_FILE_MACHINE_ARM
+        | IMAGE_FILE_MACHINE_ARMNT
+        | IMAGE_FILE_MACHINE_THUMB => false,
+        _ => return Err(ERROR_NOT_SUPPORTED),
+    };
+    Ok(if !native_is_64_bit {
+        DebuggerRegistryView::Native
+    } else if target_is_32_bit {
+        DebuggerRegistryView::Registry32
+    } else {
+        DebuggerRegistryView::Registry64
+    })
 }
 
 // 引用命令行参数。只在包含空格、制表符或引号时加引号，并正确处理反斜杠转义。
@@ -1147,20 +1380,108 @@ pub(super) fn extract_first_command_token(command_line: &str) -> String {
     }
 }
 
-// 将 AeDebug 注册表值规范化：展开环境变量后提取可执行文件路径，过滤无效调试器。
-fn normalize_debugger_command(command_line: &str, value_type: u32) -> Result<Option<String>, u32> {
+fn parse_debugger_command(
+    command_line: &str,
+    value_type: u32,
+) -> Result<Option<DebuggerCommand>, u32> {
     let expanded = if value_type == REG_EXPAND_SZ {
         expand_environment_variables(command_line)?
-    } else {
+    } else if value_type == REG_SZ {
         command_line.to_string()
+    } else {
+        return Err(ERROR_INVALID_DATA);
     };
-    Ok(normalize_debugger_command_with(
-        &expanded,
-        REG_SZ,
-        str::to_string,
-    ))
+    parse_expanded_debugger_command(&expanded)
 }
 
+fn parse_expanded_debugger_command(command_line: &str) -> Result<Option<DebuggerCommand>, u32> {
+    let template = command_line.trim().to_string();
+    let executable = extract_first_command_token(&template);
+    let file_name = Path::new(&executable)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if executable.is_empty()
+        || !Path::new(&executable).is_absolute()
+        || file_name.eq_ignore_ascii_case("drwtsn32")
+        || file_name.eq_ignore_ascii_case("drwtsn32.exe")
+    {
+        return Ok(None);
+    }
+    validate_debugger_template(&template)?;
+    Ok(Some(DebuggerCommand {
+        template,
+        executable,
+    }))
+}
+
+fn validate_debugger_template(template: &str) -> Result<(), u32> {
+    let mut placeholders = 0usize;
+    let mut chars = template.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            continue;
+        }
+        match chars.next() {
+            Some('%') => {}
+            Some('l' | 'L') => {
+                if !matches!(chars.next(), Some('d' | 'D')) {
+                    return Err(ERROR_INVALID_DATA);
+                }
+                placeholders += 1;
+            }
+            Some('p' | 'P') => return Err(ERROR_NOT_SUPPORTED),
+            Some(_) | None => return Err(ERROR_INVALID_DATA),
+        }
+    }
+    if placeholders == 2 {
+        Ok(())
+    } else {
+        Err(ERROR_INVALID_DATA)
+    }
+}
+
+fn format_debugger_template(
+    template: &str,
+    process_id: u32,
+    event_handle: usize,
+) -> Result<String, u32> {
+    validate_debugger_template(template)?;
+    let replacements = [process_id.to_string(), event_handle.to_string()];
+    let mut replacement_index = 0usize;
+    let mut output = String::with_capacity(template.len() + 32);
+    let mut chars = template.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('%') => output.push('%'),
+            Some('l' | 'L') => {
+                if !matches!(chars.next(), Some('d' | 'D')) {
+                    return Err(ERROR_INVALID_DATA);
+                }
+                output.push_str(
+                    replacements
+                        .get(replacement_index)
+                        .ok_or(ERROR_INVALID_DATA)?,
+                );
+                replacement_index += 1;
+            }
+            Some('p' | 'P') => return Err(ERROR_NOT_SUPPORTED),
+            Some(_) | None => return Err(ERROR_INVALID_DATA),
+        }
+    }
+    if replacement_index == replacements.len() {
+        Ok(output)
+    } else {
+        Err(ERROR_INVALID_DATA)
+    }
+}
+
+// Compatibility helper used by the existing pure parsing tests.
+#[cfg(test)]
 pub(super) fn normalize_debugger_command_with<F>(
     command_line: &str,
     value_type: u32,
@@ -1171,14 +1492,19 @@ where
 {
     let expanded = if value_type == REG_EXPAND_SZ {
         expand_environment_variables(command_line)
-    } else {
+    } else if value_type == REG_SZ {
         command_line.to_string()
+    } else {
+        return None;
     };
     let executable = extract_first_command_token(&expanded);
-
+    let file_name = Path::new(&executable)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
     if executable.is_empty()
-        || executable.eq_ignore_ascii_case("drwtsn32")
-        || executable.eq_ignore_ascii_case("drwtsn32.exe")
+        || file_name.eq_ignore_ascii_case("drwtsn32")
+        || file_name.eq_ignore_ascii_case("drwtsn32.exe")
     {
         None
     } else {
@@ -1189,21 +1515,16 @@ where
 // 展开字符串中的环境变量（如 %SystemRoot%）。
 // 使用 Win32 ExpandEnvironmentStringsW API，正确处理 WOW64 重定向和 %% 转义。
 fn expand_environment_variables(command_line: &str) -> Result<String, u32> {
-    // 安全性: the Win32 ExpandEnvironmentStringsW API reads the process environment block
-    // maintained by the kernel, which handles system-variable edge cases (WOW64 redirections,
-    // %% escaping, variable-length limits) correctly.
     let wide_input = to_wide_null(command_line);
     let required = unsafe { ExpandEnvironmentStringsW(wide_input.as_ptr(), null_mut(), 0) };
     if required == 0 {
-        let error = unsafe { GetLastError() };
-        return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+        return Err(nonzero_last_error());
     }
     let mut buffer = vec![0u16; required as usize];
     let written =
         unsafe { ExpandEnvironmentStringsW(wide_input.as_ptr(), buffer.as_mut_ptr(), required) };
     if written == 0 || written > required {
-        let error = unsafe { GetLastError() };
-        return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
+        return Err(nonzero_last_error());
     }
     let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
     Ok(String::from_utf16_lossy(&buffer[..len]))
@@ -1463,5 +1784,83 @@ fn query_windows_directory() -> Result<String, u32> {
             return Ok(String::from_utf16_lossy(&buffer[..length]));
         }
         buffer.resize(length.saturating_add(1), 0);
+    }
+}
+
+#[cfg(test)]
+mod debugger_tests {
+    use super::*;
+
+    #[test]
+    fn full_aedebug_template_preserves_debugger_specific_arguments() {
+        let template = r#""C:\Debuggers\windbg.exe" -p %ld -e %ld -g"#;
+        let command = parse_expanded_debugger_command(template).unwrap().unwrap();
+        assert_eq!(command.executable, r"C:\Debuggers\windbg.exe");
+        assert_eq!(
+            format_debugger_template(&command.template, 1234, 5678).unwrap(),
+            r#""C:\Debuggers\windbg.exe" -p 1234 -e 5678 -g"#
+        );
+    }
+
+    #[test]
+    fn visual_studio_jit_template_and_literal_percent_are_supported() {
+        let template = r#""C:\Windows\System32\vsjitdebugger.exe" -p %ld -e %ld --label 100%%"#;
+        assert_eq!(
+            format_debugger_template(template, 42, 99).unwrap(),
+            r#""C:\Windows\System32\vsjitdebugger.exe" -p 42 -e 99 --label 100%"#
+        );
+    }
+
+    #[test]
+    fn unsupported_or_ambiguous_templates_are_rejected() {
+        assert_eq!(
+            parse_expanded_debugger_command(r#""C:\Debuggers\dbg.exe" -p %ld -e %ld -j 0x%p"#),
+            Err(ERROR_NOT_SUPPORTED)
+        );
+        for template in [
+            r#""C:\Debuggers\dbg.exe" -p %ld"#,
+            r#""C:\Debuggers\dbg.exe" -p %ld -e %ld -x %ld"#,
+            r#""C:\Debuggers\dbg.exe" -p %q -e %ld"#,
+        ] {
+            assert!(parse_expanded_debugger_command(template).is_err());
+        }
+        assert!(
+            parse_expanded_debugger_command(r#""relative\dbg.exe" -p %ld -e %ld"#)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn target_machine_selects_the_matching_registry_view() {
+        assert_eq!(
+            debugger_registry_view_for_machines(IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_AMD64,)
+                .unwrap(),
+            DebuggerRegistryView::Registry32
+        );
+        assert_eq!(
+            debugger_registry_view_for_machines(
+                IMAGE_FILE_MACHINE_UNKNOWN,
+                IMAGE_FILE_MACHINE_AMD64,
+            )
+            .unwrap(),
+            DebuggerRegistryView::Registry64
+        );
+        assert_eq!(
+            debugger_registry_view_for_machines(
+                IMAGE_FILE_MACHINE_UNKNOWN,
+                IMAGE_FILE_MACHINE_I386,
+            )
+            .unwrap(),
+            DebuggerRegistryView::Native
+        );
+        assert_eq!(
+            debugger_registry_view_for_machines(
+                IMAGE_FILE_MACHINE_ARMNT,
+                IMAGE_FILE_MACHINE_ARM64,
+            )
+            .unwrap(),
+            DebuggerRegistryView::Registry32
+        );
     }
 }
