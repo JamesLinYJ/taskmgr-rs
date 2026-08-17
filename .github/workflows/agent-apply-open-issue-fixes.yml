@@ -8,6 +8,7 @@ on:
       - agent/fix-open-issue-root-causes
     paths:
       - scripts/agent_fix_open_issues.py
+      - scripts/agent_fix_ci_lints.py
       - .github/workflows/agent-apply-open-issue-fixes.yml
 
 permissions:
@@ -34,7 +35,9 @@ jobs:
           fetch-depth: 0
 
       - name: Apply reviewed source transformations
-        run: python scripts/agent_fix_open_issues.py
+        run: |
+          python scripts/agent_fix_open_issues.py
+          python scripts/agent_fix_ci_lints.py
 
       - name: Install Rust toolchain
         run: |
@@ -69,6 +72,7 @@ jobs:
       - name: Publish final source-only commit
         run: |
           Remove-Item scripts/agent_fix_open_issues.py
+          Remove-Item scripts/agent_fix_ci_lints.py
           Remove-Item .github/workflows/agent-apply-open-issue-fixes.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
