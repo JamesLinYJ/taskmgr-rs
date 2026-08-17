@@ -79,7 +79,8 @@ struct RawAdapterEntry {
     key: AdapterIdentity,
     name: String,
     state: String,
-    link_speed_bps: u64,
+    transmit_link_speed_bps: u64,
+    receive_link_speed_bps: u64,
     bytes_sent: u64,
     bytes_received: u64,
 }
@@ -859,22 +860,32 @@ impl NetworkPageState {
                     .as_ref()
                     .map(|state| (state.current_sent, state.current_received)),
             );
-            // A zero curve point marks an unavailable interval after first sight or counter
-            // reset; the textual value remains "-" so it is not presented as measured idle.
-            let total_delta = counter_delta.map_or(0, |delta| delta.2);
-            let sent_util = counter_delta.map_or(0, |delta| {
-                utilization_percent_for_history(delta.0, raw_adapter.link_speed_bps, elapsed_secs)
-            });
-            let received_util = counter_delta.map_or(0, |delta| {
-                utilization_percent_for_history(delta.1, raw_adapter.link_speed_bps, elapsed_secs)
-            });
-            let total_util = counter_delta.map_or(0, |delta| {
-                utilization_percent_for_history(delta.2, raw_adapter.link_speed_bps, elapsed_secs)
-            });
+            // Each direction owns an independent full-duplex capacity. "Total" is the
+            // busiest direction's percentage, which remains meaningful for asymmetric links and
+            // cannot fabricate a 200% value by summing independent capacities.
+            let (sent_ratio, received_ratio, total_ratio) =
+                counter_delta.map_or((None, None, None), |delta| {
+                    directional_utilization_ratios(
+                        delta.0,
+                        delta.1,
+                        raw_adapter.transmit_link_speed_bps,
+                        raw_adapter.receive_link_speed_bps,
+                        elapsed_secs,
+                    )
+                });
 
-            push_history(&mut sent_history, sent_util);
-            push_history(&mut received_history, received_util);
-            push_history(&mut total_history, total_util);
+            push_history(
+                &mut sent_history,
+                utilization_percent_for_history(sent_ratio),
+            );
+            push_history(
+                &mut received_history,
+                utilization_percent_for_history(received_ratio),
+            );
+            push_history(
+                &mut total_history,
+                utilization_percent_for_history(total_ratio),
+            );
 
             let bytes_total = raw_adapter
                 .bytes_sent
@@ -884,12 +895,11 @@ impl NetworkPageState {
                 key: raw_adapter.key,
                 name: raw_adapter.name,
                 state: raw_adapter.state,
-                link_speed: format_link_speed(raw_adapter.link_speed_bps),
-                utilization: counter_delta
-                    .map(|_| {
-                        utilization_text(total_delta, raw_adapter.link_speed_bps, elapsed_secs)
-                    })
-                    .unwrap_or_else(|| "-".to_string()),
+                link_speed: format_link_speeds(
+                    raw_adapter.transmit_link_speed_bps,
+                    raw_adapter.receive_link_speed_bps,
+                ),
+                utilization: utilization_text(total_ratio),
                 bytes_sent: format_counter(raw_adapter.bytes_sent),
                 bytes_received: format_counter(raw_adapter.bytes_received),
                 bytes_total: bytes_total
@@ -964,7 +974,8 @@ impl NetworkPageState {
                 key,
                 name,
                 state: adapter_state_text(row.OperStatus),
-                link_speed_bps: row.ReceiveLinkSpeed.max(row.TransmitLinkSpeed),
+                transmit_link_speed_bps: row.TransmitLinkSpeed,
+                receive_link_speed_bps: row.ReceiveLinkSpeed,
                 bytes_sent: row.OutOctets,
                 bytes_received: row.InOctets,
             });
@@ -1378,7 +1389,7 @@ fn collapse_raw_adapters(adapters: Vec<RawAdapterEntry>) -> Vec<RawAdapterEntry>
 
 fn raw_adapter_rank(adapter: &RawAdapterEntry) -> (u8, u8, i64) {
     (
-        u8::from(adapter.link_speed_bps != 0),
+        u8::from(adapter.transmit_link_speed_bps != 0 || adapter.receive_link_speed_bps != 0),
         u8::from(!adapter.state.eq_ignore_ascii_case("disconnected")),
         -(adapter.name.len() as i64),
     )
@@ -1423,22 +1434,38 @@ fn utilization_ratio_percent(
     link_speed_bps: u64,
     elapsed_secs: f64,
 ) -> Option<f64> {
-    if bytes_per_interval == 0 || link_speed_bps == 0 || elapsed_secs <= 0.0 {
+    if link_speed_bps == 0 || !elapsed_secs.is_finite() || elapsed_secs <= 0.0 {
         return None;
+    }
+    if bytes_per_interval == 0 {
+        return Some(0.0);
     }
 
     let bits_per_second = (bytes_per_interval as f64 * 8.0) / elapsed_secs;
-    Some(((bits_per_second * 100.0) / link_speed_bps as f64).clamp(0.0, 100.0))
+    let percent = (bits_per_second * 100.0) / link_speed_bps as f64;
+    percent.is_finite().then(|| percent.clamp(0.0, 100.0))
 }
 
-fn utilization_percent_for_history(
-    bytes_per_interval: u64,
-    link_speed_bps: u64,
+fn directional_utilization_ratios(
+    sent_bytes: u64,
+    received_bytes: u64,
+    transmit_link_speed_bps: u64,
+    receive_link_speed_bps: u64,
     elapsed_secs: f64,
-) -> u8 {
-    let Some(ratio_percent) =
-        utilization_ratio_percent(bytes_per_interval, link_speed_bps, elapsed_secs)
-    else {
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let sent = utilization_ratio_percent(sent_bytes, transmit_link_speed_bps, elapsed_secs);
+    let received = utilization_ratio_percent(received_bytes, receive_link_speed_bps, elapsed_secs);
+    let total = match (sent, received) {
+        (Some(sent), Some(received)) => Some(sent.max(received)),
+        (Some(sent), None) => Some(sent),
+        (None, Some(received)) => Some(received),
+        (None, None) => None,
+    };
+    (sent, received, total)
+}
+
+fn utilization_percent_for_history(ratio_percent: Option<f64>) -> u8 {
+    let Some(ratio_percent) = ratio_percent else {
         return 0;
     };
 
@@ -1450,17 +1477,27 @@ fn utilization_percent_for_history(
     }
 }
 
-fn utilization_text(bytes_per_interval: u64, link_speed_bps: u64, elapsed_secs: f64) -> String {
-    let Some(ratio_percent) =
-        utilization_ratio_percent(bytes_per_interval, link_speed_bps, elapsed_secs)
-    else {
-        return "0%".to_string();
+fn utilization_text(ratio_percent: Option<f64>) -> String {
+    let Some(ratio_percent) = ratio_percent else {
+        return "-".to_string();
     };
 
     if ratio_percent > 0.0 && ratio_percent < 1.0 {
         "<1%".to_string()
     } else {
         format!("{}%", ratio_percent.round().clamp(0.0, 100.0) as u8)
+    }
+}
+
+fn format_link_speeds(transmit_bits_per_second: u64, receive_bits_per_second: u64) -> String {
+    match (transmit_bits_per_second, receive_bits_per_second) {
+        (0, 0) => "-".to_string(),
+        (transmit, receive) if transmit == receive => format_link_speed(transmit),
+        (transmit, receive) => format!(
+            "Tx {} / Rx {}",
+            format_link_speed(transmit),
+            format_link_speed(receive)
+        ),
     }
 }
 
@@ -1843,6 +1880,48 @@ mod tests {
     fn renamed_adapter_updates_the_primary_list_column() {
         let adapter = test_adapter("Renamed Ethernet");
         assert_eq!(adapter_row_texts(&adapter)[0], "Renamed Ethernet");
+    }
+
+    #[test]
+    fn asymmetric_links_use_each_direction_capacity() {
+        let (sent, received, total) =
+            directional_utilization_ratios(1_250_000, 0, 10_000_000, 100_000_000, 1.0);
+        assert_eq!(sent, Some(100.0));
+        assert_eq!(received, Some(0.0));
+        assert_eq!(total, Some(100.0));
+
+        let (sent, received, total) =
+            directional_utilization_ratios(0, 1_250_000, 100_000_000, 10_000_000, 1.0);
+        assert_eq!(sent, Some(0.0));
+        assert_eq!(received, Some(100.0));
+        assert_eq!(total, Some(100.0));
+    }
+
+    #[test]
+    fn full_duplex_total_is_the_busiest_direction_not_a_sum() {
+        let (_, _, total) =
+            directional_utilization_ratios(12_500_000, 12_500_000, 100_000_000, 100_000_000, 1.0);
+        assert_eq!(total, Some(100.0));
+    }
+
+    #[test]
+    fn unavailable_direction_does_not_poison_the_other_direction() {
+        let (sent, received, total) =
+            directional_utilization_ratios(0, 1_250_000, 0, 10_000_000, 1.0);
+        assert_eq!(sent, None);
+        assert_eq!(received, Some(100.0));
+        assert_eq!(total, Some(100.0));
+        assert_eq!(utilization_text(None), "-");
+        assert_eq!(utilization_text(Some(0.0)), "0%");
+    }
+
+    #[test]
+    fn asymmetric_link_speed_text_preserves_both_capacities() {
+        assert_eq!(
+            format_link_speeds(10_000_000, 100_000_000),
+            "Tx 10.0 Mbps / Rx 100 Mbps"
+        );
+        assert_eq!(format_link_speeds(1_000_000_000, 1_000_000_000), "1.0 Gbps");
     }
 
     #[test]

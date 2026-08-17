@@ -15,7 +15,9 @@ use std::mem::{size_of, zeroed};
 // 数据合法性校验以及注册表的读写边界。
 use std::ptr::null_mut;
 
-use windows_sys::Win32::Foundation::{ERROR_REVISION_MISMATCH, ERROR_SUCCESS, RECT};
+use windows_sys::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_INVALID_DATA, ERROR_REVISION_MISMATCH, ERROR_SUCCESS, RECT,
+};
 use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromRect};
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_BINARY, REG_OPTION_NON_VOLATILE, RegCloseKey,
@@ -31,8 +33,12 @@ use crate::app::page_registry::PageId;
 use crate::infrastructure::native::{record_win32_error, to_wide_null};
 use crate::ui::resource_ids::NUM_COLUMN;
 
-const TASKMAN_KEY: &str = "Software\\Microsoft\\Windows NT\\CurrentVersion\\TaskManager";
-const OPTIONS_KEY: &str = "Preferences";
+const OPTIONS_KEY: &str = "Software\\taskmgr-rs\\TaskManager";
+const OPTIONS_VALUE: &str = "OptionsV1";
+const LEGACY_TASKMAN_KEY: &str = "Software\\Microsoft\\Windows NT\\CurrentVersion\\TaskManager";
+const LEGACY_OPTIONS_VALUE: &str = "Preferences";
+const OPTIONS_STORAGE_MAGIC: [u8; 8] = *b"TMGRRS01";
+const OPTIONS_STORAGE_VERSION: u32 = 1;
 const OPTIONS_SCHEMA_VERSION: i32 = 2;
 const SCHEMA_0_NETWORK_PAGE: i32 = 3;
 const SCHEMA_0_USERS_PAGE: i32 = 4;
@@ -144,6 +150,48 @@ pub struct Options {
     pub unused2: i32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StoredOptions {
+    magic: [u8; 8],
+    storage_version: u32,
+    payload_size: u32,
+    options: Options,
+}
+
+impl StoredOptions {
+    fn new(options: Options) -> Self {
+        Self {
+            magic: OPTIONS_STORAGE_MAGIC,
+            storage_version: OPTIONS_STORAGE_VERSION,
+            payload_size: size_of::<Options>() as u32,
+            options,
+        }
+    }
+
+    fn into_options(self) -> Result<Options, u32> {
+        if self.magic != OPTIONS_STORAGE_MAGIC || self.payload_size != size_of::<Options>() as u32 {
+            return Err(ERROR_INVALID_DATA);
+        }
+        if self.storage_version != OPTIONS_STORAGE_VERSION {
+            return Err(ERROR_REVISION_MISMATCH);
+        }
+        Ok(self.options)
+    }
+}
+
+/// Marker for fixed-layout registry values whose every bit pattern is a valid Rust value.
+///
+/// # Safety
+///
+/// Implementors must be `Copy`, have a stable layout, contain no references, and permit every
+/// possible byte pattern. This lets the registry reader initialize the value as zeroed storage
+/// before Windows fills every byte.
+unsafe trait RegistryPod: Copy {}
+
+unsafe impl RegistryPod for Options {}
+unsafe impl RegistryPod for StoredOptions {}
+
 impl Default for Options {
     fn default() -> Self {
         // 默认值尽量贴近经典任务管理器的首次启动体验。
@@ -200,109 +248,81 @@ impl Options {
     }
 
     pub fn load(&mut self, min_width: i32, min_height: i32) -> bool {
-        // 读取失败或数据不合法时，统一回退到默认配置，避免坏配置把程序带崩。
+        // taskmgr-rs owns a versioned application-specific value. The Microsoft Task Manager key
+        // is read only for a one-time migration of values that carry taskmgr-rs' exact schema
+        // marker; it is never written or deleted.
         if modifiers_force_defaults() {
             self.set_default_values(min_width, min_height);
             return false;
         }
 
-        // 安全性: registry buffers point to live local variables for the duration of each call;
-        // loaded binary data is size/type checked before being used.
-        unsafe {
-            let key_name = to_wide_null(TASKMAN_KEY);
-            let value_name = to_wide_null(OPTIONS_KEY);
-            let mut key: HKEY = null_mut();
-            if RegOpenKeyExW(HKEY_CURRENT_USER, key_name.as_ptr(), 0, KEY_READ, &mut key)
-                != ERROR_SUCCESS
-            {
+        match read_registry_binary::<StoredOptions>(OPTIONS_KEY, OPTIONS_VALUE) {
+            Ok(Some(stored)) => {
+                let loaded = match stored.into_options() {
+                    Ok(loaded) => loaded,
+                    Err(error) => {
+                        record_win32_error("taskmgr-rs options envelope", error);
+                        self.set_default_values(min_width, min_height);
+                        return false;
+                    }
+                };
+                return self.apply_loaded_options(loaded, min_width, min_height, false);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                record_win32_error("reading taskmgr-rs options", error);
                 self.set_default_values(min_width, min_height);
                 return false;
             }
+        }
 
-            let mut loaded = zeroed::<Options>();
-            let mut value_type = 0u32;
-            let mut value_size = size_of::<Options>() as u32;
-            let status = RegQueryValueExW(
-                key,
-                value_name.as_ptr(),
-                null_mut(),
-                &mut value_type,
-                &mut loaded as *mut Options as *mut u8,
-                &mut value_size,
-            );
-            RegCloseKey(key);
-
-            if status != ERROR_SUCCESS
-                || value_type != REG_BINARY
-                || value_size != size_of::<Options>() as u32
-            {
+        match read_registry_binary::<Options>(LEGACY_TASKMAN_KEY, LEGACY_OPTIONS_VALUE) {
+            Ok(Some(legacy)) if legacy_options_is_taskmgr_rs(&legacy) => {
+                self.apply_loaded_options(legacy, min_width, min_height, true)
+            }
+            Ok(Some(_)) | Ok(None) => {
                 self.set_default_values(min_width, min_height);
-                return false;
+                false
             }
-
-            let migrated = match loaded.migrate_schema() {
-                Ok(migrated) => migrated,
-                Err(()) => {
-                    record_win32_error("unsupported options schema", ERROR_REVISION_MISMATCH);
-                    self.set_default_values(min_width, min_height);
-                    return false;
-                }
-            };
-            let loaded_was_valid = loaded.is_valid(min_width, min_height);
-            if !loaded_was_valid {
-                loaded.normalize(min_width, min_height);
+            Err(error) => {
+                record_win32_error("reading legacy taskmgr-rs options", error);
+                self.set_default_values(min_width, min_height);
+                false
             }
-            *self = loaded;
-            if (migrated || !loaded_was_valid)
-                && let Err(error) = self.save()
-            {
-                record_win32_error("normalized options persistence", error);
-            }
-            loaded_was_valid
         }
     }
 
-    pub fn save(&self) -> Result<(), u32> {
-        // 整个结构体按历史格式整体写入注册表，保持与原版偏好布局兼容。
-        // 安全性: registry handles are opened and closed in this block; the value buffer points
-        // to `self` and is written as the historical binary Options format.
-        unsafe {
-            let key_name = to_wide_null(TASKMAN_KEY);
-            let value_name = to_wide_null(OPTIONS_KEY);
-            let mut key: HKEY = null_mut();
-            let mut disposition = 0u32;
-
-            let create_status = RegCreateKeyExW(
-                HKEY_CURRENT_USER,
-                key_name.as_ptr(),
-                0,
-                null_mut(),
-                REG_OPTION_NON_VOLATILE,
-                KEY_WRITE,
-                null_mut(),
-                &mut key,
-                &mut disposition,
-            );
-            if create_status != ERROR_SUCCESS {
-                return Err(create_status);
+    fn apply_loaded_options(
+        &mut self,
+        mut loaded: Options,
+        min_width: i32,
+        min_height: i32,
+        persist_migration: bool,
+    ) -> bool {
+        let migrated = match loaded.migrate_schema() {
+            Ok(migrated) => migrated,
+            Err(()) => {
+                record_win32_error("unsupported options schema", ERROR_REVISION_MISMATCH);
+                self.set_default_values(min_width, min_height);
+                return false;
             }
-
-            let set_status = RegSetValueExW(
-                key,
-                value_name.as_ptr(),
-                0,
-                REG_BINARY,
-                self as *const Options as *const u8,
-                size_of::<Options>() as u32,
-            );
-            RegCloseKey(key);
-
-            if set_status == ERROR_SUCCESS {
-                Ok(())
-            } else {
-                Err(set_status)
-            }
+        };
+        let loaded_was_valid = loaded.is_valid(min_width, min_height);
+        if !loaded_was_valid {
+            loaded.normalize(min_width, min_height);
         }
+        *self = loaded;
+        if (persist_migration || migrated || !loaded_was_valid)
+            && let Err(error) = self.save()
+        {
+            record_win32_error("normalized options persistence", error);
+        }
+        loaded_was_valid
+    }
+
+    pub fn save(&self) -> Result<(), u32> {
+        let stored = StoredOptions::new(*self);
+        write_registry_binary(OPTIONS_KEY, OPTIONS_VALUE, &stored)
     }
 
     pub fn minimize_on_use(&self) -> bool {
@@ -463,6 +483,135 @@ impl Options {
             self.flags |= mask;
         } else {
             self.flags &= !mask;
+        }
+    }
+}
+
+fn legacy_options_is_taskmgr_rs(options: &Options) -> bool {
+    options.cb_size == size_of::<Options>() as u32
+        && options.unused == OPTIONS_SCHEMA_VERSION
+        && options.unused2 == 0
+        && options.current_page >= -1
+        && options.current_page < PageId::COUNT as i32
+        && is_valid_view_mode(options.view_mode)
+        && is_valid_cpu_history_mode(options.cpu_history_mode)
+        && is_valid_update_speed(options.update_speed)
+        && options.flags & !ALL_VALID_FLAGS == 0
+        && process_columns_are_valid(&options.active_process_columns, &options.column_widths)
+}
+
+fn read_registry_binary<T: RegistryPod>(
+    key_path: &str,
+    value_name: &str,
+) -> Result<Option<T>, u32> {
+    unsafe {
+        let key_path = to_wide_null(key_path);
+        let value_name = to_wide_null(value_name);
+        let mut key: HKEY = null_mut();
+        let open_status =
+            RegOpenKeyExW(HKEY_CURRENT_USER, key_path.as_ptr(), 0, KEY_READ, &mut key);
+        if open_status == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        if open_status != ERROR_SUCCESS {
+            return Err(open_status);
+        }
+
+        let mut value_type = 0u32;
+        let mut value_size = 0u32;
+        let size_status = RegQueryValueExW(
+            key,
+            value_name.as_ptr(),
+            null_mut(),
+            &mut value_type,
+            null_mut(),
+            &mut value_size,
+        );
+        if size_status == ERROR_FILE_NOT_FOUND {
+            let close_status = RegCloseKey(key);
+            return if close_status == ERROR_SUCCESS {
+                Ok(None)
+            } else {
+                Err(close_status)
+            };
+        }
+        if size_status != ERROR_SUCCESS {
+            RegCloseKey(key);
+            return Err(size_status);
+        }
+        if value_type != REG_BINARY || value_size != size_of::<T>() as u32 {
+            RegCloseKey(key);
+            return Err(ERROR_INVALID_DATA);
+        }
+
+        // SAFETY: RegistryPod requires every bit pattern to be valid. The exact-size check above
+        // and the second query's unchanged byte count guarantee that Windows initializes all bytes.
+        let mut value = zeroed::<T>();
+        let mut actual_size = value_size;
+        let read_status = RegQueryValueExW(
+            key,
+            value_name.as_ptr(),
+            null_mut(),
+            &mut value_type,
+            (&mut value as *mut T).cast::<u8>(),
+            &mut actual_size,
+        );
+        let close_status = RegCloseKey(key);
+        if read_status != ERROR_SUCCESS {
+            return Err(read_status);
+        }
+        if close_status != ERROR_SUCCESS {
+            return Err(close_status);
+        }
+        if value_type != REG_BINARY || actual_size != size_of::<T>() as u32 {
+            return Err(ERROR_INVALID_DATA);
+        }
+        Ok(Some(value))
+    }
+}
+
+fn write_registry_binary<T: RegistryPod>(
+    key_path: &str,
+    value_name: &str,
+    value: &T,
+) -> Result<(), u32> {
+    unsafe {
+        let key_path = to_wide_null(key_path);
+        let value_name = to_wide_null(value_name);
+        let mut key: HKEY = null_mut();
+        let mut disposition = 0u32;
+        let create_status = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            key_path.as_ptr(),
+            0,
+            null_mut(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            null_mut(),
+            &mut key,
+            &mut disposition,
+        );
+        if create_status != ERROR_SUCCESS {
+            return Err(create_status);
+        }
+
+        // SAFETY: RegistryPod has a fixed initialized representation and contains no references.
+        let bytes = std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>());
+        let set_status = RegSetValueExW(
+            key,
+            value_name.as_ptr(),
+            0,
+            REG_BINARY,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+        );
+        let close_status = RegCloseKey(key);
+        if set_status != ERROR_SUCCESS {
+            Err(set_status)
+        } else if close_status != ERROR_SUCCESS {
+            Err(close_status)
+        } else {
+            Ok(())
         }
     }
 }
@@ -628,12 +777,63 @@ fn screen_reader_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ColumnId, NUM_COLUMN, OPTIONS_SCHEMA_VERSION, Options, SCHEMA_0_NETWORK_PAGE,
+        ColumnId, ERROR_INVALID_DATA, ERROR_REVISION_MISMATCH, LEGACY_OPTIONS_VALUE,
+        LEGACY_TASKMAN_KEY, NUM_COLUMN, OPTIONS_KEY, OPTIONS_SCHEMA_VERSION, OPTIONS_STORAGE_MAGIC,
+        OPTIONS_STORAGE_VERSION, OPTIONS_VALUE, Options, SCHEMA_0_NETWORK_PAGE,
         SCHEMA_0_USERS_PAGE, SCHEMA_1_GPU_PAGE, SCHEMA_1_NETWORK_PAGE, SCHEMA_1_USERS_PAGE,
-        UpdateSpeed, normalize_process_columns, process_columns_are_valid,
-        update_speed_timer_interval, window_rect_dimensions_are_valid, window_rect_is_valid,
+        StoredOptions, UpdateSpeed, legacy_options_is_taskmgr_rs, normalize_process_columns,
+        process_columns_are_valid, update_speed_timer_interval, window_rect_dimensions_are_valid,
+        window_rect_is_valid,
     };
     use windows_sys::Win32::Foundation::RECT;
+
+    #[test]
+    fn stored_options_envelope_round_trips_and_rejects_foreign_data() {
+        let options = Options::default();
+        assert_eq!(
+            StoredOptions::new(options).into_options().unwrap().unused,
+            options.unused
+        );
+
+        let mut foreign = StoredOptions::new(options);
+        foreign.magic = *b"NATIVE00";
+        assert_eq!(foreign.into_options().err(), Some(ERROR_INVALID_DATA));
+
+        let mut future = StoredOptions::new(options);
+        future.storage_version = OPTIONS_STORAGE_VERSION + 1;
+        assert_eq!(future.into_options().err(), Some(ERROR_REVISION_MISMATCH));
+
+        let mut wrong_size = StoredOptions::new(options);
+        wrong_size.payload_size = 0;
+        assert_eq!(wrong_size.into_options().err(), Some(ERROR_INVALID_DATA));
+        assert_eq!(OPTIONS_STORAGE_MAGIC, *b"TMGRRS01");
+    }
+
+    #[test]
+    fn legacy_migration_requires_the_exact_taskmgr_rs_schema_marker() {
+        let current = Options::default();
+        assert!(legacy_options_is_taskmgr_rs(&current));
+
+        for schema in [0, 1, OPTIONS_SCHEMA_VERSION + 1] {
+            let candidate = Options {
+                unused: schema,
+                ..current
+            };
+            assert!(!legacy_options_is_taskmgr_rs(&candidate));
+        }
+
+        let wrong_size = Options {
+            cb_size: 0,
+            ..current
+        };
+        assert!(!legacy_options_is_taskmgr_rs(&wrong_size));
+    }
+
+    #[test]
+    fn application_options_namespace_is_distinct_from_windows_task_manager() {
+        assert_ne!(OPTIONS_KEY, LEGACY_TASKMAN_KEY);
+        assert_ne!(OPTIONS_VALUE, LEGACY_OPTIONS_VALUE);
+    }
 
     #[test]
     fn process_columns_reject_missing_primary_and_duplicates() {

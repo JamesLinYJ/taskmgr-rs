@@ -79,9 +79,10 @@ Pull requests and pushes to `main` run formatting, all-target checks, strict Cli
 x86_64 release build on GitHub's Windows Server 2025 / Visual Studio 2026 runner. Separate jobs
 compile i686 and ARM64; i686 tests also run under WOW64.
 
-To publish a version, first update `Cargo.toml` and `Cargo.lock`, merge the change, then push the
-matching tag such as `v0.2.5`. The Release workflow rejects a tag that does not exactly match the
-Cargo package version. It builds all three architectures in parallel, verifies the PE machine and
+To publish a version, update `Cargo.toml` and `Cargo.lock` together and merge the change to `main`.
+The Release workflow reads the package version and automatically creates the matching tag (for
+example `v0.2.6`) when it does not exist. It then builds all three architectures in parallel,
+verifies the PE machine and
 Windows version resources, writes `SHA256SUMS.txt`, creates GitHub build-provenance attestations,
 and publishes only after the uploaded sizes and digests match. A publishing failure leaves only a
 draft; a build failure creates no release, so neither path exposes a partial release.

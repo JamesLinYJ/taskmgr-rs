@@ -79,8 +79,8 @@ Pull Request 和推送到 `main` 的提交会在 GitHub 的 Windows Server 2025 
 runner 上执行格式检查、全目标 check、严格 Clippy、完整测试和 x86_64 release 构建。独立任务
 同时验证 i686 与 ARM64，i686 测试会在 WOW64 下实际执行。
 
-发布版本时，先同步修改 `Cargo.toml` 与 `Cargo.lock` 并合入主线，再推送与版本完全一致的 tag，
-例如 `v0.2.5`。Release 工作流会拒绝与 Cargo 包版本不一致的 tag，并行构建三种架构，核对 PE
+发布版本时，只需同步修改 `Cargo.toml` 与 `Cargo.lock` 并合入 `main`。Release 工作流会读取包
+版本；如果对应 tag（例如 `v0.2.6`）尚不存在，就自动创建 tag，并行构建三种架构，核对 PE
 机器类型和 Windows 版本资源，生成 `SHA256SUMS.txt` 与 GitHub 构建来源证明。只有 GitHub
 服务器上的资产大小和摘要都与本地一致时才公开 Release。发布阶段失败时只保留草稿，构建
 阶段失败时不会创建 Release，因此都不会暴露不完整发布。
