@@ -42,15 +42,30 @@ jobs:
               [IO.File]::WriteAllText((Resolve-Path -LiteralPath $Path).Path, $updated, [Text.UTF8Encoding]::new($false))
           }
 
+          function Replace-RegexExactlyOnce {
+              param(
+                  [Parameter(Mandatory)][string]$Path,
+                  [Parameter(Mandatory)][string]$Pattern,
+                  [Parameter(Mandatory)][string]$Replacement
+              )
+              $text = Get-Content -LiteralPath $Path -Raw
+              $matches = [regex]::Matches($text, $Pattern)
+              if ($matches.Count -ne 1) {
+                  throw "$Path expected exactly one regex match, found $($matches.Count)"
+              }
+              $updated = [regex]::Replace($text, $Pattern, $Replacement, 1)
+              [IO.File]::WriteAllText((Resolve-Path -LiteralPath $Path).Path, $updated, [Text.UTF8Encoding]::new($false))
+          }
+
           Replace-ExactlyOnce `
               -Path 'Cargo.toml' `
               -Old 'version = "0.2.5"' `
               -New 'version = "0.2.6"'
 
-          Replace-ExactlyOnce `
+          Replace-RegexExactlyOnce `
               -Path 'Cargo.lock' `
-              -Old "name = `"taskmgr-rs`"`nversion = `"0.2.5`"" `
-              -New "name = `"taskmgr-rs`"`nversion = `"0.2.6`""
+              -Pattern 'name = "taskmgr-rs"(\r?\n)version = "0\.2\.5"' `
+              -Replacement 'name = "taskmgr-rs"$1version = "0.2.6"'
 
           $oldEnglish = @'
           To publish a version, first update `Cargo.toml` and `Cargo.lock`, merge the change, then push the
@@ -60,7 +75,8 @@ jobs:
           $newEnglish = @'
           To publish a version, update `Cargo.toml` and `Cargo.lock` together and merge the change to `main`.
           The Release workflow reads the package version and automatically creates the matching tag (for
-          example `v0.2.6`) when it does not exist. It builds all three architectures in parallel, verifies the PE machine and
+          example `v0.2.6`) when it does not exist. It then builds all three architectures in parallel,
+          verifies the PE machine and
           '@
           Replace-ExactlyOnce -Path 'README.md' -Old $oldEnglish.TrimEnd("`r", "`n") -New $newEnglish.TrimEnd("`r", "`n")
 
